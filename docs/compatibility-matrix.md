@@ -5,27 +5,25 @@ The daemon, libclamav12, clamdscan, clamav-base, and scanning utilities use that
 The local and official profiles use the [same daemon configuration](compatibility/oracle.conf.in).
 Each run creates a private directory and binds an available loopback port. [Replay instructions](compatibility/replay.md)
 
-Stock clamd supplies the full-scan verdicts. The Barnacle executable currently performs offline whole-file lookups.
-A missing daemon capability is a coverage gap. A hash miss leaves the object pending a complete scan.
+Stock clamd supplies the full-scan verdicts. The Barnacle daemon reports incomplete coverage as a scan error.
+Each profile tests the same fixtures against the stock daemon and Barnacle. [Daemon guide](daemon.md)
 
 ## Daemon and client coverage
 
-The runner captures a raw reply for each wire probe. It records the unmodified client's output and exit status separately.
-Compare each transport and client mode with its own reference. The pinned daemon's command list defines the command surface.
-
-| Surface | Stock observation or test | Remaining Barnacle work |
-| --- | --- | --- |
-| `PING`, `VERSION`, `VERSIONCOMMANDS` | Query the running daemon. Compare the version and full advertised command list. | Implement command replies and framing. [#8](https://github.com/yavosh/bacnacle/issues/8) |
-| NUL, newline, and legacy frames | Check reply termination with `zPING\0` and `nPING\n`. | Test unprefixed legacy commands, partial reads, and disconnects. [#8](https://github.com/yavosh/bacnacle/issues/8) |
-| Unix socket and loopback TCP | Send raw ping and clean stream requests. | Test TCP path semantics, configuration, deadlines, and cancellation. [#8](https://github.com/yavosh/bacnacle/issues/8) |
-| `INSTREAM` | Submit clean, detected, nested, competing, and limit fixtures over Unix. Run clamdscan with `--stream`. | Compare candidate bytes, errors, and client exit status for each case. [#8](https://github.com/yavosh/bacnacle/issues/8) |
-| `FILDES` | Run unmodified clamdscan with `--fdpass` on a detected file over Unix. | Implement descriptor ownership, errors, and cancellation. [#8](https://github.com/yavosh/bacnacle/issues/8) |
-| `SCAN`, `CONTSCAN`, `MULTISCAN`, `ALLMATCHSCAN` | Exercise the client's local path mode, including a missing path. | Test each explicit command, directory traversal, permissions, symlinks, all-match results, and partial failures. [#8](https://github.com/yavosh/bacnacle/issues/8) |
-| `IDSESSION`, `END` | Inventory from stock. | Exercise sequential and concurrent requests, IDs, ordering, and session-specific errors. [#8](https://github.com/yavosh/bacnacle/issues/8) |
-| `STATS`, `DETSTATS`, `DETSTATSCLEAR` | Stock advertises all three. The two legacy detection statistics commands close the connection without a payload. | Test framing and stable fields using a private daemon. [#8](https://github.com/yavosh/bacnacle/issues/8) |
-| `SHUTDOWN`, `QUIT`, signals | The harness starts its own foreground daemon and checks readiness. | Test both aliases, SIGTERM, SIGHUP, exit status, log reopening, and stale socket cleanup. [#8](https://github.com/yavosh/bacnacle/issues/8) |
-| `RELOAD`, SIGUSR2, timed self-check | The profile disables timed checks to freeze the inputs. | Compare reloads during active scans, invalid updates, and generation age. [#11](https://github.com/yavosh/bacnacle/issues/11) |
-| Service startup | The runner supplies a private clamd.conf and uses packaged clients. | Compare background startup, systemd socket activation, permissions, and service shutdown. [#8](https://github.com/yavosh/bacnacle/issues/8) |
+| Surface | Verification and behavior |
+| --- | --- |
+| `PING`, `VERSION`, `VERSIONCOMMANDS` | The Rust oracle compares exact replies, database versions, and the advertised command order. |
+| NUL, newline, and legacy frames | Check termination, fragmented commands, and disconnects using Unix sockets. |
+| Unix and TCP | Compare loopback TCP and Unix stream submissions. Depot submits the same uploads over both transports. |
+| `INSTREAM` | Compare raw frames and unmodified clamdscan. Exceeding the stream limit returns the stock size error. Unmatched content returns an explicit error. |
+| `FILDES` | Run clamdscan with `--fdpass`. Rust socket tests verify descriptor ownership on success and rejection. |
+| `SCAN`, `CONTSCAN`, `MULTISCAN`, `ALLMATCHSCAN` | Compare local detections and directory results. The all-match request returns an error while enumeration is incomplete. |
+| `IDSESSION`, `END` | Check pipelined requests, numbered replies, session termination, and commands rejected inside a session. |
+| `STATS`, `DETSTATS`, `DETSTATSCLEAR` | Check the stats frame and its terminator. The two legacy commands close the connection without a payload. |
+| `SHUTDOWN`, `QUIT`, signals | Exercise both aliases, SIGHUP, SIGTERM, PID files, private socket cleanup, and a background launch. |
+| `RELOAD`, SIGUSR2, timed self-check | Replace local rules during service operation. Invalid updates retain the last validated index. Other official generations require [#11](https://github.com/yavosh/bacnacle/issues/11). |
+| Service startup | Exercise the packaged foreground flag and an inherited Unix listener with the real systemd socket launcher. |
+| Timeouts and cancellation | Compare command read deadlines with stock. Disconnect a partial upload and verify a new client can connect. |
 
 Use the pinned command table for legacy framing and command availability. Later releases can advertise different commands.
 [ClamAV 1.4.3 command dispatch](https://github.com/Cisco-Talos/clamav/blob/clamav-1.4.3/clamd/session.c) · [Protocol guide](https://docs.clamav.net/manual/Usage/ClamdProtocol.html)
@@ -37,21 +35,30 @@ It includes hidden development options, compatibility aliases, and settings cons
 The list substitutes `/oracle` and port `3310` for the temporary directory and ephemeral port.
 `disabled` is the vendor tool's rendering, including zero-valued numeric options.
 
-The nine settings in the template override the empty-configuration defaults or explicitly select an endpoint.
-The oracle exercises socket creation, database selection, foreground startup, streaming, and the 1,024-byte transport ceiling.
-For every other option, [#8](https://github.com/yavosh/bacnacle/issues/8) tracks parsing and behavioral tests.
-Engine limits and alerts additionally require object or detection fixtures under [#9](https://github.com/yavosh/bacnacle/issues/9) and [#4](https://github.com/yavosh/bacnacle/issues/4).
-A recorded setting alone does not establish behavioral parity.
+Barnacle reads `/etc/clamav/clamd.conf` by default. The packaged service passes `--foreground=true`.
+The CLI accepts `--help`, `--version`, `--foreground`, `--debug`, `--log`, `--config-file`, `--fail-if-cvd-older-than`, `--datadir`, and `--pid`.
+CLI values override file settings. The first value wins for single-valued directives.
+`TCPAddr` and `ExcludePath` accept multiple entries. Unsupported regular expressions fail during startup.
 
-The upstream parser accepts several obsolete directives outside the effective report. These include
-`AllowSupplementaryGroups`, `ArchiveBlockMax`, `ArchiveLimitMemoryUsage`, `ArchiveMaxCompressionRatio`, `ArchiveMaxFiles`, `ArchiveMaxRecursion`,
-`ArchiveMaxScanSize`, `DetectBrokenExecutables`, `MailFollowURLs`, `MailMaxRecursion`, and `ScanOnAccess`.
-It lists the hidden build-dependent `DevCollectHashes` option. The sample configuration's `Example` marker prevents startup.
-Check warnings, rejection behavior, and build-specific support under [#8](https://github.com/yavosh/bacnacle/issues/8).
-[ClamAV 1.4.3 option parser](https://github.com/Cisco-Talos/clamav/blob/clamav-1.4.3/common/optparser.c)
+The Linux arm64 test used the unmodified Debian package configuration and one harmless local hash.
+The test created the service directory `/run/clamav` with owner and group `clamav`.
+Barnacle dropped privileges to that account and created the configured socket with mode `0666` and group `clamav`.
+Stock `clamdscan --ping` returned `PONG`. A path scan reported the fixture signature and returned exit status 1.
+`SIGTERM` stopped the daemon and removed the socket.
 
-The packaged daemon advertises `--help`, `--version`, `--foreground`, `--debug`, `--log`, `--config-file`, `--fail-if-cvd-older-than`, `--datadir`, and `--pid`.
-The launcher uses `--config-file`. Exercise flag precedence, default paths, and startup failures under [#8](https://github.com/yavosh/bacnacle/issues/8).
+| Configuration area | Behavior |
+| --- | --- |
+| Endpoints and limits | Supports Unix and TCP listeners, socket ownership, octal permissions, stale-socket checks, and timeouts. Adjusts `MaxQueue` for `MaxThreads`, `MaxRecursion`, and the soft descriptor limit. |
+| Idle sessions | With one worker, both daemons answered an independent client's ping while a session waited between commands. The session then resumed with its next request ID. |
+| Database lifecycle | Validates the configured generation before listening. Supports explicit reload, `SIGUSR2`, and periodic `SelfCheck`. A failed reload preserves the active generation. |
+| Logging | Supports a local log, size limits, rotation, and reopening on `SIGHUP`. Enabling syslog or Prelude fails during startup. |
+| Engine settings | Accepts the Debian package values for incomplete scanner stages and lists these settings in the startup log. Hash misses produce an incomplete-scan error. |
+| Unsupported policy | Unknown directives, the sample `Example` marker, unsupported engine settings, and external `VirusEvent` commands prevent startup. |
+
+The inventory includes obsolete aliases, development options, and on-access client settings.
+The pinned parser accepts additional legacy directives, including `AllowSupplementaryGroups`, `ArchiveMaxFiles`, and `ScanOnAccess`.
+These legacy spellings and alternate engine policies still need individual compatibility tests.
+Full object scanning and bytecode execution have separate qualification tasks. [Object handling](https://github.com/yavosh/bacnacle/issues/9) · [Bytecode](https://github.com/yavosh/bacnacle/issues/4) · [Upstream options](https://github.com/Cisco-Talos/clamav/blob/clamav-1.4.3/common/optparser.c)
 
 ## Database coverage
 

@@ -239,14 +239,26 @@ fn parse_rule(
 impl Feed {
     /// Load explicit paths in reference load order. Process all ignore files before hash files.
     pub fn load(paths: &[PathBuf], official: bool, flevel: u32) -> io::Result<Self> {
-        let (mut rules, inventory) = Self::load_eligible(paths, official, flevel)?;
+        Ok(Self::from_eligible(Self::load_eligible(
+            paths, official, flevel,
+        )?))
+    }
+
+    /// Validate daemon database records and resolve duplicate keys across all provenances.
+    pub fn load_sources(paths: &[(&Path, bool)], flevel: u32) -> io::Result<Self> {
+        Ok(Self::from_eligible(Self::eligible_sources(
+            paths, flevel, true,
+        )?))
+    }
+
+    fn from_eligible((mut rules, inventory): (Vec<Rule>, Vec<FileInventory>)) -> Self {
         let original_count = rules.len();
         reduce_duplicate_keys(&mut rules);
-        Ok(Self {
+        Self {
             inventory,
             duplicate_keys: original_count - rules.len(),
             rules,
-        })
+        }
     }
 
     /// Return all eligible records in database order, including names that share a key.
@@ -255,20 +267,35 @@ impl Feed {
         official: bool,
         flevel: u32,
     ) -> io::Result<(Vec<Rule>, Vec<FileInventory>)> {
+        Self::eligible_sources(
+            &paths
+                .iter()
+                .map(|p| (p.as_path(), official))
+                .collect::<Vec<_>>(),
+            flevel,
+            false,
+        )
+    }
+
+    fn eligible_sources(
+        paths: &[(&Path, bool)],
+        flevel: u32,
+        validate_allowlists: bool,
+    ) -> io::Result<(Vec<Rule>, Vec<FileInventory>)> {
         if paths.is_empty() {
             return Err(invalid("no database files"));
         }
         let mut inputs = paths
             .iter()
-            .map(|path| Ok((family(path)?, path)))
+            .map(|&(path, official)| Ok((family(path)?, path, official)))
             .collect::<io::Result<Vec<_>>>()?;
-        inputs.sort_by_key(|(family, _)| *family != Family::Ignore);
+        inputs.sort_by_key(|(family, _, _)| *family != Family::Ignore);
         let mut rules = Vec::new();
         let mut inventory = Vec::new();
         let mut ignores = Ignores::default();
-        for (family, path) in inputs {
+        for (family, path, official) in inputs {
             let mut stats = FileInventory {
-                path: path.clone(),
+                path: path.to_owned(),
                 ..Default::default()
             };
             let mut hasher = Sha256::new();
@@ -320,12 +347,26 @@ impl Feed {
                     }
                     Family::Allowlist => {
                         stats.outside_matcher += 1;
-                        Ok(())
+                        if validate_allowlists {
+                            parse_rule(
+                                line,
+                                official,
+                                flevel,
+                                &ignores,
+                                &mut FileInventory::default(),
+                            )
+                            .map(|_| ())
+                        } else {
+                            Ok(())
+                        }
                     }
                 };
                 result.map_err(|e| invalid(format!("{}:{number}: {e}", path.display())))?;
             }
-            if number == 0 && family == Family::Positive {
+            if number == 0
+                && (family == Family::Positive
+                    || (family == Family::Allowlist && validate_allowlists))
+            {
                 return Err(invalid(format!("{}: empty hash database", path.display())));
             }
             for byte in hasher.finalize() {

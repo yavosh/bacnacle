@@ -146,7 +146,8 @@ fn profile(executable: &Path, official: Option<&Path>) -> io::Result<Value> {
     let mut scans = BTreeMap::new();
     for (&name, data) in &corpus {
         clients[format!("stream-{name}")] = client_scan(root, &config, &["--stream"], name)?;
-        let reply = unix_request(&socket, &stream_frame(data)?)?;
+        let reply = unix_request(&socket, &stream_frame(data)?)
+            .map_err(|e| io::Error::other(format!("INSTREAM {name}: {e}")))?;
         scans.insert(name, json!({"sha256": fixtures::hex(&Sha256::digest(data)), "bytes": data.len(), "instream": scan_result(reply)}));
     }
     Ok(json!({
@@ -258,6 +259,38 @@ fn load(path: &Path) -> io::Result<Value> {
     serde_json::from_reader(File::open(path)?).map_err(io::Error::other)
 }
 
+// Derive the exact milestone expectations from stock, preserving all other fields.
+fn partial_reference(mut stock: Value) -> io::Result<Value> {
+    validate_reference(&stock)?;
+    const ERROR: &str = "stream: Incomplete scan: unsupported detection coverage. ERROR\0";
+    for profile in ["local", "official"] {
+        let results = &mut stock["profiles"][profile];
+        let scans: &[&str] = if profile == "local" {
+            &["clean", "nested"]
+        } else {
+            &["clean", "nested", "detected", "competing"]
+        };
+        for &name in scans {
+            results["scans"][name]["instream"] = scan_result(ERROR.into());
+        }
+        results["wire"]["tcp-zINSTREAM-clean"] = json!(ERROR);
+        // clamdscan also submits a truncated stream for its stream-limit probe.
+        for &name in scans.iter().chain(["limit"].iter()) {
+            results["clamdscan"][format!("stream-{name}")] = incomplete_client(name, false);
+        }
+        if profile == "official" {
+            results["clamdscan"]["fdpass-detected"] = incomplete_client("detected", false);
+            results["clamdscan"]["path-detected"] = incomplete_client("detected", true);
+        }
+    }
+    Ok(stock)
+}
+
+fn incomplete_client(name: &str, path_mode: bool) -> Value {
+    let prefix = if path_mode { "Incomplete scan: " } else { "" };
+    json!({"exit": 2, "stdout": format!("{{root}}/{name}: {prefix}unsupported detection coverage. ERROR\n"), "stderr": ""})
+}
+
 fn main() -> io::Result<()> {
     let args: Vec<_> = env::args_os().skip(1).collect();
     match args.as_slice() {
@@ -272,8 +305,11 @@ fn main() -> io::Result<()> {
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
         }
-        [op, db, exe, expected] if op == "check" => {
-            let reference = load(Path::new(expected))?;
+        [op, db, exe, expected] if op == "check" || op == "check-partial" => {
+            let mut reference = load(Path::new(expected))?;
+            if op == "check-partial" {
+                reference = partial_reference(reference)?;
+            }
             let report = capture(Path::new(exe), Path::new(db))?;
             println!("{}", serde_json::to_string_pretty(&report)?);
             compare(&reference, &report)
@@ -282,7 +318,7 @@ fn main() -> io::Result<()> {
             compare(&load(Path::new(expected))?, &load(Path::new(observed))?)
         }
         _ => Err(io::Error::other(
-            "usage: compat_oracle record OFFICIAL_DB | check OFFICIAL_DB DAEMON REFERENCE.json | compare REFERENCE.json OBSERVED.json",
+            "usage: compat_oracle record OFFICIAL_DB | check|check-partial OFFICIAL_DB DAEMON REFERENCE.json | compare REFERENCE.json OBSERVED.json",
         )),
     }
 }
@@ -290,6 +326,30 @@ fn main() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_reference_requires_specific_errors_and_preserves_local_hits() {
+        let stock: Value =
+            serde_json::from_str(include_str!("../docs/compat-reference.json")).unwrap();
+        let expected = partial_reference(stock.clone()).unwrap();
+        assert!(compare(&stock, &expected).is_err());
+        for (pointer, wrong) in [
+            (
+                "/profiles/local/scans/detected/instream/reply",
+                json!("stream: OK\0"),
+            ),
+            (
+                "/profiles/local/scans/nested/instream/reply",
+                json!("stream: unexpected ERROR\0"),
+            ),
+            ("/profiles/official/clamdscan/path-detected/exit", json!(0)),
+            ("/profiles/official/wire/unix-zPING", json!("PONG\n")),
+        ] {
+            let mut observed = expected.clone();
+            *observed.pointer_mut(pointer).unwrap() = wrong;
+            assert!(compare(&expected, &observed).is_err());
+        }
+    }
 
     #[test]
     fn changed_winner_or_framing_fails_comparison() {

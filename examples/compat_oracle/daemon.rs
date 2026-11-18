@@ -38,12 +38,16 @@ pub struct Daemon(Child);
 
 impl Daemon {
     pub fn start(executable: &Path, config: &Path, socket: &Path) -> io::Result<Self> {
+        let mut command = Command::new(executable);
+        command.arg("--config-file").arg(config);
+        Self::start_command(&mut command, config, socket)
+    }
+
+    pub fn start_command(command: &mut Command, config: &Path, socket: &Path) -> io::Result<Self> {
         let log = config.with_extension("log");
         let output = File::create(&log)?;
         let mut daemon = Self(
-            Command::new(executable)
-                .arg("--config-file")
-                .arg(config)
+            command
                 .env("LC_ALL", "C")
                 .env("TZ", "UTC")
                 .stdin(Stdio::null())
