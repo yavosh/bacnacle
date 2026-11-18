@@ -53,6 +53,13 @@ fn pass(line: &str, trace: &str) -> io::Result<Value> {
     )
 }
 
+fn deadline_command(deadline: &str) -> Command {
+    // The shell replaces itself with the worker. Foreground timeout owns and reaps that process.
+    let mut command = Command::new("/usr/bin/timeout");
+    command.args(["--foreground", "--kill-after=1s", deadline, "/bin/sh"]);
+    command
+}
+
 fn main() -> io::Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     let [
@@ -83,7 +90,7 @@ fn main() -> io::Result<()> {
     io::copy(&mut File::open(input)?, &mut io::sink())?;
     let group = Path::new(group);
     let start = Instant::now();
-    let mut child = Command::new("/bin/sh")
+    let mut child = deadline_command("120s")
         .args([
             "-ec",
             "echo $$ > \"$1/cgroup.procs\"; shift; exec \"$@\"",
@@ -121,9 +128,6 @@ fn main() -> io::Result<()> {
             json!({"backend":backend, "trace":trace, "concurrency":concurrency.parse::<u8>().unwrap(), "startup_ns":startup_ns, "ready":ready, "passes":results, "idle":idle}),
         )
     })();
-    if measured.is_err() {
-        let _ = child.kill();
-    }
     let status = child.wait()?;
     let report = measured?;
     if !status.success() {
@@ -135,6 +139,37 @@ fn main() -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn timeout_reaps_stalled_worker_at_readiness_and_shutdown() -> std::io::Result<()> {
+        use super::*;
+        for announces_ready in [false, true] {
+            let start = Instant::now();
+            let script = if announces_ready {
+                "echo $$; echo READY; trap '' TERM; exec sleep 60"
+            } else {
+                "echo $$; exec sleep 60"
+            };
+            let mut child = deadline_command("0.5s")
+                .args(["-c", script])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()?;
+            let mut output = BufReader::new(child.stdout.take().unwrap());
+            let pid = reply(&mut output)?;
+            if announces_ready {
+                assert_eq!(reply(&mut output)?.trim(), "READY");
+                drop(child.stdin.take());
+            } else {
+                assert!(reply(&mut output).is_err());
+            }
+            assert!(!child.wait()?.success());
+            assert!(!Path::new("/proc").join(pid.trim()).exists());
+            assert!(start.elapsed() < Duration::from_secs(10));
+        }
+        Ok(())
+    }
+
     #[test]
     fn detects_changed_counts_and_empty_timing() {
         let checksum = "f".repeat(64);

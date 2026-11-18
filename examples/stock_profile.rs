@@ -218,10 +218,10 @@ fn run() -> io::Result<Value> {
         let mut peak = Counters::read(group)?;
         let mut issued = None;
         let mut reload_peak: Option<Counters> = None;
-        let mut activated = false;
+        let mut count_at_activation = None;
         let pass = thread::scope(|scope| {
             let work = scope.spawn(|| replay(socket, &file, &trace, concurrency, &done));
-            while !work.is_finished() || (issued.is_some() && !activated) {
+            while !work.is_finished() || (issued.is_some() && count_at_activation.is_none()) {
                 let measured = Counters::read(group)?;
                 if measured.current > peak.current {
                     peak = measured.clone();
@@ -237,7 +237,7 @@ fn run() -> io::Result<Value> {
                     issued = Some((start, count));
                 }
                 if let Some((start, _)) = issued
-                    && !activated
+                    && count_at_activation.is_none()
                 {
                     if reload_peak
                         .as_ref()
@@ -249,7 +249,13 @@ fn run() -> io::Result<Value> {
                     if log.contains("Database correctly reloaded (")
                         && log.contains("Activating the newly loaded database")
                     {
-                        activated = true;
+                        let completed = done.load(Ordering::Relaxed);
+                        if completed == trace.len() {
+                            return Err(io::Error::other(
+                                "traffic ended before reload activation was observed",
+                            ));
+                        }
+                        count_at_activation = Some(completed);
                         report["stages"]["reload_activation"] = measured.json();
                         report["reload_activation_ms"] =
                             json!(start.elapsed().as_secs_f64() * 1000.);
@@ -275,6 +281,7 @@ fn run() -> io::Result<Value> {
             )?;
             report["passes"][phase]["activation_observed"] = json!(true);
             report["passes"][phase]["requests_before_reload"] = json!(count);
+            report["passes"][phase]["requests_at_activation"] = json!(count_at_activation);
         }
         report["stages"][format!("{phase}_active_peak")] = peak.json();
         report["stages"][format!("{phase}_end")] = Counters::read(group)?.json();
