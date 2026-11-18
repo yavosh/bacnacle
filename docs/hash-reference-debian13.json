@@ -1,0 +1,90 @@
+{
+  "clamav-daemon": "1.4.3+dfsg-1",
+  "version_reply": "ClamAV 1.4.3",
+  "config_template": "Foreground yes\nDatabaseDirectory {root}/db\nLocalSocket {root}/socket\nTemporaryDirectory {root}\nDisableCache yes\nSelfCheck 0\n",
+  "database_sha256": {
+    "fixture.hdb": "a8078d4103acb4f363ee3682100930c3f6494e5202ba41a9ca4387baae64f5f6",
+    "fixture.hsb": "df73c602fc087e37539a98a74007acacdadb6f4b7e919b650a65bcb3ce345e10"
+  },
+  "cases": [
+    {
+      "case": "exact",
+      "bytes": 261,
+      "sha256": "25f279a651b77f10040870f8fedd02cc2694d3ff875acbcf8581c177044c5ffe",
+      "reply": "stream: Barnacle.Exact.UNOFFICIAL FOUND",
+      "result": "matched",
+      "signature": "Barnacle.Exact.UNOFFICIAL",
+      "passed": true
+    },
+    {
+      "case": "wildcard",
+      "bytes": 264,
+      "sha256": "9e2c3c6b5c740f10430135a23782f0f3a70a681dc833197661a07036a0eaf8c7",
+      "reply": "stream: Barnacle.Wildcard.UNOFFICIAL FOUND",
+      "result": "matched",
+      "signature": "Barnacle.Wildcard.UNOFFICIAL",
+      "passed": true
+    },
+    {
+      "case": "wrong-size",
+      "bytes": 266,
+      "sha256": "b6380f1724fbe3519a0965c9c29c2f1468c906c96d75543d57a0aed0b056065d",
+      "reply": "stream: OK",
+      "result": "unmatched",
+      "passed": true
+    },
+    {
+      "case": "no-rule",
+      "bytes": 263,
+      "sha256": "9f603c785e4bc7b3e175569d573150f1914374fd6df9cbb3a0c749aecf7b6f11",
+      "reply": "stream: OK",
+      "result": "unmatched",
+      "passed": true
+    },
+    {
+      "case": "competing",
+      "bytes": 265,
+      "sha256": "aa92116069068d121c31612b60a0db9d2ec90c33501e527c71860428b9ae4de3",
+      "reply": "stream: Barnacle.CompetingExact.UNOFFICIAL FOUND",
+      "result": "matched",
+      "signature": "Barnacle.CompetingExact.UNOFFICIAL",
+      "passed": true
+    },
+    {
+      "case": "duplicate-key",
+      "bytes": 269,
+      "sha256": "887cb0e0c6e5f99166f9d3ed939c07b43b6db67bd754a7a5d4cb1710af4b05c6",
+      "reply": "stream: Barnacle.Third.UNOFFICIAL FOUND",
+      "result": "matched",
+      "signature": "Barnacle.Third.UNOFFICIAL",
+      "passed": true
+    },
+    {
+      "case": "duplicate-name",
+      "bytes": 270,
+      "sha256": "96a4a4901453e867f1045f3a04f6736b0d7347d0fd5d72a11b24b2d735029f75",
+      "reply": "stream: Barnacle.Repeated.UNOFFICIAL FOUND",
+      "result": "matched",
+      "signature": "Barnacle.Repeated.UNOFFICIAL",
+      "passed": true
+    },
+    {
+      "case": "cross-algorithm",
+      "bytes": 271,
+      "sha256": "06300ea304de9fb4b0a8a590f6fb21326673b37ff81a53399ad819c582bf7017",
+      "reply": "stream: Barnacle.MD5.UNOFFICIAL FOUND",
+      "result": "matched",
+      "signature": "Barnacle.MD5.UNOFFICIAL",
+      "passed": true
+    },
+    {
+      "case": "wildcard-versus-algorithm",
+      "bytes": 281,
+      "sha256": "91bebeaa8cba0dbf6e9ee80e1aa6a4e7e70ae6e62d98c1ca25cca61339cd63bb",
+      "reply": "stream: Barnacle.WildMD5.UNOFFICIAL FOUND",
+      "result": "matched",
+      "signature": "Barnacle.WildMD5.UNOFFICIAL",
+      "passed": true
+    }
+  ]
+}
