@@ -1,0 +1,135 @@
+AlertExceedsMax disabled
+CacheSize = "65536"
+PreludeEnable disabled
+PreludeAnalyzerName disabled
+LogFile disabled
+LogFileUnlock disabled
+LogFileMaxSize = "1048576"
+LogTime disabled
+LogClean disabled
+LogSyslog disabled
+LogFacility = "LOG_LOCAL6"
+LogVerbose disabled
+LogRotate disabled
+ExtendedDetectionInfo disabled
+PidFile disabled
+TemporaryDirectory = "/oracle"
+DatabaseDirectory = "/oracle/db"
+OfficialDatabaseOnly disabled
+FailIfCvdOlderThan disabled
+LocalSocket = "/oracle/socket"
+LocalSocketGroup disabled
+LocalSocketMode disabled
+FixStaleSocket = "yes"
+TCPSocket = "3310"
+TCPAddr = "127.0.0.1"
+MaxConnectionQueueLength = "200"
+StreamMaxLength = "1024"
+StreamMinPort = "1024"
+StreamMaxPort = "2048"
+MaxThreads = "10"
+ReadTimeout = "120"
+CommandReadTimeout = "30"
+SendBufTimeout = "500"
+MaxQueue = "100"
+IdleTimeout = "30"
+ExcludePath disabled
+MaxDirectoryRecursion = "15"
+FollowDirectorySymlinks disabled
+FollowFileSymlinks disabled
+CrossFilesystems = "yes"
+SelfCheck disabled
+ConcurrentDatabaseReload = "yes"
+DisableCache = "yes"
+VirusEvent disabled
+ExitOnOOM disabled
+AllowAllMatchScan = "yes"
+Foreground = "yes"
+Debug disabled
+LeaveTemporaryFiles disabled
+GenerateMetadataJson disabled
+User disabled
+Bytecode = "yes"
+BytecodeSecurity = "TrustSigned"
+BytecodeTimeout = "10000"
+BytecodeUnsigned disabled
+BytecodeMode = "Auto"
+DetectPUA disabled
+ExcludePUA disabled
+IncludePUA disabled
+ScanPE = "yes"
+ScanELF = "yes"
+ScanMail = "yes"
+ScanPartialMessages disabled
+PhishingSignatures = "yes"
+PhishingScanURLs = "yes"
+HeuristicAlerts = "yes"
+HeuristicScanPrecedence disabled
+StructuredDataDetection disabled
+StructuredMinCreditCardCount = "3"
+StructuredMinSSNCount = "3"
+StructuredSSNFormatNormal = "yes"
+StructuredSSNFormatStripped disabled
+ScanHTML = "yes"
+ScanOLE2 = "yes"
+AlertBrokenExecutables disabled
+AlertBrokenMedia disabled
+AlertEncrypted disabled
+StructuredCCOnly disabled
+AlertEncryptedArchive disabled
+AlertEncryptedDoc disabled
+AlertOLE2Macros disabled
+AlertPhishingSSLMismatch disabled
+AlertPhishingCloak disabled
+AlertPartitionIntersection disabled
+ScanPDF = "yes"
+ScanSWF = "yes"
+ScanXMLDOCS = "yes"
+ScanHWP3 = "yes"
+ScanOneNote = "yes"
+ScanArchive = "yes"
+ScanImage = "yes"
+ScanImageFuzzyHash = "yes"
+ForceToDisk disabled
+MaxScanTime disabled
+MaxScanSize = "419430400"
+MaxFileSize = "104857600"
+MaxRecursion = "17"
+MaxFiles = "10000"
+MaxEmbeddedPE = "41943040"
+MaxHTMLNormalize = "41943040"
+MaxHTMLNoTags = "8388608"
+MaxScriptNormalize = "20971520"
+MaxZipTypeRcg = "1048576"
+MaxPartitions = "50"
+MaxIconsPE = "100"
+MaxRecHWP3 = "16"
+PCREMatchLimit = "100000"
+PCRERecMatchLimit = "2000"
+PCREMaxFileSize = "104857600"
+OnAccessMountPath disabled
+OnAccessIncludePath disabled
+OnAccessExcludePath disabled
+OnAccessExcludeRootUID disabled
+OnAccessExcludeUID disabled
+OnAccessExcludeUname disabled
+OnAccessMaxFileSize = "5242880"
+OnAccessDisableDDD disabled
+OnAccessPrevention disabled
+OnAccessExtraScanning disabled
+OnAccessCurlTimeout = "5000"
+OnAccessMaxThreads = "5"
+OnAccessRetryAttempts disabled
+OnAccessDenyOnError disabled
+DevACOnly disabled
+DevACDepth disabled
+DevPerformance disabled
+DevLiblog disabled
+DisableCertCheck disabled
+AlgorithmicDetection = "yes"
+BlockMax disabled
+PhishingAlwaysBlockSSLMismatch disabled
+PhishingAlwaysBlockCloak disabled
+PartitionIntersection disabled
+OLE2BlockMacros disabled
+ArchiveBlockEncrypted disabled

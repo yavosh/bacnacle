@@ -138,8 +138,14 @@ fn profile(executable: &Path, official: Option<&Path>) -> io::Result<Value> {
     )?;
     drop(listener);
     let _daemon = Daemon::start(executable, &config, &socket)?;
+    let mut clients = json!({
+        "path-detected": client_scan(root, &config, &[], "detected")?,
+        "fdpass-detected": client_scan(root, &config, &["--fdpass"], "detected")?,
+        "missing-path": client_scan(root, &config, &[], "missing")?,
+    });
     let mut scans = BTreeMap::new();
     for (&name, data) in &corpus {
+        clients[format!("stream-{name}")] = client_scan(root, &config, &["--stream"], name)?;
         let reply = unix_request(&socket, &stream_frame(data)?)?;
         scans.insert(name, json!({"sha256": fixtures::hex(&Sha256::digest(data)), "bytes": data.len(), "instream": scan_result(reply)}));
     }
@@ -153,13 +159,7 @@ fn profile(executable: &Path, official: Option<&Path>) -> io::Result<Value> {
             "tcp-zPING": tcp_request(addr, b"zPING\0")?,
             "tcp-zINSTREAM-clean": tcp_request(addr, &stream_frame(&corpus["clean"])?)?,
         },
-        "clamdscan": {
-            "path-detected": client_scan(root, &config, &[], "detected")?,
-            "stream-detected": client_scan(root, &config, &["--stream"], "detected")?,
-            "fdpass-detected": client_scan(root, &config, &["--fdpass"], "detected")?,
-            "missing-path": client_scan(root, &config, &[], "missing")?,
-            "stream-limit": client_scan(root, &config, &["--stream"], "limit")?,
-        },
+        "clamdscan": clients,
     }))
 }
 
@@ -230,14 +230,17 @@ fn validate_reference(report: &Value) -> io::Result<()> {
         let clients = &results["clamdscan"];
         for mode in [
             "path-detected",
+            "stream-clean",
             "stream-detected",
+            "stream-competing",
+            "stream-nested",
             "fdpass-detected",
             "missing-path",
             "stream-limit",
         ] {
             let expected = match mode {
                 "missing-path" => 2,
-                "stream-limit" => 0,
+                "stream-clean" | "stream-limit" => 0,
                 _ => i32::from(profile == "local"),
             };
             if clients[mode]["exit"] != expected {
@@ -299,6 +302,21 @@ mod tests {
             "stream: OK\0",
         ] {
             assert!(compare(&detected, &scan_result(raw.into())).is_err());
+        }
+    }
+
+    #[test]
+    fn measured_profile_must_use_the_same_generation_and_config() {
+        let measured: Value =
+            serde_json::from_str(include_str!("../docs/compat-reference.json")).unwrap();
+        for pointer in [
+            "/profiles/official/database_sha256/main.cvd",
+            "/config_template",
+        ] {
+            let mut changed = measured.clone();
+            *changed.pointer_mut(pointer).unwrap() = json!("modified");
+            let failure = compare(&measured, &changed).unwrap_err().to_string();
+            assert!(failure.starts_with(pointer), "{failure}");
         }
     }
 

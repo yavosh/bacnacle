@@ -1,0 +1,98 @@
+Module PE: On
+   * Submodule     PARITE:	On
+   * Submodule       KRIZ:	On
+   * Submodule    MAGISTR:	On
+   * Submodule    POLIPOS:	On
+   * Submodule    MD5SECT:	On
+   * Submodule        UPX:	On
+   * Submodule        FSG:	On
+   * Submodule    SWIZZOR:	** Off **
+   * Submodule     PETITE:	On
+   * Submodule     PESPIN:	On
+   * Submodule         YC:	On
+   * Submodule     WWPACK:	On
+   * Submodule     NSPACK:	On
+   * Submodule        MEW:	On
+   * Submodule      UPACK:	On
+   * Submodule     ASPACK:	On
+   * Submodule    CATALOG:	On
+   * Submodule      CERTS:	On
+   * Submodule  MATCHICON:	On
+   * Submodule     IMPTBL:	On
+Module ELF: On
+Module MACHO: On
+Module ARCHIVE: On
+   * Submodule        RAR:	On
+   * Submodule        ZIP:	On
+   * Submodule       GZIP:	On
+   * Submodule       BZIP:	On
+   * Submodule        ARJ:	On
+   * Submodule       SZDD:	On
+   * Submodule        CAB:	On
+   * Submodule        CHM:	On
+   * Submodule       OLE2:	On
+   * Submodule        TAR:	On
+   * Submodule       CPIO:	On
+   * Submodule     BINHEX:	On
+   * Submodule        SIS:	On
+   * Submodule       NSIS:	On
+   * Submodule     AUTOIT:	On
+   * Submodule    ISHIELD:	On
+   * Submodule       7zip:	On
+   * Submodule    ISO9660:	On
+   * Submodule        DMG:	On
+   * Submodule        XAR:	On
+   * Submodule    HFSPLUS:	On
+   * Submodule         XZ:	On
+   * Submodule     PASSWD:	On
+   * Submodule        MBR:	On
+   * Submodule        GPT:	On
+   * Submodule        APM:	On
+   * Submodule        EGG:	On
+   * Submodule        UDF:	On
+   * Submodule        LHA:	On
+   * Submodule        ALZ:	On
+Module DOCUMENT: On
+   * Submodule       HTML:	On
+   * Submodule        RTF:	On
+   * Submodule        PDF:	On
+   * Submodule     SCRIPT:	On
+   * Submodule HTMLSKIPRAW:	On
+   * Submodule     JSNORM:	On
+   * Submodule        SWF:	On
+   * Submodule      OOXML:	On
+   * Submodule      MSPML:	On
+   * Submodule        HWP:	On
+   * Submodule    ONENOTE:	On
+Module MAIL: On
+   * Submodule       MBOX:	On
+   * Submodule       TNEF:	On
+Module OTHER: On
+   * Submodule  UUENCODED:	On
+   * Submodule     SCRENC:	On
+   * Submodule       RIFF:	On
+   * Submodule       JPEG:	On
+   * Submodule    CRYPTFF:	On
+   * Submodule        DLP:	On
+   * Submodule  MYDOOMLOG:	On
+   * Submodule PREFILTERING:	On
+   * Submodule PDFNAMEOBJ:	On
+   * Submodule  PRTNINTXN:	On
+   * Submodule        LZW:	On
+   * Submodule        GIF:	On
+   * Submodule        PNG:	On
+   * Submodule       TIFF:	On
+   * Submodule IMAGE FUZZY HASH:	On
+Module PHISHING On
+   * Submodule     ENGINE:	On
+   * Submodule    ENTCONV:	On
+Module BYTECODE On
+   * Submodule INTERPRETER:	On
+   * Submodule    JIT X86:	On
+   * Submodule    JIT PPC:	On
+   * Submodule    JIT ARM:	** Off **
+Module STATS Off
+Module PCRE On
+   * Submodule    SUPPORT:	On
+   * Submodule    OPTIONS:	On
+   * Submodule     GLOBAL:	On

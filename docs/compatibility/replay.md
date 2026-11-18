@@ -33,9 +33,12 @@ Build the pinned index using the [matcher guide](../whole-file-hashes.md). Set `
 Run the current Barnacle CLI against the same fixture bytes.
 
 ```sh
-target/release/examples/compat_matcher target/release/barnacle docs/compat-reference.json "$index" > /tmp/matcher.json
+target/release/examples/compat_matcher target/release/barnacle "$index" > /tmp/matcher.json
 ```
 
 The matcher report includes each CLI reply and its corresponding stock `INSTREAM` result.
 A direct local detection must report the stock signature. A miss says only that the whole-file hash did not match.
 A nested detection and an oversized stream exercise daemon behavior beyond this matcher.
+
+The Rust matcher runner embeds the [pinned stock results](../compat-reference.json).
+Compare its output with the [recorded matcher results](matcher-results.json).

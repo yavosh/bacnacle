@@ -33,11 +33,11 @@ fn observation(stock: &Value, output: Output, direct_hit: bool) -> Result<Value>
     }))
 }
 
-fn run(binary: &Path, reference: &Path, official: &Path) -> Result<()> {
+fn run(binary: &Path, official: &Path) -> Result<()> {
     if fixtures::file_hash(official)? != INDEX_SHA256 {
         return Err("official index differs from the verified generation".into());
     }
-    let stock: Value = serde_json::from_slice(&fs::read(reference)?)?;
+    let stock: Value = serde_json::from_str(include_str!("../docs/compat-reference.json"))?;
     let tmp = tempfile::tempdir()?;
     let path = tmp.path();
     fixtures::write_rules(path)?;
@@ -100,8 +100,35 @@ fn run(binary: &Path, reference: &Path, official: &Path) -> Result<()> {
 
 fn main() -> Result<()> {
     let args: Vec<_> = env::args_os().skip(1).collect();
-    let [binary, reference, official] = args.as_slice() else {
-        return Err("usage: compat_matcher BARNACLE STOCK_REFERENCE OFFICIAL_INDEX".into());
+    let [binary, official] = args.as_slice() else {
+        return Err("usage: compat_matcher BARNACLE OFFICIAL_INDEX".into());
     };
-    run(Path::new(binary), Path::new(reference), Path::new(official))
+    run(Path::new(binary), Path::new(official))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
+
+    #[test]
+    fn changed_cli_signature_or_exit_status_fails_a_direct_match() {
+        let stock = json!({"verdict": "detected", "signature": "Fixture.Exact"});
+        for (line, exit) in [
+            ("matched\tFixture.Other\n", 0),
+            ("matched\tFixture.Exact\n", 1),
+            ("unmatched\n", 0),
+        ] {
+            let output = Output {
+                status: ExitStatus::from_raw(exit << 8),
+                stdout: line.into(),
+                stderr: Vec::new(),
+            };
+            assert_eq!(
+                observation(&stock, output, true).unwrap()["agrees_with_fixture"],
+                false
+            );
+        }
+    }
 }
