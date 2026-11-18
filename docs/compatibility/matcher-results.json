@@ -1,0 +1,136 @@
+{
+  "backend": "memory",
+  "gaps": [
+    "daemon protocol",
+    "complete clean verdict",
+    "extracted objects",
+    "daemon scan limits"
+  ],
+  "profiles": {
+    "local": {
+      "clean": {
+        "agrees_with_fixture": true,
+        "exit_code": 0,
+        "matcher_signature": null,
+        "stderr": "",
+        "stdout": "unmatched\n",
+        "stock_instream": {
+          "reply": "stream: OK\u0000",
+          "signature": null,
+          "verdict": "clean"
+        }
+      },
+      "competing": {
+        "agrees_with_fixture": true,
+        "exit_code": 0,
+        "matcher_signature": "Barnacle.Oracle.Exact.UNOFFICIAL",
+        "stderr": "",
+        "stdout": "matched\tBarnacle.Oracle.Exact.UNOFFICIAL\n",
+        "stock_instream": {
+          "reply": "stream: Barnacle.Oracle.Exact.UNOFFICIAL FOUND\u0000",
+          "signature": "Barnacle.Oracle.Exact.UNOFFICIAL",
+          "verdict": "detected"
+        }
+      },
+      "detected": {
+        "agrees_with_fixture": true,
+        "exit_code": 0,
+        "matcher_signature": "Barnacle.Oracle.Detected.UNOFFICIAL",
+        "stderr": "",
+        "stdout": "matched\tBarnacle.Oracle.Detected.UNOFFICIAL\n",
+        "stock_instream": {
+          "reply": "stream: Barnacle.Oracle.Detected.UNOFFICIAL FOUND\u0000",
+          "signature": "Barnacle.Oracle.Detected.UNOFFICIAL",
+          "verdict": "detected"
+        }
+      },
+      "limit": {
+        "agrees_with_fixture": true,
+        "exit_code": 0,
+        "matcher_signature": null,
+        "stderr": "",
+        "stdout": "unmatched\n",
+        "stock_instream": {
+          "reply": "INSTREAM size limit exceeded. ERROR\u0000",
+          "signature": null,
+          "verdict": "error"
+        }
+      },
+      "nested": {
+        "agrees_with_fixture": true,
+        "exit_code": 0,
+        "matcher_signature": null,
+        "stderr": "",
+        "stdout": "unmatched\n",
+        "stock_instream": {
+          "reply": "stream: Barnacle.Oracle.Detected.UNOFFICIAL FOUND\u0000",
+          "signature": "Barnacle.Oracle.Detected.UNOFFICIAL",
+          "verdict": "detected"
+        }
+      }
+    },
+    "official": {
+      "clean": {
+        "agrees_with_fixture": true,
+        "exit_code": 0,
+        "matcher_signature": null,
+        "stderr": "",
+        "stdout": "unmatched\n",
+        "stock_instream": {
+          "reply": "stream: OK\u0000",
+          "signature": null,
+          "verdict": "clean"
+        }
+      },
+      "competing": {
+        "agrees_with_fixture": true,
+        "exit_code": 0,
+        "matcher_signature": null,
+        "stderr": "",
+        "stdout": "unmatched\n",
+        "stock_instream": {
+          "reply": "stream: OK\u0000",
+          "signature": null,
+          "verdict": "clean"
+        }
+      },
+      "detected": {
+        "agrees_with_fixture": true,
+        "exit_code": 0,
+        "matcher_signature": null,
+        "stderr": "",
+        "stdout": "unmatched\n",
+        "stock_instream": {
+          "reply": "stream: OK\u0000",
+          "signature": null,
+          "verdict": "clean"
+        }
+      },
+      "limit": {
+        "agrees_with_fixture": true,
+        "exit_code": 0,
+        "matcher_signature": null,
+        "stderr": "",
+        "stdout": "unmatched\n",
+        "stock_instream": {
+          "reply": "INSTREAM size limit exceeded. ERROR\u0000",
+          "signature": null,
+          "verdict": "error"
+        }
+      },
+      "nested": {
+        "agrees_with_fixture": true,
+        "exit_code": 0,
+        "matcher_signature": null,
+        "stderr": "",
+        "stdout": "unmatched\n",
+        "stock_instream": {
+          "reply": "stream: OK\u0000",
+          "signature": null,
+          "verdict": "clean"
+        }
+      }
+    }
+  },
+  "scope": "whole-file matcher"
+}

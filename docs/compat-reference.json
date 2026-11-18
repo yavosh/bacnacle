@@ -1,0 +1,216 @@
+{
+  "architecture": "arm64",
+  "client_package": "1.4.3+dfsg-1",
+  "config_template": "Foreground yes\nDatabaseDirectory {root}/db\nLocalSocket {root}/socket\nTemporaryDirectory {root}\nDisableCache yes\nSelfCheck 0\nStreamMaxLength 1K\nTCPAddr 127.0.0.1\nTCPSocket {port}\n",
+  "profiles": {
+    "local": {
+      "clamdscan": {
+        "fdpass-detected": {
+          "exit": 1,
+          "stderr": "",
+          "stdout": "{root}/detected: Barnacle.Oracle.Detected.UNOFFICIAL FOUND\n"
+        },
+        "missing-path": {
+          "exit": 2,
+          "stderr": "ERROR: Can't access file {root}/missing\n",
+          "stdout": ""
+        },
+        "path-detected": {
+          "exit": 1,
+          "stderr": "",
+          "stdout": "{root}/detected: Barnacle.Oracle.Detected.UNOFFICIAL FOUND\n"
+        },
+        "stream-clean": {
+          "exit": 0,
+          "stderr": "",
+          "stdout": "{root}/clean: OK\n"
+        },
+        "stream-competing": {
+          "exit": 1,
+          "stderr": "",
+          "stdout": "{root}/competing: Barnacle.Oracle.Exact.UNOFFICIAL FOUND\n"
+        },
+        "stream-detected": {
+          "exit": 1,
+          "stderr": "",
+          "stdout": "{root}/detected: Barnacle.Oracle.Detected.UNOFFICIAL FOUND\n"
+        },
+        "stream-limit": {
+          "exit": 0,
+          "stderr": "",
+          "stdout": "{root}/limit: OK\n"
+        },
+        "stream-nested": {
+          "exit": 1,
+          "stderr": "",
+          "stdout": "{root}/nested: Barnacle.Oracle.Detected.UNOFFICIAL FOUND\n"
+        }
+      },
+      "database_sha256": {
+        "fixture.hdb": "112d021ac66386e7e01589b2bad8f616c3593697e17ae261ab3236b244b7df05",
+        "fixture.hsb": "70e86ea9d4ef2ae640f0df8be74a67437cc50363eff60c335b9f7cee8f8f8bad"
+      },
+      "scans": {
+        "clean": {
+          "bytes": 270,
+          "instream": {
+            "reply": "stream: OK\u0000",
+            "signature": null,
+            "verdict": "clean"
+          },
+          "sha256": "ff313a8afe28ae35be2ba902d8e965cc7bf2cd4c5c479b32cf0b2a20e1077537"
+        },
+        "competing": {
+          "bytes": 274,
+          "instream": {
+            "reply": "stream: Barnacle.Oracle.Exact.UNOFFICIAL FOUND\u0000",
+            "signature": "Barnacle.Oracle.Exact.UNOFFICIAL",
+            "verdict": "detected"
+          },
+          "sha256": "2eb59303933fb16eec233ad9a0f7b6a4ca554c821b4e058fa966e4398c0d62ea"
+        },
+        "detected": {
+          "bytes": 273,
+          "instream": {
+            "reply": "stream: Barnacle.Oracle.Detected.UNOFFICIAL FOUND\u0000",
+            "signature": "Barnacle.Oracle.Detected.UNOFFICIAL",
+            "verdict": "detected"
+          },
+          "sha256": "4ede50f860b0ba3c92ce4b7f2a894a69325bf5bb81718971016ac2bb561797f3"
+        },
+        "limit": {
+          "bytes": 1025,
+          "instream": {
+            "reply": "INSTREAM size limit exceeded. ERROR\u0000",
+            "signature": null,
+            "verdict": "error"
+          },
+          "sha256": "4a82297889eb505cf6b5cbdf69977afab4632d6557539782f657bd7dc78091a5"
+        },
+        "nested": {
+          "bytes": 296,
+          "instream": {
+            "reply": "stream: Barnacle.Oracle.Detected.UNOFFICIAL FOUND\u0000",
+            "signature": "Barnacle.Oracle.Detected.UNOFFICIAL",
+            "verdict": "detected"
+          },
+          "sha256": "543b2a212f6dd6784fd75e7e6347070ec39408da191dc847011513a3bb5628e0"
+        }
+      },
+      "wire": {
+        "tcp-zINSTREAM-clean": "stream: OK\u0000",
+        "tcp-zPING": "PONG\u0000",
+        "unix-nPING": "PONG\n",
+        "unix-zPING": "PONG\u0000",
+        "unix-zVERSION": "ClamAV 1.4.3\u0000",
+        "unix-zVERSIONCOMMANDS": "ClamAV 1.4.3| COMMANDS: SCAN QUIT RELOAD PING CONTSCAN VERSIONCOMMANDS VERSION END SHUTDOWN MULTISCAN FILDES STATS IDSESSION INSTREAM DETSTATSCLEAR DETSTATS ALLMATCHSCAN\u0000"
+      }
+    },
+    "official": {
+      "clamdscan": {
+        "fdpass-detected": {
+          "exit": 0,
+          "stderr": "",
+          "stdout": "{root}/detected: OK\n"
+        },
+        "missing-path": {
+          "exit": 2,
+          "stderr": "ERROR: Can't access file {root}/missing\n",
+          "stdout": ""
+        },
+        "path-detected": {
+          "exit": 0,
+          "stderr": "",
+          "stdout": "{root}/detected: OK\n"
+        },
+        "stream-clean": {
+          "exit": 0,
+          "stderr": "",
+          "stdout": "{root}/clean: OK\n"
+        },
+        "stream-competing": {
+          "exit": 0,
+          "stderr": "",
+          "stdout": "{root}/competing: OK\n"
+        },
+        "stream-detected": {
+          "exit": 0,
+          "stderr": "",
+          "stdout": "{root}/detected: OK\n"
+        },
+        "stream-limit": {
+          "exit": 0,
+          "stderr": "",
+          "stdout": "{root}/limit: OK\n"
+        },
+        "stream-nested": {
+          "exit": 0,
+          "stderr": "",
+          "stdout": "{root}/nested: OK\n"
+        }
+      },
+      "database_sha256": {
+        "bytecode.cvd": "6d4aa01f219e988060fc419f495d07f27e0cdf1a2cccc065971da922c76f7ffb",
+        "daily.cvd": "423f7774182bfbc82b50c7796c68a93f8b1817ef7ebbc88d7def444bc2c8f35b",
+        "main.cvd": "0b2182d229f46981ec8f535382222f7c9dfdd656b250ad47988b910a8d302365"
+      },
+      "scans": {
+        "clean": {
+          "bytes": 270,
+          "instream": {
+            "reply": "stream: OK\u0000",
+            "signature": null,
+            "verdict": "clean"
+          },
+          "sha256": "ff313a8afe28ae35be2ba902d8e965cc7bf2cd4c5c479b32cf0b2a20e1077537"
+        },
+        "competing": {
+          "bytes": 274,
+          "instream": {
+            "reply": "stream: OK\u0000",
+            "signature": null,
+            "verdict": "clean"
+          },
+          "sha256": "2eb59303933fb16eec233ad9a0f7b6a4ca554c821b4e058fa966e4398c0d62ea"
+        },
+        "detected": {
+          "bytes": 273,
+          "instream": {
+            "reply": "stream: OK\u0000",
+            "signature": null,
+            "verdict": "clean"
+          },
+          "sha256": "4ede50f860b0ba3c92ce4b7f2a894a69325bf5bb81718971016ac2bb561797f3"
+        },
+        "limit": {
+          "bytes": 1025,
+          "instream": {
+            "reply": "INSTREAM size limit exceeded. ERROR\u0000",
+            "signature": null,
+            "verdict": "error"
+          },
+          "sha256": "4a82297889eb505cf6b5cbdf69977afab4632d6557539782f657bd7dc78091a5"
+        },
+        "nested": {
+          "bytes": 296,
+          "instream": {
+            "reply": "stream: OK\u0000",
+            "signature": null,
+            "verdict": "clean"
+          },
+          "sha256": "543b2a212f6dd6784fd75e7e6347070ec39408da191dc847011513a3bb5628e0"
+        }
+      },
+      "wire": {
+        "tcp-zINSTREAM-clean": "stream: OK\u0000",
+        "tcp-zPING": "PONG\u0000",
+        "unix-nPING": "PONG\n",
+        "unix-zPING": "PONG\u0000",
+        "unix-zVERSION": "ClamAV 1.4.3/28187/Wed Nov 18 06:28:39 2026\u0000",
+        "unix-zVERSIONCOMMANDS": "ClamAV 1.4.3/28187/Wed Nov 18 06:28:39 2026| COMMANDS: SCAN QUIT RELOAD PING CONTSCAN VERSIONCOMMANDS VERSION END SHUTDOWN MULTISCAN FILDES STATS IDSESSION INSTREAM DETSTATSCLEAR DETSTATS ALLMATCHSCAN\u0000"
+      }
+    }
+  },
+  "reference_package": "1.4.3+dfsg-1",
+  "schema": 1
+}

@@ -1,0 +1,9 @@
+Foreground yes
+DatabaseDirectory {root}/db
+LocalSocket {root}/socket
+TemporaryDirectory {root}
+DisableCache yes
+SelfCheck 0
+StreamMaxLength 1K
+TCPAddr 127.0.0.1
+TCPSocket {port}

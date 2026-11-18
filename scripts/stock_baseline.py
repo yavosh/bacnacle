@@ -5,13 +5,33 @@ import hashlib
 import json
 import math
 import os
+import socket
 import sys
 import tempfile
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
-from hash_reference import request, stream_request
+
+def request(path, command):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(5)
+        connection.connect(str(path))
+        connection.sendall(command)
+        reply = bytearray()
+        while len(reply) < 4096:
+            chunk = connection.recv(4096 - len(reply))
+            if not chunk:
+                raise ValueError(f"unterminated clamd reply: {bytes(reply)!r}")
+            reply.extend(chunk)
+            if reply.endswith(b"\0"):
+                return reply[:-1].decode("ascii")
+        raise ValueError("clamd reply exceeds 4096 bytes")
+
+
+def stream_request(path, data):
+    frame = len(data).to_bytes(4, "big") + data + bytes(4)
+    return request(path, b"zINSTREAM\0" + frame)
 
 
 def prepare(corpus):

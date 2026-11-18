@@ -1,22 +1,21 @@
 # Establish the whole-file hash baseline
 
-## Capture reference matches
+## Replay reference matches
 
-Run the following command as an ordinary user on an isolated Debian 13 machine with the reference `clamav-daemon` package.
-Save the JSON outside the checkout.
+Run the live Rust test as an ordinary user on isolated Debian 13 with `clamav-daemon=1.4.3+dfsg-1`.
 
 ```sh
-python3 scripts/hash_reference.py > /tmp/barnacle-hash-reference.json
+cargo test --locked --test hash_reference live_stock_daemon -- --ignored
 ```
 
 The runner creates two local signature files and starts a private clamd.
 It sends nine harmless binary inputs over `INSTREAM`.
 The cases cover exact and wildcard sizes, incorrect sizes, absent hashes, duplicate keys and names, and competing algorithms.
-The report preserves each reply, including the winning signature's suffix.
-The command exits unsuccessfully on a daemon error or unexpected result.
+The test compares each reply byte for byte, including its terminating NUL and the winning signature's suffix.
+The test fails on a daemon error or unexpected result.
 
 The [Debian 13 reference report](hash-reference-debian13.json) records the observed winner, package revision, configuration, database digests, and fixture digests.
-Compare each Rust result against the recorded result and signature, including the exact winner for competing names.
+Run `cargo test --locked --test hash_reference` to compare all three Rust backends with the recorded result and signature.
 Here, `unmatched` describes the hash lookup only.
 These fixtures test hash semantics. The performance runs below use a full verified generation.
 

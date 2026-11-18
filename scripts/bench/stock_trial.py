@@ -8,8 +8,7 @@ import time
 from pathlib import Path
 
 from hash_trial import counters, prepare, startup, usage
-from hash_reference import request
-from stock_baseline import replay
+from stock_baseline import replay, request
 
 
 def main():
