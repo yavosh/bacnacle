@@ -1,4 +1,7 @@
 //! Replay the pinned file and digest traces directly against a resident hash index.
+#[path = "bench/corpus.rs"]
+mod corpus;
+
 use barnacle::{Algorithm, Feed, PINNED_FLEVEL, hash_reader, index::Index};
 use sha2::{Digest, Sha256};
 use std::fs::File;
@@ -8,9 +11,23 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-const FILE_COUNT: usize = 4096;
 const LOOKUP_COUNT: usize = 65536;
-const LENGTHS: [usize; 4] = [4096, 16384, 65536, 262144];
+
+fn prepare_files(output: &Path) -> io::Result<()> {
+    use sha3::{Shake256, digest::ExtendableOutput};
+    let mut file = tempfile::NamedTempFile::new_in(output.parent().unwrap_or(Path::new(".")))?;
+    let mut buffer = Vec::new();
+    for (id, (offset, length)) in corpus::spans().enumerate() {
+        if offset == 0 && id != 0 {
+            continue;
+        }
+        buffer.resize(length, 0);
+        Shake256::digest_xof(format!("barnacle-v1/{id}").as_bytes(), &mut buffer);
+        file.write_all(&buffer)?;
+    }
+    file.persist_noclobber(output)?;
+    Ok(())
+}
 
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
@@ -50,18 +67,9 @@ impl Trace {
         match kind {
             "file" => {
                 let file = File::open(path)?;
-                let mut offset = 0u64;
-                let mut spans = Vec::with_capacity(FILE_COUNT);
-                for i in 0..FILE_COUNT {
-                    let size = LENGTHS[i % 4];
-                    if i > 0 && i % 4 == 0 {
-                        spans.push((0, size));
-                    } else {
-                        spans.push((offset, size));
-                        offset += size as u64;
-                    }
-                }
-                if file.metadata()?.len() != offset {
+                let spans: Vec<_> = corpus::spans().collect();
+                let &(last, length) = spans.last().unwrap();
+                if file.metadata()?.len() != last + length as u64 {
                     return Err(invalid("unexpected corpus size"));
                 }
                 Ok(Self::Files(file, spans))
@@ -174,6 +182,11 @@ fn replay(trace: &Trace, index: &Index, concurrency: usize) -> io::Result<()> {
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let [action, output] = args.as_slice()
+        && action == "prepare-files"
+    {
+        return prepare_files(Path::new(output));
+    }
     if args.first().map(String::as_str) == Some("prepare") && args.len() >= 3 {
         return prepare_queries(
             Path::new(&args[1]),
@@ -182,7 +195,7 @@ fn main() -> io::Result<()> {
     }
     let [backend, index, kind, input, concurrency] = args.as_slice() else {
         return Err(invalid(
-            "usage: hash_bench prepare OUTPUT DB... | BACKEND INDEX file|digest INPUT 1|4",
+            "usage: hash_bench prepare-files OUTPUT | prepare OUTPUT DB... | BACKEND INDEX file|digest INPUT 1|4",
         ));
     };
     let concurrency = match concurrency.as_str() {
@@ -208,4 +221,20 @@ fn main() -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::corpus;
+
+    #[test]
+    fn file_trace_reuses_the_first_object_without_advancing_the_offset() {
+        let spans: Vec<_> = corpus::spans().collect();
+        assert_eq!(spans.len(), 4096);
+        assert_eq!(spans[4], spans[0]);
+        assert_eq!(spans[5], (348160, 16384));
+        let &(last, size) = spans.last().unwrap();
+        assert_eq!(last + size as u64, 352325632);
+        assert_eq!(spans.iter().map(|(_, size)| size).sum::<usize>(), 356515840);
+    }
 }
