@@ -42,7 +42,7 @@ Start with the verified FreshClam snapshot. The build helper checks all three ar
 
 ```sh
 python3 scripts/build_pinned_hash_index.py target/release/barnacle "$snapshot_dir" /tmp/pinned.bhi
-python3 scripts/check_hash_reference.py target/release/barnacle
+cargo test --locked --test hash_reference
 ```
 
 The first command reports eligible records before duplicate resolution. The following counts come from the pinned generation.
