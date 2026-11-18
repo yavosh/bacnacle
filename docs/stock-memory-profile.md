@@ -13,7 +13,8 @@ At four concurrent requests, stock used **1,127.8 MiB** at warm idle. Anonymous 
 | Ready | 1,077.5 | 955.6 | 119.5 | 1,077.7 | 119.2 | 79 |
 | Cold scans, largest sampled current | 1,127.1 | 997.8 | 125.6 | 1,127.2 | 119.5 | 81 |
 | Warm idle | 1,127.8 | 986.8 | 132.8 | 1,131.1 | 119.5 | 81 |
-| Reload, largest sampled current | 1,144.0 | 989.2 | 133.2 | 1,144.1 | 119.5 | 81 |
+| Reload pass, largest sampled current | 1,162.8 | 1,009.2 | 133.9 | 1,164.3 | 119.5 | 81 |
+| Reload request to activation, largest sampled current | 1,144.0 | 989.2 | 133.2 | 1,144.1 | 119.5 | 81 |
 | Activation observed | 1,144.0 | 989.2 | 133.2 | 1,144.1 | 119.5 | 81 |
 
 | Requests in flight | Pass | Files/s | p95 (ms) |
@@ -56,10 +57,10 @@ The table subtracts each omission profile's median ready memory from the all-fam
 | Family omitted | Anonymous saving | Paired anonymous range | File-backed saving | Total saving |
 | --- | ---: | ---: | ---: | ---: |
 | Logical signatures | 690.4 | 688.0–691.1 | 88.4 | 780.3 |
-| PE section hashes | 177.7 | 176.4–178.4 | 159.7 | 338.2 |
+| PE section hashes | 177.7 | 176.4–178.3 | 159.7 | 338.2 |
 | Whole-file hashes | 52.8 | 51.6–53.8 | 36.4 | 89.4 |
 | Body patterns | 39.2 | 37.9–41.4 | 23.6 | 62.9 |
-| Container metadata, icons, and URL rules | 10.7 | 9.5–11.9 | 0.1 | 10.8 |
+| Container metadata, icons, and URL rules | 10.7 | 9.5–12.0 | 0.1 | 10.8 |
 
 All extracted families together used 998.5 MiB of anonymous memory at readiness. The fixed base used 10.4 MiB. Logical signatures account for the largest measured difference. When building the [logical matcher](https://github.com/yavosh/bacnacle/issues/3), measure pattern tables, expression programs, and per-scan state separately. The readiness measurement includes shared initialization costs. It cannot attribute bytes to individual compiled tables or measure scratch space allocated during a scan.
 
