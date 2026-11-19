@@ -10,7 +10,7 @@ pub(super) fn eligible(header: &[u8], file_type: &str) -> bool {
     if header.len() <= 5 {
         return false;
     }
-    // Exclude the leading pairs of all fixed-offset-zero built-in types. Python
+    // Guard fixed-offset-zero built-in types. Most use a leading pair here. Python
     // bytecode uses CR LF at bytes 2 and 3 instead. Include BOMs for encoded text.
     const PREFIXES: &[&[u8; 2]] = &[
         b"\x1f\x8b",
@@ -28,7 +28,6 @@ pub(super) fn eligible(header: &[u8], file_type: &str) -> bool {
         b"BZ",
         b"CW",
         b"Da",
-        b"De",
         b"EG",
         b"En",
         b"ER",
@@ -100,6 +99,8 @@ pub(super) fn eligible(header: &[u8], file_type: &str) -> bool {
             b"Received-SPF: ",
             b"Return-Path: ",
             b"Return-path: ",
+            b"Delivered-To: ",
+            b"Delivery-date: ",
         ]
         .iter()
         .any(|field| header.starts_with(field))
@@ -128,7 +129,7 @@ pub(super) fn eligible(header: &[u8], file_type: &str) -> bool {
         b"\nFrom",
         b"\nMessage",
         b"\nReceiv",
-        b"Delivere",
+        b"Delivered-To:",
         b"/RGB",
         b"\x19\x04\x00\x10",
     ];
@@ -221,6 +222,20 @@ mod tests {
         }
         assert!(test(b"bill %pDx"));
         assert!(test(b"bill \xa4h"));
+    }
+
+    #[test]
+    fn delivery_prose_reaches_the_raw_stage() {
+        let eligible = |header: &[u8]| eligible(header, "CL_TYPE_TEXT_ASCII");
+        assert!(eligible(b"Depot receipt\nDelivered intact.\n"));
+        assert!(eligible(b"Delivery dated Monday.\n"));
+        for header in [
+            b"Delivered-To: stockroom@example.invalid".as_slice(),
+            b"Delivery-date: Mon, 16 Nov 2026 12:00:00 +0000",
+            b"X-Inventory: recorded\ndElIvErEd-To: stockroom@example.invalid",
+        ] {
+            assert!(!eligible(header));
+        }
     }
 
     #[test]

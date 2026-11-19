@@ -1445,6 +1445,8 @@ fn saved_mailbox_spans(stock: bool) -> io::Result<()> {
         let crlf = i % 3 == 2;
         let body = if fold {
             format!("Office delivery {i}\n\t \nFiled.\n")
+        } else if i == 15 || i == 17 {
+            format!("Depot receipt {i}\nDelivered intact.\n")
         } else {
             format!("Office delivery {i}\nFiled.\n")
         };
