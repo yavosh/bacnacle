@@ -213,11 +213,16 @@ impl Reply<'_> {
         generation: &super::Generation,
         input: impl Read,
     ) -> io::Result<Option<Detection>> {
-        generation.scan(Cancellable {
-            input,
-            conn: self.conn,
-            state: self.state,
-            checked: None,
+        let mut checked: Option<Instant> = None;
+        generation.scan_checked(input, || {
+            if self.state.stopping() {
+                return Err(io::ErrorKind::ConnectionAborted.into());
+            }
+            if checked.is_none_or(|last| last.elapsed() >= Duration::from_millis(100)) {
+                check_connection(self.conn)?;
+                checked = Some(Instant::now());
+            }
+            Ok(())
         })
     }
 
@@ -248,7 +253,9 @@ impl Reply<'_> {
         let mut details = None;
         let status = match result {
             Ok(Some(Detection { name, hashes })) => {
-                if self.state.config.extended_detection_info {
+                if self.state.config.extended_detection_info
+                    && let Some(hashes) = hashes
+                {
                     details = Some(format!(
                         "{name}({}:{}) FOUND",
                         hashes.md5_hex(),
@@ -300,31 +307,6 @@ fn check_connection(conn: &Connection) -> io::Result<()> {
         return Err(io::ErrorKind::ConnectionAborted.into());
     }
     Ok(())
-}
-
-struct Cancellable<'a, R> {
-    input: R,
-    conn: &'a Connection,
-    state: &'a State,
-    checked: Option<Instant>,
-}
-
-impl<R: Read> Read for Cancellable<'_, R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.state.stopping() {
-            return Err(io::ErrorKind::ConnectionAborted.into());
-        }
-        // Check for a disconnected client periodically while scanning local files.
-        // A peer may close its write half and continue reading replies.
-        if self
-            .checked
-            .is_none_or(|last| last.elapsed() >= Duration::from_millis(100))
-        {
-            check_connection(self.conn)?;
-            self.checked = Some(Instant::now());
-        }
-        self.input.read(buf)
-    }
 }
 
 struct Chunks<'a> {
@@ -404,7 +386,7 @@ fn instream<'a>(reply: Reply<'a>, jobs: Option<&Jobs<'a, '_>>) -> io::Result<boo
         let (valid, finalized) = std::sync::mpsc::channel();
         let engine = generation.clone();
         let declined = jobs.try_submit(move || {
-            let result = engine.scan(input);
+            let result = reply.scan(&engine, input);
             if finalized.recv().is_ok() {
                 reply.stream_result(result)?;
             }
@@ -420,7 +402,7 @@ fn instream<'a>(reply: Reply<'a>, jobs: Option<&Jobs<'a, '_>>) -> io::Result<boo
             return Ok(true);
         }
     }
-    let result = generation.scan(&mut data);
+    let result = reply.scan(&generation, &mut data);
     if !data.finish(reply)? {
         return Ok(false);
     }

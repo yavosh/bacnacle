@@ -6,9 +6,10 @@ use md5::{Digest, Md5};
 use sha1::Sha1;
 use sha2::Sha256;
 
+pub mod body;
 mod feed;
 pub mod index;
-pub use feed::{Feed, FileInventory, PINNED_FLEVEL};
+pub use feed::{Feed, FileInventory, IgnoreSet, PINNED_FLEVEL};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]

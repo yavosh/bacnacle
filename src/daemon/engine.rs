@@ -3,12 +3,13 @@ mod cvd;
 mod raw;
 
 use super::Config;
+use barnacle::body::{BodyIndex, ObjectContext};
 use barnacle::index::{self, Index};
-use barnacle::{Feed, FileHashes, PINNED_FLEVEL, hash_reader};
+use barnacle::{Feed, FileHashes, IgnoreSet, PINNED_FLEVEL, hash_reader};
 use nix::libc;
 use std::ffi::CStr;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -155,16 +156,19 @@ fn sources(config: &Config) -> io::Result<Vec<Source>> {
 
 pub(super) struct Detection {
     pub name: String,
-    pub hashes: FileHashes,
+    pub hashes: Option<FileHashes>,
 }
 
 pub(super) struct Generation {
     sources: Vec<Source>,
     index: Index,
+    body: BodyIndex,
+    temporary_directory: PathBuf,
     version: String,
     scan_limit: u64,
     scan_time: Duration,
     partial_only: bool,
+    needs_hashes: bool,
 }
 
 fn daily_version() -> io::Result<String> {
@@ -226,7 +230,7 @@ impl Generation {
             match ext.as_str() {
                 "cvd" => cvd::extract(path, temp.path(), &mut paths)?,
                 "hdu" | "hsu" | "mdu" | "msu" | "ndu" | "ldu" if !config.detect_pua => continue,
-                "hdb" | "hsb" | "ign" | "ign2" | "fp" | "sfp" => {
+                "hdb" | "hsb" | "ndb" | "ndu" | "ign" | "ign2" | "fp" | "sfp" => {
                     let output =
                         local_dir.join(path.file_name().expect("directory entry has a name"));
                     source.copy_to(&output)?;
@@ -235,16 +239,29 @@ impl Generation {
                 _ => return Err(invalid(format!("unsupported database: {}", path.display()))),
             }
         }
-        let paths: Vec<_> = paths
+        let (body_paths, hash_paths): (Vec<_>, Vec<_>) = paths
             .iter()
             .map(|(p, official)| (p.as_path(), *official))
-            .collect();
-        let mut feed = Feed::load_sources(&paths, PINNED_FLEVEL)?;
+            .partition(|(p, _)| matches!(extension(p).as_str(), "ndb" | "ndu"));
+        let (mut feed, ignores) = if hash_paths.is_empty() && !body_paths.is_empty() {
+            (Feed::default(), IgnoreSet::default())
+        } else {
+            Feed::load_sources_with_ignores(&hash_paths, PINNED_FLEVEL)?
+        };
         let partial_only = has_cvd || feed.inventory.iter().any(|i| i.outside_matcher > 0);
+        let needs_hashes =
+            !partial_only && (!feed.rules.is_empty() || config.extended_detection_info);
         let db = temp.path().join("index.bhi");
         index::build(&db, &mut feed.rules)?;
         drop(feed);
         let index = Index::open_pread(&db)?;
+        // Each body source is a private copy in this generation's temporary directory.
+        // Release its pages when parsing finishes, before building the search automata.
+        let body = BodyIndex::load_with(&body_paths, PINNED_FLEVEL, &ignores, |path| {
+            let file = File::open(path)?;
+            fs::remove_file(path)?;
+            Ok(file)
+        })?;
         if inputs != sources(config)? {
             return Err(invalid("database changed while loading"));
         }
@@ -256,9 +273,12 @@ impl Generation {
         Ok(Self {
             sources: inputs,
             index,
+            body,
+            temporary_directory: config.temporary_directory.clone(),
             scan_limit,
             scan_time: config.max_scan_time,
             partial_only,
+            needs_hashes,
             version: if has_cvd {
                 daily_version()?
             } else {
@@ -275,46 +295,105 @@ impl Generation {
         Ok(self.sources != sources(config)?)
     }
 
-    pub(super) fn scan(&self, reader: impl Read) -> io::Result<Option<Detection>> {
+    #[cfg(test)]
+    fn scan(&self, reader: impl Read) -> io::Result<Option<Detection>> {
+        self.scan_checked(reader, || Ok(()))
+    }
+
+    pub(super) fn scan_checked(
+        &self,
+        reader: impl Read,
+        mut alive: impl FnMut() -> io::Result<()>,
+    ) -> io::Result<Option<Detection>> {
+        let deadline = (!self.scan_time.is_zero())
+            .then(|| Instant::now().checked_add(self.scan_time))
+            .flatten();
+        let mut check = || {
+            check_deadline(deadline)?;
+            alive()
+        };
         let mut input = ScanInput {
             reader: reader.take(self.scan_limit.saturating_add(1)),
             header: Vec::with_capacity(raw::HEADER_SIZE),
-            deadline: (!self.scan_time.is_zero())
-                .then(|| Instant::now().checked_add(self.scan_time))
-                .flatten(),
+            object: (!self.body.is_empty() && !self.partial_only)
+                .then(|| tempfile::spooled_tempfile_in(64 * 1024, &self.temporary_directory)),
+            check: &mut check,
         };
-        let hashes = hash_reader(&mut input)?;
-        if hashes.size > self.scan_limit {
+        let (size, hashes) = if self.needs_hashes {
+            let hashes = hash_reader(&mut input)?;
+            (hashes.size, Some(hashes))
+        } else {
+            (io::copy(&mut input, &mut io::sink())?, None)
+        };
+        (input.check)()?;
+        if size > self.scan_limit {
             return Err(invalid("scan size limit exceeded"));
         }
         // The pinned engine skips files of five bytes or less. Unimplemented
         // allowlists and other official matchers can suppress or supersede a hash.
-        if self.partial_only || hashes.size > i32::MAX as u64 {
+        if self.partial_only || size <= 5 || size > i32::MAX as u64 {
             return Ok(None);
         }
-        let result =
-            hashes.lookup(|algorithm, digest, size| self.index.lookup(algorithm, digest, size))?;
-        Ok(result
-            .filter(|_| raw::eligible(&input.header))
-            .map(|name| Detection { name, hashes }))
+        let eligible = raw::eligible(&input.header);
+        if let Some(object) = input.object {
+            let mut find = |bytes: &[u8]| -> io::Result<Option<String>> {
+                let context = ObjectContext::raw(bytes);
+                // In the pinned scanner PE signature matching precedes PE unpacking.
+                // Other container or normalized objects may first produce a nested winner.
+                if !eligible && !context.is_valid_pe() {
+                    return Ok(None);
+                }
+                Ok(self
+                    .body
+                    .first_match_checked(bytes, &context, &mut *input.check)?
+                    .map(str::to_owned))
+            };
+            let name = match object.into_inner() {
+                tempfile::SpooledData::InMemory(bytes) => find(bytes.get_ref())?,
+                tempfile::SpooledData::OnDisk(file) => {
+                    // SAFETY: this unlinked scratch file has a single owner. All writes
+                    // finished before mapping. The map is dropped before the file handle.
+                    let bytes = unsafe { memmap2::Mmap::map(&file)? };
+                    find(&bytes)?
+                }
+            };
+            if let Some(name) = name {
+                return Ok(Some(Detection { name, hashes }));
+            }
+        }
+        if eligible && let Some(digests) = &hashes {
+            let result = digests
+                .lookup(|algorithm, digest, size| self.index.lookup(algorithm, digest, size))?;
+            return Ok(result.map(|name| Detection { name, hashes }));
+        }
+        Ok(None)
     }
 }
 
-struct ScanInput<R> {
+struct ScanInput<'a, R> {
     reader: R,
     header: Vec<u8>,
-    deadline: Option<Instant>,
+    object: Option<tempfile::SpooledTempFile>,
+    check: &'a mut dyn FnMut() -> io::Result<()>,
 }
 
-impl<R: Read> Read for ScanInput<R> {
+fn check_deadline(deadline: Option<Instant>) -> io::Result<()> {
+    if deadline.is_some_and(|t| Instant::now() >= t) {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "MaxScanTime exceeded",
+        ));
+    }
+    Ok(())
+}
+
+impl<R: Read> Read for ScanInput<'_, R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        if self.deadline.is_some_and(|t| Instant::now() >= t) {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "MaxScanTime exceeded",
-            ));
-        }
+        (self.check)()?;
         let n = self.reader.read(buffer)?;
+        if let Some(object) = &mut self.object {
+            object.write_all(&buffer[..n])?;
+        }
         let keep = n.min(raw::HEADER_SIZE - self.header.len());
         self.header.extend_from_slice(&buffer[..keep]);
         Ok(n)
@@ -399,6 +478,40 @@ mod tests {
     }
 
     #[test]
+    fn body_only_generation_hashes_for_extended_logs() {
+        let mut fixture = Fixture::new();
+        fixture.write("local.ndb", "Marker:0:*:616263646566\n");
+        let scan = |config: &Config| {
+            Generation::load(config)
+                .unwrap()
+                .scan(&b"abcdef"[..])
+                .unwrap()
+                .unwrap()
+        };
+        assert!(scan(&fixture.config).hashes.is_none());
+        fixture.config.extended_detection_info = true;
+        let digests = scan(&fixture.config).hashes.unwrap();
+        assert_eq!(digests.md5_hex(), "e80b5017098950fc58aad83c8c14978e");
+        assert_eq!(digests.size, 6);
+    }
+
+    #[test]
+    fn invalid_body_record_identifies_the_source_and_preserves_the_loaded_rules() {
+        let fixture = Fixture::new();
+        let good = "Before:0:*:4261726e61636c65\n";
+        fixture.write("local.ndb", good);
+        let previous = Generation::load(&fixture.config).unwrap();
+        fixture.write("local.ndb", format!("{good}Broken:0:*:GGGG\n"));
+        let error = Generation::load(&fixture.config).err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("local.ndb:2:"));
+        assert_eq!(
+            previous.scan(&b"Barnacle"[..]).unwrap().unwrap().name,
+            "Before.UNOFFICIAL"
+        );
+    }
+
+    #[test]
     fn competing_and_unsupported_results_remain_incomplete() {
         let f = Fixture::new();
         let raw = b"abcdef";
@@ -464,6 +577,10 @@ mod tests {
         }
         let bytes = b"local mixed generation";
         f.write("local.hdb", rule(bytes, "Mixed"));
+        f.write(
+            "local.ndb",
+            "MixedBody:0:*:6c6f63616c206d697865642067656e65726174696f6e\n",
+        );
         let db = Generation::load(&f.config).unwrap();
         assert!(db.version().starts_with("ClamAV 1.4.3/28187/"));
         let local = hash_reader(&bytes[..])
@@ -471,6 +588,14 @@ mod tests {
             .lookup(|a, d, s| db.index.lookup(a, d, s))
             .unwrap();
         assert_eq!(local.as_deref(), Some("Mixed.UNOFFICIAL"));
+        // Stock loads 101,744 body signatures from these official archives at flevel 213.
+        assert_eq!(db.body.rule_count(), 101_745);
+        assert_eq!(
+            db.body
+                .first_match(bytes, &ObjectContext::raw(bytes))
+                .unwrap(),
+            Some("MixedBody.UNOFFICIAL")
+        );
         assert!(db.scan(&bytes[..]).unwrap().is_none());
     }
 }

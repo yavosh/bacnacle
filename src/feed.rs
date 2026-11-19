@@ -52,6 +52,7 @@ impl fmt::Display for FileInventory {
     }
 }
 
+#[derive(Default)]
 pub struct Feed {
     pub inventory: Vec<FileInventory>,
     /// One stock-selected name per eligible key. Inventory counts include duplicates.
@@ -87,7 +88,7 @@ fn family(path: &Path) -> io::Result<Family> {
 }
 
 #[derive(Default)]
-struct Ignores(HashMap<String, Option<[u8; 16]>>);
+pub struct IgnoreSet(HashMap<String, Option<[u8; 16]>>);
 
 // ClamAV pads names shorter than three bytes with ASCII spaces. Removing those
 // spaces from a key of at most three bytes gives the same equality comparison.
@@ -99,7 +100,7 @@ fn ignore_key(name: &str) -> &str {
     }
 }
 
-impl Ignores {
+impl IgnoreSet {
     fn add(&mut self, line: &str) -> io::Result<()> {
         let fields: Vec<_> = line.split(':').collect();
         let (name, digest) = match fields.as_slice() {
@@ -130,7 +131,7 @@ impl Ignores {
         Ok(())
     }
 
-    fn matches(&self, name: &str, line: &str) -> bool {
+    pub(crate) fn matches(&self, name: &str, line: &str) -> bool {
         let normalized = if name.len() > 3 && name.ends_with('}') {
             name.split_once(".{").map_or(name, |(base, _)| base)
         } else if name.len() > ".UNOFFICIAL".len() {
@@ -170,7 +171,7 @@ fn parse_rule(
     line: &str,
     official: bool,
     flevel: u32,
-    ignores: &Ignores,
+    ignores: &IgnoreSet,
     stats: &mut FileInventory,
 ) -> io::Result<Option<Rule>> {
     let mut fields = line.split(':');
@@ -246,9 +247,17 @@ impl Feed {
 
     /// Validate daemon database records and resolve duplicate keys across all provenances.
     pub fn load_sources(paths: &[(&Path, bool)], flevel: u32) -> io::Result<Self> {
-        Ok(Self::from_eligible(Self::eligible_sources(
-            paths, flevel, true,
-        )?))
+        Ok(Self::load_sources_with_ignores(paths, flevel)?.0)
+    }
+
+    /// Keep the generation’s ignore entries available to the other signature families.
+    pub fn load_sources_with_ignores(
+        paths: &[(&Path, bool)],
+        flevel: u32,
+    ) -> io::Result<(Self, IgnoreSet)> {
+        let mut ignores = IgnoreSet::default();
+        let records = Self::eligible_sources(paths, flevel, true, &mut ignores)?;
+        Ok((Self::from_eligible(records), ignores))
     }
 
     fn from_eligible((mut rules, inventory): (Vec<Rule>, Vec<FileInventory>)) -> Self {
@@ -274,6 +283,7 @@ impl Feed {
                 .collect::<Vec<_>>(),
             flevel,
             false,
+            &mut IgnoreSet::default(),
         )
     }
 
@@ -281,6 +291,7 @@ impl Feed {
         paths: &[(&Path, bool)],
         flevel: u32,
         validate_allowlists: bool,
+        ignores: &mut IgnoreSet,
     ) -> io::Result<(Vec<Rule>, Vec<FileInventory>)> {
         if paths.is_empty() {
             return Err(invalid("no database files"));
@@ -292,7 +303,6 @@ impl Feed {
         inputs.sort_by_key(|(family, _, _)| *family != Family::Ignore);
         let mut rules = Vec::new();
         let mut inventory = Vec::new();
-        let mut ignores = Ignores::default();
         for (family, path, official) in inputs {
             let mut stats = FileInventory {
                 path: path.to_owned(),
@@ -335,7 +345,7 @@ impl Feed {
                         stats.ignore_entries += 1;
                         ignores.add(line)
                     }
-                    Family::Positive => parse_rule(line, official, flevel, &ignores, &mut stats)
+                    Family::Positive => parse_rule(line, official, flevel, ignores, &mut stats)
                         .map(|r| {
                             if let Some(rule) = r {
                                 rules.push(rule)
@@ -352,7 +362,7 @@ impl Feed {
                                 line,
                                 official,
                                 flevel,
-                                &ignores,
+                                ignores,
                                 &mut FileInventory::default(),
                             )
                             .map(|_| ())

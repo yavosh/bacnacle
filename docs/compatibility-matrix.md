@@ -80,7 +80,8 @@ Use each profile's recorded database digests when comparing results.
 | Whole-file hashes, `.hdb .hsb` | main, daily | The offline matcher compares exact sizes, wildcards, miss behavior, duplicates, and competing names with stock. |
 | PUA-only hashes and rules, `.hdu .hsu .mdu .msu .ndu .ldu` | daily | The profile disables PUA. Test enabling the appropriate categories. [#10](https://github.com/yavosh/bacnacle/issues/10) |
 | Ignore names and file allowlists, `.ign .ign2 .fp .sfp` | daily has all four. Main has `.fp .sfp`. | Hash loading applies ignore entries. Test full-scan allowlist and competing-match precedence. [#10](https://github.com/yavosh/bacnacle/issues/10) |
-| Extended and logical patterns, `.ndb .ldb` | main, daily | Exercise byte ranges, offsets, conditions, and normalized objects. [#2](https://github.com/yavosh/bacnacle/issues/2) · [#3](https://github.com/yavosh/bacnacle/issues/3) |
+| Extended patterns, `.ndb` | main, daily | 101,744 active rules compile. Raw object comparisons cover offsets, ranges, and match counts. [Body signature coverage](body-patterns.md) |
+| Logical patterns, `.ldb` | main, daily | Logical conditions and normalized-object comparisons remain open. [#3](https://github.com/yavosh/bacnacle/issues/3) |
 | PE section hashes, `.mdb .msb` | main, daily | Exercise benign sections and signed-file metadata. [#10](https://github.com/yavosh/bacnacle/issues/10) |
 | Container metadata and certificates, `.cdb .crb` | main, daily | Exercise nested object metadata and certificate decisions. [#9](https://github.com/yavosh/bacnacle/issues/9) · [#10](https://github.com/yavosh/bacnacle/issues/10) |
 | PE icons and URL rules, `.idb .pdb .wdb` | daily | Exercise benign local icon and URL fixtures. [#10](https://github.com/yavosh/bacnacle/issues/10) |

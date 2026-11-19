@@ -1,7 +1,7 @@
 # Barnacle
 
-Barnacle is an experimental Rust scanner for ClamAV signatures. Its first matcher detects whole-file MD5, SHA-1, and SHA-256 signatures.
-A match reports the stock signature name. A miss leaves the file pending a complete scan by clamd.
+Barnacle is an experimental Rust scanner for ClamAV whole-file hashes and extended body signatures.
+A confirmed detection reports the stock signature name. Stock clamd supplies complete scan verdicts. [Body signature coverage](docs/body-patterns.md)
 
 Build and test the executable with `cargo build --release --locked` and `cargo test --locked`.
 Run a private daemon with `barnacle serve --foreground --config-file /path/to/clamd.conf`. [Daemon guide](docs/daemon.md)

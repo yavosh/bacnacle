@@ -21,6 +21,7 @@ dependencies = [
 name = "barnacle"
 version = "0.1.0"
 dependencies = [
+ "aho-corasick",
  "flate2",
  "md-5",
  "memmap2",
