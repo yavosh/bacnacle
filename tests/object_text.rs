@@ -286,3 +286,83 @@ fn html_views_respect_input_size_limits() -> io::Result<()> {
 fn stock_html_size_limits() -> io::Result<()> {
     compare_html_limits(Path::new("/usr/sbin/clamd"), true)
 }
+
+fn long_script_hash(executable: &Path, stock: bool) -> io::Result<()> {
+    use md5::{Digest, Md5};
+    let mut paper = b" \tWAREHOUSE\r\n ".to_vec();
+    paper.extend(b"Paper BOX-7. ".repeat(6000));
+    paper.extend(b"\r\nPA\xc3\xa9PER   \tReCeiPt\r\n ");
+    let mut normalized = b" warehouse ".to_vec();
+    normalized.extend(b"paper box-7. ".repeat(6000));
+    normalized.extend(b"paper receipt ");
+    assert!(normalized.len() > 64 * 1024);
+    let hd = |bytes: &[u8], name: &str| {
+        format!(
+            "{}:{}:Local.{name}\n",
+            Md5::digest(bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
+            bytes.len()
+        )
+    };
+    let len = paper.len();
+    let total = len + normalized.len();
+    let view = Some("Local.LargeView.UNOFFICIAL");
+    let raw = Some("Local.RawPaper.UNOFFICIAL");
+    let size_limit = Some("Heuristics.Limits.Exceeded.MaxScanSize");
+    let file_limit = Some("Heuristics.Limits.Exceeded.MaxFiles");
+    let depth_limit = Some("Heuristics.Limits.Exceeded.MaxRecursion");
+    for (limit, scan, files, depth, outer, winner) in [
+        (len, total, 0, 8, false, view),
+        (len - 1, total, 0, 8, false, None),
+        (0, total, 0, 8, false, view),
+        (len, total, 0, 8, true, raw),
+        (len, total - 1, 0, 8, false, size_limit),
+        (len, total, 1, 8, false, file_limit),
+        (len, total, 0, 1, false, depth_limit),
+    ] {
+        let root = tempfile::tempdir_in("/tmp")?;
+        let db = root.path().join("db");
+        fs::create_dir(&db)?;
+        let mut rules = hd(&normalized, "LargeView");
+        if outer {
+            rules += &hd(&paper, "RawPaper")
+        }
+        fs::write(db.join("paper.hdb"), rules)?;
+        fs::write(db.join("unused.ndb"), "Unused:7:EOF-8:526f62696e\n")?;
+        let config = root.path().join("config");
+        let socket = root.path().join("socket");
+        fs::write(
+            &config,
+            format!(
+                "Foreground yes\nDisableCache yes\nLocalSocket {}\nDatabaseDirectory {}\nMaxScriptNormalize {limit}\nMaxScanSize {scan}\nMaxFiles {files}\nMaxRecursion {depth}\nAlertExceedsMax yes\n",
+                socket.display(),
+                db.display()
+            ),
+        )?;
+        let _daemon = Daemon::start(executable, &config, &socket)?;
+        let reply = unix_request(&socket, &stream_frame(&paper)?)?;
+        let expected = match winner {
+            Some(name) => format!("stream: {name} FOUND\0"),
+            None if stock => "stream: OK\0".into(),
+            None => "stream: Incomplete scan: unsupported detection coverage. ERROR\0".into(),
+        };
+        assert_eq!(
+            reply, expected,
+            "script {limit}, size {scan}, count {files}, depth {depth}, raw {outer}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn spilled_normalized_receipt_matches() -> io::Result<()> {
+    long_script_hash(Path::new(env!("CARGO_BIN_EXE_barnacle")), false)
+}
+
+#[test]
+#[ignore = "requires pinned Debian clamd"]
+fn stock_spilled_normalized_receipt_matches() -> io::Result<()> {
+    long_script_hash(Path::new("/usr/sbin/clamd"), true)
+}

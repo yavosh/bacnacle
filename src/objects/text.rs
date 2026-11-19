@@ -159,6 +159,20 @@ struct NormalizedText<'a> {
 
 impl Read for NormalizedText<'_> {
     fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        // Printable text with single spaces keeps its length. Lowercase it in bulk.
+        let n = self.bytes.len().min(output.len());
+        let input = &self.bytes[..n];
+        if n >= 64
+            && !(self.space && input[0] == b' ')
+            && input.iter().all(|b| (0x20..=0x7f).contains(b))
+            && memchr::memmem::find(input, b"  ").is_none()
+        {
+            output[..n].copy_from_slice(input);
+            output[..n].make_ascii_lowercase();
+            self.bytes = &self.bytes[n..];
+            self.space = input[n - 1] == b' ';
+            return Ok(n);
+        }
         let mut written = 0;
         while written < output.len() {
             let Some((&b, rest)) = self.bytes.split_first() else {
@@ -193,4 +207,44 @@ pub(super) fn after_raw(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Ha
             Handling::Complete
         },
     )
+}
+
+#[cfg(test)]
+mod normalized_text_tests {
+    use super::*;
+
+    #[test]
+    fn bulk_reads_keep_scalar_whitespace_state() -> io::Result<()> {
+        let mut source = b"MiXeD-bOX ".repeat(900);
+        source[8191..8193].fill(b' ');
+        source.extend(0..=u8::MAX);
+        source.extend(b" Warehouse note.".repeat(900));
+        source.extend(b"\r\n  Tail\x7f  ");
+        let mut expected = Vec::new();
+        for &byte in &source {
+            match byte {
+                9..=13 | b' ' if expected.last() != Some(&b' ') => expected.push(b' '),
+                0x21..=0x7f => expected.push(byte.to_ascii_lowercase()),
+                _ => (),
+            }
+        }
+        for size in [1, 2, 63, 64, 65, 257, 8191, 8192] {
+            let mut reader = NormalizedText {
+                bytes: &source,
+                space: false,
+            };
+            let mut actual = Vec::new();
+            let mut buf = vec![0; size];
+            loop {
+                assert_eq!(reader.read(&mut [])?, 0);
+                let n = reader.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                actual.extend_from_slice(&buf[..n]);
+            }
+            assert_eq!(actual, expected, "read size {size}");
+        }
+        Ok(())
+    }
 }
