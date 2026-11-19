@@ -238,6 +238,49 @@ pub(in crate::objects) fn directory(
     bytes: &[u8],
     sink: &mut dyn ChildSink,
 ) -> io::Result<Option<(usize, usize)>> {
+    Ok(locate(bytes, sink)?.map(|dir| (dir.offset, dir.count)))
+}
+
+struct Directory {
+    offset: usize,
+    count: usize,
+    zip64_end: Option<usize>,
+}
+
+// Small ZIP64 archives can carry a conventional directory with a 76-byte trailer.
+// The classic counts and size can use sentinels. The directory offset must be usable.
+fn zip64_directory(bytes: &[u8], end: usize, offset: usize) -> Option<Directory> {
+    let start = end.checked_sub(76)?;
+    let tail = &bytes[start..end];
+    let wide = |i| u64::from_le_bytes(tail[i..i + 8].try_into().unwrap());
+    let count = u16::try_from(wide(32)).ok()?;
+    let counts_agree = |i| {
+        let classic = u16_at(bytes, end + i);
+        classic == count || classic == u16::MAX
+    };
+    let classic_size = u32_at(bytes, end + 12);
+    (tail.starts_with(b"PK\x06\x06")
+        && wide(4) == 44
+        && tail[16..24] == [0; 8]
+        && wide(24) == u64::from(count)
+        && (classic_size == u32::MAX || wide(40) == u64::from(classic_size))
+        && wide(48) == offset as u64
+        && wide(40) == start.checked_sub(offset)? as u64
+        && &tail[56..60] == b"PK\x06\x07"
+        && u32_at(tail, 60) == 0
+        && wide(64) == start as u64
+        && u32_at(tail, 72) == 1
+        && bytes[end + 4..end + 8] == [0; 4]
+        && counts_agree(8)
+        && counts_agree(10))
+    .then_some(Directory {
+        offset,
+        count: usize::from(count),
+        zip64_end: Some(start),
+    })
+}
+
+fn locate(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Option<Directory>> {
     if bytes.len() < 22 {
         return Ok(None);
     }
@@ -250,7 +293,12 @@ pub(in crate::objects) fn directory(
                 let record = &bytes[at..at + 22];
                 let offset = u32_at(record, 16) as usize;
                 if offset != 0 && bytes.get(offset..).is_some_and(|b| b.starts_with(CENTRAL)) {
-                    return Ok(Some((offset, usize::from(u16_at(record, 10)))));
+                    let classic = Directory {
+                        offset,
+                        count: usize::from(u16_at(record, 10)),
+                        zip64_end: None,
+                    };
+                    return Ok(Some(zip64_directory(bytes, at, offset).unwrap_or(classic)));
                 }
             }
         }
@@ -271,18 +319,20 @@ pub(in crate::objects) fn single(bytes: &[u8], sink: &mut dyn ChildSink) -> io::
 }
 
 pub(super) fn extract(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handling> {
-    if let Some((directory_offset, count)) = directory(bytes, sink)? {
+    if let Some(Directory {
+        offset: directory_offset,
+        count,
+        zip64_end,
+    }) = locate(bytes, sink)?
+    {
         let mut directory = &bytes[directory_offset..];
         // A classic directory contains at most 65535 records. Store only offsets
         // and sizes so each filename and member body still borrows the source object.
         let mut records = Vec::new();
         let max_files = sink.max_files();
-        let limit = if max_files == 0 {
-            count
-        } else {
-            count.min(max_files)
-        };
-        for _ in 0..limit {
+        let mut visited = 0;
+        while visited < count && (max_files == 0 || records.len() < max_files) {
+            visited += 1;
             sink.check()?;
             let Some((head, rest)) = directory.split_at_checked(46) else {
                 return Ok(Handling::Incomplete);
@@ -297,10 +347,34 @@ pub(super) fn extract(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Hand
             let Some(next) = rest.get(fields..) else {
                 return Ok(Handling::Incomplete);
             };
-            records.push((u32_at(head, 42), (u32_at(head, 20), u32_at(head, 24))));
             directory = next;
+            let offset = u32_at(head, 42);
+            let sizes = (u32_at(head, 20), u32_at(head, 24));
+            if zip64_end.is_some() {
+                // Stock reads the 32-bit local offset and compressed size. A sentinel
+                // skips that member before it consumes a slot in the scan catalogue.
+                if offset == u32::MAX {
+                    continue;
+                }
+                if let Some(local) = bytes
+                    .get(offset as usize..directory_offset)
+                    .and_then(|b| b.get(..30))
+                    && local.starts_with(LOCAL)
+                    && (if u16_at(local, 6) & 8 == 0 {
+                        u32_at(local, 18)
+                    } else {
+                        sizes.0
+                    }) == u32::MAX
+                {
+                    continue;
+                }
+            }
+            records.push((offset, sizes));
         }
-        if limit == count && !directory.starts_with(END) {
+        if visited == count
+            && !directory.starts_with(END)
+            && zip64_end != Some(bytes.len() - directory.len())
+        {
             return Ok(Handling::Incomplete);
         }
         records.sort_unstable();

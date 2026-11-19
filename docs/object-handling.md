@@ -56,6 +56,16 @@ Use the Office benchmark's container settings with 512 requests per client and `
 The sole rule was `40e674895de36362c65153f79fa06d45:81000:Workspace.Reference`.
 [Raw ZIP measurements](benchmarks/object-zip-deflate64.csv) · [Benchmark procedure](benchmarks/object-office-packages.md#reproduction)
 
+### Small ZIP64 archives
+
+Stock scans stored and deflated members in libarchive ZIP64 files with usable 32-bit directory fields.
+The first eligible member wins over the archive. The ZIP parent carries each member’s basename.
+Classic count and directory-size sentinels preserve scanning order, including when central records appear in reverse.
+A sentinel in the classic directory offset suppresses all members, including with file-count and recursion alerts enabled.
+The Apache fixtures exercise per-member sentinels. Stock skips those members and continues with later eligible entries.
+The comparisons cover single-disk archives with a fixed ZIP64 trailer. Large offsets, split archives, and extended trailers remain unverified.
+[Rust comparisons](../tests/object_zip64.rs) · [Writer settings](../tests/fixtures/zip64/README.md)
+
 ### Executable containers
 
 Stock scans a universal Mach-O file's architecture slices in descriptor order before checking the whole-file hash.
