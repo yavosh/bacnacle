@@ -203,6 +203,9 @@ impl State {
             // Block new scan snapshots and let in-flight scans release their old version.
             // Keep the validated old version available in case loading the replacement fails.
             let mut current = self.generation.write().unwrap();
+            if Arc::strong_count(&*current) > 1 {
+                self.log("Waiting for active scans before database reload");
+            }
             while Arc::strong_count(&*current) > 1 && !self.stopping() {
                 thread::sleep(Duration::from_millis(20));
             }

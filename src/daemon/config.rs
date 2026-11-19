@@ -54,6 +54,7 @@ pub(super) struct Config {
     pub log_max_size: u64,
     pub log_rotate: bool,
     pub log_clean: bool,
+    pub extended_detection_info: bool,
     pub log_verbose: bool,
     pub partial_engine_options: Vec<String>,
 }
@@ -102,6 +103,7 @@ impl Default for Config {
             log_max_size: 1 << 20,
             log_rotate: false,
             log_clean: false,
+            extended_detection_info: false,
             log_verbose: false,
             partial_engine_options: Vec::new(),
         }
@@ -189,6 +191,7 @@ impl Config {
             "LogRotate" => self.log_rotate = boolean(value)?,
             "LogTime" => self.log_time = boolean(value)?,
             "LogClean" => self.log_clean = boolean(value)?,
+            "ExtendedDetectionInfo" => self.extended_detection_info = boolean(value)?,
             "LogVerbose" => self.log_verbose = boolean(value)?,
             // clamonacc consumes the OnAccess settings in the same configuration.
             "OnAccessMaxFileSize" => {
@@ -300,7 +303,6 @@ fn reference_engine_value(key: &str, value: &str) -> bool {
         | "ScanXMLDOCS"
         | "ScanHWP3"
         | "Bytecode" => boolean(value).ok() == Some(true),
-        "ExtendedDetectionInfo" => boolean(value).is_ok(),
         "ArchiveBlockEncrypted"
         | "PhishingAlwaysBlockSSLMismatch"
         | "PhishingAlwaysBlockCloak"

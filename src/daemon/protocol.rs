@@ -11,8 +11,10 @@ use std::time::{Duration, Instant};
 use rustix::net::{self, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags};
 
 use super::State;
+use super::engine::Detection;
 
 mod jobs;
+mod order;
 mod paths;
 use jobs::Jobs;
 use std::sync::Mutex;
@@ -171,6 +173,16 @@ struct Reply<'a> {
 
 impl Reply<'_> {
     fn line(&self, path: Option<&OsStr>, status: &str) -> io::Result<()> {
+        self.line_and_log(path, status, path, status)
+    }
+
+    fn line_and_log(
+        &self,
+        path: Option<&OsStr>,
+        status: &str,
+        log_path: Option<&OsStr>,
+        log_status: &str,
+    ) -> io::Result<()> {
         let mut bytes = Vec::new();
         if let Some(id) = self.id {
             write!(bytes, "{id}: ")?;
@@ -181,7 +193,7 @@ impl Reply<'_> {
         }
         bytes.extend_from_slice(status.as_bytes());
         bytes.push(self.term);
-        if let Some(path) = path
+        if let Some(path) = log_path
             && (status.ends_with("FOUND")
                 || status.ends_with("ERROR")
                 || self.state.config.log_clean)
@@ -189,14 +201,18 @@ impl Reply<'_> {
             self.state.log(&format!(
                 "{}: {}",
                 path.to_string_lossy().escape_debug(),
-                status.escape_debug()
+                log_status.escape_debug()
             ));
         }
         let _guard = self.output.lock().unwrap();
         (&*self.conn).write_all(&bytes)
     }
 
-    fn scan(&self, generation: &super::Generation, input: impl Read) -> io::Result<Option<String>> {
+    fn scan(
+        &self,
+        generation: &super::Generation,
+        input: impl Read,
+    ) -> io::Result<Option<Detection>> {
         generation.scan(Cancellable {
             input,
             conn: self.conn,
@@ -205,16 +221,85 @@ impl Reply<'_> {
         })
     }
 
-    fn result(&self, label: &OsStr, result: io::Result<Option<String>>) -> io::Result<bool> {
+    fn result(&self, label: &OsStr, result: io::Result<Option<Detection>>) -> io::Result<bool> {
+        self.named_result(label, label, result)
+    }
+
+    fn stream_result(&self, result: io::Result<Option<Detection>>) -> io::Result<bool> {
+        let peer = match self.conn {
+            Connection::Tcp(stream) => match stream.peer_addr() {
+                Ok(std::net::SocketAddr::V4(addr)) => {
+                    format!("instream({}@{})", addr.ip(), addr.port())
+                }
+                _ => "instream(local)".into(),
+            },
+            Connection::Unix(_) => "instream(local)".into(),
+        };
+        self.named_result(OsStr::new("stream"), OsStr::new(&peer), result)
+    }
+
+    fn named_result(
+        &self,
+        label: &OsStr,
+        log_label: &OsStr,
+        result: io::Result<Option<Detection>>,
+    ) -> io::Result<bool> {
         let detected = matches!(result, Ok(Some(_)));
+        let mut details = None;
         let status = match result {
-            Ok(Some(sig)) => format!("{sig} FOUND"),
+            Ok(Some(Detection { name, hashes })) => {
+                if self.state.config.extended_detection_info {
+                    details = Some(format!(
+                        "{name}({}:{}) FOUND",
+                        hashes.md5_hex(),
+                        hashes.size
+                    ));
+                }
+                format!("{name} FOUND")
+            }
             Ok(None) => INCOMPLETE.to_owned(),
             Err(error) => format!("{error}. ERROR"),
         };
-        self.line(Some(label), &status)?;
+        self.line_and_log(
+            Some(label),
+            &status,
+            Some(log_label),
+            details.as_deref().unwrap_or(&status),
+        )?;
         Ok(detected)
     }
+}
+
+fn descriptor_path(file: &File) -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).ok()
+    }
+    #[cfg(target_vendor = "apple")]
+    {
+        rustix::fs::getpath(file)
+            .ok()
+            .map(|s| Path::new(OsStr::from_bytes(s.as_bytes())).to_owned())
+    }
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+    {
+        let _ = file;
+        None
+    }
+}
+
+fn check_connection(conn: &Connection) -> io::Result<()> {
+    use nix::poll::{PollFd, PollFlags, poll};
+    let mut fd = [PollFd::new(conn.as_fd(), PollFlags::empty())];
+    poll(&mut fd, 0_u8)?;
+    if fd[0]
+        .revents()
+        .unwrap_or(PollFlags::empty())
+        .intersects(PollFlags::POLLHUP | PollFlags::POLLERR)
+    {
+        return Err(io::ErrorKind::ConnectionAborted.into());
+    }
+    Ok(())
 }
 
 struct Cancellable<'a, R> {
@@ -235,16 +320,7 @@ impl<R: Read> Read for Cancellable<'_, R> {
             .checked
             .is_none_or(|last| last.elapsed() >= Duration::from_millis(100))
         {
-            use nix::poll::{PollFd, PollFlags, poll};
-            let mut fd = [PollFd::new(self.conn.as_fd(), PollFlags::empty())];
-            poll(&mut fd, 0_u8)?;
-            if fd[0]
-                .revents()
-                .unwrap_or(PollFlags::empty())
-                .intersects(PollFlags::POLLHUP | PollFlags::POLLERR)
-            {
-                return Err(io::ErrorKind::ConnectionAborted.into());
-            }
+            check_connection(self.conn)?;
             self.checked = Some(Instant::now());
         }
         self.input.read(buf)
@@ -257,7 +333,6 @@ struct Chunks<'a> {
     quota: u64,
     complete: bool,
     overflow: bool,
-    deadline: Deadline,
 }
 
 impl Read for Chunks<'_> {
@@ -267,15 +342,7 @@ impl Read for Chunks<'_> {
         }
         if self.left == 0 {
             let mut header = [0; 4];
-            let mut filled = 0;
-            while filled < header.len() {
-                self.deadline.apply(self.conn)?;
-                let n = (&*self.conn).read(&mut header[filled..])?;
-                if n == 0 {
-                    return Err(io::ErrorKind::UnexpectedEof.into());
-                }
-                filled += n;
-            }
+            (&*self.conn).read_exact(&mut header)?;
             self.left = u32::from_be_bytes(header) as usize;
             if self.left == 0 {
                 self.complete = true;
@@ -291,7 +358,6 @@ impl Read for Chunks<'_> {
             self.quota -= self.left as u64;
         }
         let count = buf.len().min(self.left);
-        self.deadline.apply(self.conn)?;
         let n = (&*self.conn).read(&mut buf[..count])?;
         if n == 0 {
             return Err(io::ErrorKind::UnexpectedEof.into());
@@ -321,13 +387,14 @@ impl Chunks<'_> {
 
 fn instream<'a>(reply: Reply<'a>, jobs: Option<&Jobs<'a, '_>>) -> io::Result<bool> {
     let state = reply.state;
+    // Stock applies ReadTimeout to inactivity between reads during an upload.
+    reply.conn.read_timeout(state.config.read_timeout)?;
     let mut data = Chunks {
         conn: reply.conn,
         left: 0,
         quota: state.config.stream_max_length,
         complete: false,
         overflow: false,
-        deadline: Deadline::new(state.config.read_timeout),
     };
     let generation = state.snapshot();
     if let Some(jobs) = jobs {
@@ -339,7 +406,7 @@ fn instream<'a>(reply: Reply<'a>, jobs: Option<&Jobs<'a, '_>>) -> io::Result<boo
         let declined = jobs.try_submit(move || {
             let result = engine.scan(input);
             if finalized.recv().is_ok() {
-                reply.result(OsStr::new("stream"), result)?;
+                reply.stream_result(result)?;
             }
             Ok(())
         })?;
@@ -357,7 +424,7 @@ fn instream<'a>(reply: Reply<'a>, jobs: Option<&Jobs<'a, '_>>) -> io::Result<boo
     if !data.finish(reply)? {
         return Ok(false);
     }
-    reply.result(OsStr::new("stream"), result)?;
+    reply.stream_result(result)?;
     Ok(true)
 }
 
@@ -570,8 +637,12 @@ pub(super) fn handle(
                     let scan = move || {
                         let label = format!("fd[{}]", file.as_raw_fd());
                         if file.metadata().is_ok_and(|meta| meta.is_file()) {
-                            reply.result(
+                            let path = descriptor_path(&file);
+                            reply.named_result(
                                 OsStr::new(&label),
+                                path.as_deref()
+                                    .map(Path::as_os_str)
+                                    .unwrap_or_else(|| OsStr::new(&label)),
                                 reply.scan(&generation, FromStart(file, 0)),
                             )?;
                         } else {

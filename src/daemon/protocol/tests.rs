@@ -81,13 +81,13 @@ fn missing_descriptor_and_disconnected_sender() {
 }
 
 fn chunks(conn: &Connection, quota: u64) -> Chunks<'_> {
+    conn.read_timeout(Duration::from_secs(1)).unwrap();
     Chunks {
         conn,
         left: 0,
         quota,
         complete: false,
         overflow: false,
-        deadline: Deadline::new(Duration::from_secs(1)),
     }
 }
 

@@ -4,7 +4,7 @@ Build the service, compiler, and validator with one command. The release executa
 
 ```sh
 cargo build --locked --release --bin barnacle
-barnacle serve --foreground --config-file /path/to/clamd.conf
+target/release/barnacle serve --foreground --config-file /path/to/clamd.conf
 ```
 
 Barnacle reads external databases from `DatabaseDirectory`. Use `TemporaryDirectory` for the compiled index during startup and reload.
@@ -15,8 +15,8 @@ The Linux arm64 executable links to libc and the GCC runtime. It starts its own 
 For offline use, compile a local whole-file signature database and verify the resulting index.
 
 ```sh
-barnacle build index.bhi local.hdb
-barnacle validate index.bhi
+target/release/barnacle build index.bhi local.hdb
+target/release/barnacle validate index.bhi
 ```
 
 ## Service and clients
@@ -34,6 +34,8 @@ Use SIGHUP to reopen logs and SIGTERM to stop the service.
 ## Scan results
 
 Barnacle can report a confirmed local whole-file signature with its stock name.
+Set `ExtendedDetectionInfo yes` to include the file's MD5 and byte count in detection logs.
+INSTREAM log entries identify the Unix connection or IPv4 peer. FILDES logs the resolved path when available.
 A hash miss, an unsupported detection stage, or an ambiguous winner produces an error.
 Keep stock clamd authoritative for complete scan verdicts. An ordinary unmatched upload produces the following NUL-terminated reply.
 
@@ -50,10 +52,11 @@ The test used Depot revision `531704866a5d1881f23a4beb633dcdefb0da6bb9` in an is
 ## Verification
 
 Run the ordinary Rust tests with `cargo test --locked --all-targets`.
-Use the pinned Debian environment for the stock lifecycle and systemd socket activation tests.
+Use the pinned Debian environment for the stock lifecycle, real signature archive, and systemd socket activation tests.
+Set `snapshot_dir` to the directory containing the verified archives.
 
 ```sh
-cargo test --locked --test daemon -- --ignored
+BARNACLE_CVD_DIR="$snapshot_dir" cargo test --locked --all-targets -- --include-ignored
 ```
 
 The activation test invokes the packaged `systemd-socket-activate` launcher on a private Unix socket.

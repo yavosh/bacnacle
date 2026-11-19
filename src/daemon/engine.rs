@@ -4,7 +4,7 @@ mod raw;
 
 use super::Config;
 use barnacle::index::{self, Index};
-use barnacle::{Feed, PINNED_FLEVEL, hash_reader};
+use barnacle::{Feed, FileHashes, PINNED_FLEVEL, hash_reader};
 use nix::libc;
 use std::ffi::CStr;
 use std::fs::{self, File, OpenOptions};
@@ -153,6 +153,11 @@ fn sources(config: &Config) -> io::Result<Vec<Source>> {
     Ok(inputs)
 }
 
+pub(super) struct Detection {
+    pub name: String,
+    pub hashes: FileHashes,
+}
+
 pub(super) struct Generation {
     sources: Vec<Source>,
     index: Index,
@@ -270,7 +275,7 @@ impl Generation {
         Ok(self.sources != sources(config)?)
     }
 
-    pub(super) fn scan(&self, reader: impl Read) -> io::Result<Option<String>> {
+    pub(super) fn scan(&self, reader: impl Read) -> io::Result<Option<Detection>> {
         let mut input = ScanInput {
             reader: reader.take(self.scan_limit.saturating_add(1)),
             header: Vec::with_capacity(raw::HEADER_SIZE),
@@ -289,11 +294,9 @@ impl Generation {
         }
         let result =
             hashes.lookup(|algorithm, digest, size| self.index.lookup(algorithm, digest, size))?;
-        if result.is_some() && raw::eligible(&input.header) {
-            Ok(result)
-        } else {
-            Ok(None)
-        }
+        Ok(result
+            .filter(|_| raw::eligible(&input.header))
+            .map(|name| Detection { name, hashes }))
     }
 }
 
@@ -362,16 +365,16 @@ mod tests {
         let old = Generation::load(&f.config).unwrap();
         assert_eq!(old.version(), "ClamAV 1.4.3");
         assert_eq!(
-            old.scan(&bytes[..]).unwrap().as_deref(),
-            Some("First.UNOFFICIAL")
+            old.scan(&bytes[..]).unwrap().unwrap().name,
+            "First.UNOFFICIAL"
         );
         assert!(!old.changed(&f.config).unwrap());
         f.write("fixture.ign2", "First\n");
         f.write("freshclam.dat", "metadata");
         assert!(old.changed(&f.config).unwrap());
         assert_eq!(
-            old.scan(&bytes[..]).unwrap().as_deref(),
-            Some("First.UNOFFICIAL")
+            old.scan(&bytes[..]).unwrap().unwrap().name,
+            "First.UNOFFICIAL"
         );
         let new = Generation::load(&f.config).unwrap();
         assert!(new.scan(&bytes[..]).unwrap().is_none());
@@ -412,10 +415,7 @@ mod tests {
             .concat(),
         );
         let db = Generation::load(&f.config).unwrap();
-        assert_eq!(
-            db.scan(&raw[..]).unwrap().as_deref(),
-            Some("Local.UNOFFICIAL")
-        );
+        assert_eq!(db.scan(&raw[..]).unwrap().unwrap().name, "Local.UNOFFICIAL");
         assert!(db.scan(&ignored[..]).unwrap().is_none());
         assert!(db.scan(&archive[..]).unwrap().is_none());
         assert!(db.scan(&b"short"[..]).unwrap().is_none());

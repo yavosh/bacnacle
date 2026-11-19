@@ -1,8 +1,7 @@
-use std::ffi::OsStr;
 use std::fs::File;
 use std::io;
 use std::os::fd::BorrowedFd;
-use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -15,6 +14,7 @@ use std::sync::Arc;
 
 struct Directory {
     entries: Dir,
+    order: super::order::Order,
     path: PathBuf,
     identity: (u64, u64),
 }
@@ -101,23 +101,33 @@ pub(super) fn scan<'a>(
             first = false;
             (CWD, root.to_owned(), root.to_owned())
         } else if let Some(dir) = stack.last_mut() {
-            match dir.entries.read() {
-                None => {
+            match dir.order.next(
+                &mut dir.entries,
+                config.follow_directory_symlinks,
+                &config.temporary_directory,
+                || {
+                    if state.stopping()
+                        || (!config.max_scan_time.is_zero()
+                            && start.elapsed() >= config.max_scan_time)
+                    {
+                        return Err(io::Error::other("Directory scan interrupted"));
+                    }
+                    super::check_connection(reply.conn)
+                },
+            ) {
+                Ok(None) => {
                     stack.pop();
                     continue;
                 }
-                Some(Err(error)) => {
-                    path_error(&reply, &dir.path, &error.into())?;
+                Err(error) => {
+                    path_error(&reply, &dir.path, &error)?;
                     reported = true;
                     stack.pop();
                     continue;
                 }
-                Some(Ok(entry)) => {
-                    let name = OsStr::from_bytes(entry.file_name().to_bytes());
-                    if name == "." || name == ".." {
-                        continue;
-                    }
-                    (dir.entries.fd()?, PathBuf::from(name), dir.path.join(name))
+                Ok(Some(name)) => {
+                    let path = dir.path.join(&name);
+                    (dir.entries.fd()?, PathBuf::from(name), path)
                 }
             }
         } else {
@@ -178,6 +188,7 @@ pub(super) fn scan<'a>(
             match Dir::new(file) {
                 Ok(entries) => stack.push(Directory {
                     entries,
+                    order: super::order::Order::new(cmd == b"SCAN"),
                     path,
                     identity: (device, meta.ino()),
                 }),

@@ -12,6 +12,8 @@ fn directories_session_and_skipped_objects() -> io::Result<()> {
     let tmp = tempfile::tempdir_in("/tmp")?;
     let root = tmp.path().canonicalize()?;
     let socket = root.join("socket");
+    let scratch = root.join("scratch");
+    fs::create_dir(&scratch)?;
     let db = root.join("db");
     let tree = root.join("objects");
     fs::create_dir(&db)?;
@@ -39,10 +41,27 @@ fn directories_session_and_skipped_objects() -> io::Result<()> {
             "Foreground yes\nLocalSocket {}\nDatabaseDirectory {}\nTemporaryDirectory {}\nSelfCheck 0\nMaxThreads 4\nMaxQueue 4\nMaxDirectoryRecursion 1\nExcludePath omit-path$\n",
             socket.display(),
             db.display(),
-            root.display()
+            scratch.display()
         ),
     )?;
     let _daemon = Daemon::start(Path::new(env!("CARGO_BIN_EXE_barnacle")), &config, &socket)?;
+    let ordered = root.join("ordered");
+    fs::create_dir_all(ordered.join("00-subdirectory"))?;
+    fs::write(ordered.join("00-subdirectory/nested-hit"), data)?;
+    let early = ordered.join("99-earlier-inode");
+    let late = ordered.join("01-later-inode");
+    fs::write(&early, data)?;
+    fs::write(&late, data)?;
+    use std::os::unix::fs::MetadataExt;
+    let first = if early.metadata()?.ino() < late.metadata()?.ino() {
+        early
+    } else {
+        late
+    };
+    assert_eq!(
+        unix_request(&socket, format!("zSCAN {}\0", ordered.display()).as_bytes())?,
+        format!("{}: Fixture.UNOFFICIAL FOUND\0", first.display())
+    );
     for (frame, expected) in [
         (&b"zFILDES\0\0"[..], "No file descriptor received. ERROR\0"),
         (&b"nFILDES\nx"[..], "No file descriptor received. ERROR\n"),
@@ -106,5 +125,24 @@ fn directories_session_and_skipped_objects() -> io::Result<()> {
     actual.sort();
     expected.sort();
     assert_eq!(actual, expected);
+    let large = root.join("large");
+    fs::create_dir(&large)?;
+    for index in 0..2050 {
+        fs::hard_link(&hit, large.join(index.to_string()))?;
+    }
+    let first = large.read_dir()?.next().unwrap()?.path();
+    let scan = format!("zSCAN {}\0", large.display());
+    assert_eq!(
+        unix_request(&socket, scan.as_bytes())?,
+        format!("{}: Fixture.UNOFFICIAL FOUND\0", first.display())
+    );
+    // A regular file at TemporaryDirectory makes spilling fail, even when
+    // tests run as root. The running daemon already owns its active index.
+    fs::rename(&scratch, root.join("previous-scratch"))?;
+    fs::write(&scratch, b"unavailable directory")?;
+    let failure = unix_request(&socket, scan.as_bytes())?;
+    assert!(failure.contains("directory sort failed"));
+    assert!(failure.ends_with(". ERROR\0"));
+    assert_eq!(failure.matches('\0').count(), 1);
     Ok(())
 }

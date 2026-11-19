@@ -7,7 +7,7 @@ use md5::{Digest, Md5};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
@@ -199,6 +199,19 @@ fn lifecycle(exe: &Path, stock: bool) -> io::Result<()> {
     canceled.write_all(b"zINSTREAM\0\0\0\0\x10half")?;
     drop(canceled);
     assert_eq!(unix_request(&socket, b"zPING\0")?, "PONG\0");
+    // The upload lasts longer than ReadTimeout. Every chunk arrives before the next read expires.
+    let mut paced = UnixStream::connect(&socket)?;
+    paced.set_read_timeout(Some(Duration::from_secs(5)))?;
+    paced.write_all(b"zINSTREAM\0")?;
+    for chunk in DATA.chunks(9) {
+        paced.write_all(&(chunk.len() as u32).to_be_bytes())?;
+        paced.write_all(chunk)?;
+        thread::sleep(Duration::from_millis(550));
+    }
+    paced.write_all(&[0; 4])?;
+    let mut paced_reply = String::new();
+    paced.read_to_string(&mut paced_reply)?;
+    assert_eq!(paced_reply, "stream: Barnacle.First.UNOFFICIAL FOUND\0");
     let idle = UnixStream::connect(&socket)?;
     idle.set_read_timeout(Some(Duration::from_secs(6)))?;
     assert_eq!(exchange(idle, b"")?, "COMMAND READ TIMED OUT\n");
@@ -279,13 +292,16 @@ fn systemd_inherited_socket() -> io::Result<()> {
         let config = root.join("service.conf");
         let socket = root.join("systemd.sock");
         let pidfile = root.join("pid");
+        let reserved = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let tcp = reserved.local_addr()?;
         fs::write(
             &config,
             format!(
-                "Foreground yes\nDatabaseDirectory {}\nLocalSocket {}\nPidFile {}\nSelfCheck 0\n",
+                "Foreground yes\nDatabaseDirectory {}\nLocalSocket {}\nPidFile {}\nSelfCheck 0\nTCPAddr 127.0.0.1\nTCPSocket {}\n",
                 db.display(),
                 socket.display(),
-                pidfile.display()
+                pidfile.display(),
+                tcp.port()
             ),
         )?;
         let mut activate = Command::new("systemd-socket-activate");
@@ -296,10 +312,18 @@ fn systemd_inherited_socket() -> io::Result<()> {
             .arg("--foreground=true")
             .arg("--config-file")
             .arg(&config);
+        drop(reserved);
         let _daemon = Daemon::start_command(&mut activate, &config, &socket)?;
         assert_eq!(
             unix_request(&socket, &stream_frame(DATA)?)?,
             "stream: Barnacle.Service.UNOFFICIAL FOUND\0"
+        );
+        assert_eq!(
+            TcpStream::connect_timeout(&tcp, Duration::from_secs(2))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::ConnectionRefused,
+            "{exe} used a configured endpoint outside the systemd descriptor set"
         );
         assert_eq!(unix_request(&socket, b"zQUIT\0")?, "");
         wait_until(|| !pidfile.exists());
