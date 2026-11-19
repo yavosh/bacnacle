@@ -13,7 +13,7 @@ pub(super) enum Parser {
     Mail,
     Tnef,
     Uuencoded,
-    Html,
+    Html { big_endian: bool },
     Utf16Html,
     Pdf,
     Ole2,
@@ -130,16 +130,18 @@ impl FileType {
             if let Some(format) = xml::Format::recognize(bytes) {
                 return Ok(Self::generic(bytes, format.name(), Parser::Xml(format)));
             }
-            match text::raw_target(bytes) {
-                Some(Target::Html) if text::little_endian_html(bytes) => {
+            match text::parser(bytes) {
+                Some(Parser::Utf16Html) => {
                     return Ok(Self::generic(
                         bytes,
                         "CL_TYPE_HTML_UTF16",
                         Parser::Utf16Html,
                     ));
                 }
-                Some(Target::Html) => return Ok(Self::typed(bytes, Target::Html, Parser::Html)),
-                Some(Target::Mail) => return Ok(Self::typed(bytes, Target::Mail, Parser::Mail)),
+                Some(html @ Parser::Html { .. }) => {
+                    return Ok(Self::typed(bytes, Target::Html, html));
+                }
+                Some(Parser::Mail) => return Ok(Self::typed(bytes, Target::Mail, Parser::Mail)),
                 _ => {}
             }
         }
@@ -277,9 +279,11 @@ impl Parser {
             Self::Image if options.scan_image && options.alert_broken_media => {
                 Ok(Handling::Incomplete)
             }
-            Self::Mail | Self::Tnef if options.scan_mail => text::before_raw(bytes, sink),
-            Self::Html | Self::Utf16Html if options.scan_html => text::before_raw(bytes, sink),
-            Self::Uuencoded => text::before_raw(bytes, sink),
+            Self::Mail | Self::Tnef if options.scan_mail => text::before_raw(self, bytes, sink),
+            Self::Html { .. } | Self::Utf16Html if options.scan_html => {
+                text::before_raw(self, bytes, sink)
+            }
+            Self::Uuencoded => text::before_raw(self, bytes, sink),
             // These formats use the ordinary raw matcher after any enabled parser.
             Self::Archive
             | Self::ThinMachO
@@ -302,7 +306,7 @@ impl Parser {
             | Self::HfsPlus
             | Self::Mail
             | Self::Tnef
-            | Self::Html
+            | Self::Html { .. }
             | Self::Utf16Html
             | Self::Pdf => Ok(Handling::Complete),
             Self::Text | Self::None => Ok(Handling::Unrecognized),

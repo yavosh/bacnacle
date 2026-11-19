@@ -1,18 +1,30 @@
 //! Bounded readers for sampled PDF stream filters.
+mod lzw;
+use crate::objects::{ChildSink, Snapshot};
 use flate2::read::ZlibDecoder;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum Filter {
     Flate,
+    Lzw,
     Hex,
     Ascii85,
     RunLength,
     Jpeg,
     Unsupported,
 }
+pub(super) enum Output {
+    Decoded(Snapshot),
+    TooLarge(u64),
+    UseInput,
+    Counted(u64),
+    Malformed,
+}
+
 impl Filter {
     pub(super) fn parse(name: &[u8]) -> Self {
         match name {
+            b"/LZWDecode" | b"/LZW" => Self::Lzw,
             b"/FlateDecode" | b"/Fl" => Self::Flate,
             b"/ASCIIHexDecode" | b"/AHx" => Self::Hex,
             b"/ASCII85Decode" | b"/A85" => Self::Ascii85,
@@ -24,7 +36,51 @@ impl Filter {
     pub(super) fn dumped(&self) -> bool {
         matches!(self, Self::Flate | Self::Hex | Self::Ascii85 | Self::Jpeg)
     }
-    pub(super) fn reader(self, data: &[u8]) -> io::Result<Box<dyn Read + '_>> {
+    pub(super) fn decode(
+        self,
+        data: &[u8],
+        limit: u64,
+        retain: bool,
+        sink: &mut dyn ChildSink,
+    ) -> io::Result<Output> {
+        if self == Self::Lzw {
+            return lzw::decode(data, limit, retain, sink);
+        }
+        let source = self.reader(data)?;
+        let mut source = source.take(limit.saturating_add(1));
+        let mut snapshot = retain.then(|| Snapshot::new(sink.temporary_directory()));
+        let mut buf = [0; 8192];
+        let mut size = 0;
+        loop {
+            sink.check()?;
+            let n = match source.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                // The filter reads only the immutable PDF bytes. Check and scratch
+                // errors arise separately and retain their original error kinds.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::InvalidData
+                            | io::ErrorKind::InvalidInput
+                            | io::ErrorKind::UnexpectedEof
+                    ) =>
+                {
+                    return Ok(Output::Malformed);
+                }
+                Err(e) => return Err(e),
+            };
+            size += n as u64;
+            if size > limit {
+                return Ok(Output::TooLarge(size));
+            }
+            if let Some(file) = &mut snapshot {
+                file.write_all(&buf[..n])?;
+            }
+        }
+        Ok(snapshot.map_or(Output::Counted(size), Output::Decoded))
+    }
+    fn reader(self, data: &[u8]) -> io::Result<Box<dyn Read + '_>> {
         Ok(match self {
             Self::Flate => Box::new(ZlibDecoder::new(data)),
             Self::Hex => Box::new(Hex(data)),

@@ -54,9 +54,10 @@ trait ChildSink {
         name: Option<&[u8]>,
     ) -> io::Result<bool>;
     fn child_bytes(&mut self, bytes: &[u8], name: Option<&[u8]>) -> io::Result<bool>;
+    fn utf16_html(&mut self, bytes: &[u8]) -> io::Result<Handling>;
     fn embedded_archive(&mut self, kind: &'static str, bytes: &[u8]) -> io::Result<Handling>;
     fn embedded_xdp(&mut self, bytes: &[u8]) -> io::Result<Handling>;
-    fn installer_header(&mut self, bytes: &[u8]) -> io::Result<bool>;
+    fn match_generic_view(&mut self, bytes: &[u8]) -> io::Result<bool>;
     fn partition(&mut self, snapshot: Snapshot) -> io::Result<bool> {
         snapshot.with_bytes(|bytes| self.partition_bytes(bytes, None))
     }
@@ -245,6 +246,7 @@ struct Traversal<'a> {
     options: &'a Options,
     temporary_directory: &'a Path,
     parents: Vec<Layer>,
+    normalized_depth: usize,
     bytes_scanned: u64,
     files_scanned: usize,
     stopped: Option<Verdict>,
@@ -271,6 +273,7 @@ pub fn scan(
         options,
         temporary_directory,
         parents: Vec::new(),
+        normalized_depth: 0,
         bytes_scanned: 0,
         files_scanned: 0,
         stopped: None,
@@ -326,7 +329,8 @@ impl Traversal<'_> {
             self.stopped = Some(Verdict::Incomplete);
         }
         if self.stopped.is_none()
-            && (file_type.parser != classify::Parser::Html || !self.options.scan_html)
+            && (!matches!(file_type.parser, classify::Parser::Html { .. })
+                || !self.options.scan_html)
         {
             let (layer, parents) = self.parents.split_last().expect("current layer");
             let object = Object {
@@ -348,7 +352,8 @@ impl Traversal<'_> {
                 && (self.options.scan_archive
                     || self.options.scan_pe && embedded::pe_carrier(file_type.name)
                     || self.options.scan_pdf && xdp::can_retype(file_type.name))
-                && (file_type.parser != classify::Parser::Html || !self.options.scan_html);
+                && (!matches!(file_type.parser, classify::Parser::Html { .. })
+                    || !self.options.scan_html);
             if self.after_raw(bytes, &file_type, recognize)? == Handling::Incomplete {
                 self.stopped = Some(Verdict::Incomplete);
             }
@@ -440,14 +445,14 @@ impl ChildSink for Traversal<'_> {
     fn child_limit(&self) -> Option<Limit> {
         if self.options.max_files != 0 && self.files_scanned >= self.options.max_files {
             Some(Limit::MaxFiles)
-        } else if self.parents.len() >= self.recursion_limit() {
+        } else if self.parents.len() + self.normalized_depth >= self.recursion_limit() {
             Some(Limit::MaxRecursion)
         } else {
             None
         }
     }
 
-    fn installer_header(&mut self, bytes: &[u8]) -> io::Result<bool> {
+    fn match_generic_view(&mut self, bytes: &[u8]) -> io::Result<bool> {
         if !self.can_enter_child() || self.skip_declared_size(bytes.len() as u64) {
             return Ok(false);
         }
@@ -541,6 +546,17 @@ impl ChildSink for Traversal<'_> {
         Ok(self.stopped.is_some())
     }
 
+    fn utf16_html(&mut self, bytes: &[u8]) -> io::Result<Handling> {
+        if self.skip_declared_size((bytes.len() / 2) as u64) || !self.can_enter_child() {
+            return Ok(Handling::Complete);
+        }
+        // Stock counts this buffer for recursion but hides normalized parents from signatures.
+        self.normalized_depth += 1;
+        let result = text::unicode_html(bytes, true, self);
+        self.normalized_depth -= 1;
+        result
+    }
+
     fn child_bytes(&mut self, bytes: &[u8], name: Option<&[u8]>) -> io::Result<bool> {
         if !self.can_enter_child() {
             return Ok(false);
@@ -576,7 +592,7 @@ impl ChildSink for Traversal<'_> {
                     self.first_limit.get_or_insert(Limit::MaxFiles);
                     return Ok(false);
                 }
-                if self.parents.len() >= self.recursion_limit() {
+                if self.parents.len() + self.normalized_depth >= self.recursion_limit() {
                     self.first_limit.get_or_insert(Limit::MaxRecursion);
                     return Ok(false);
                 }

@@ -46,6 +46,15 @@ Both daemons selected its whole-file hash over a target-12 rule. [Java fixtures]
 Little-endian and big-endian WAVE files matched generic body and whole-file signatures both directly and inside ZIP files.
 PNG, JPEG, TIFF, GIF, and BMP controls matched graphics signatures before whole-file hashes. [Media comparisons](../tests/object_images.rs)
 
+### Unicode HTML
+
+Both daemons matched hashes of normalized markup and plain text from little-endian and big-endian UTF-16 pages.
+The comparisons cover multilingual text, a ZIP attachment, and a 2,500-paragraph page.
+For little-endian pages, the HTML size limits apply to the converted bytes. Conversion also consumes one recursion level.
+For big-endian pages with a byte order mark, the limits apply to the original bytes.
+When limits compete, stock checks normalized output size before file count or recursion. Barnacle counts excluded views without storing their output.
+The tests cover file count, scan size, recursion, and disabling HTML scans. [Unicode HTML comparisons](../tests/object_unicode_html.rs) · [Memory and throughput measurements](benchmarks/object-unicode-html.md)
+
 ### Binary HWP documents
 
 HWP5 stores document streams in an OLE compound file. A `FileHeader` stream starts with the HWP signature and contains compression flags.
@@ -118,11 +127,24 @@ Document names come from the winning signature. [End-to-end fixtures](../tests/o
 | PDF feature | Observed coverage |
 | --- | --- |
 | Page streams and embedded files | Unfiltered, Flate, ASCIIHex, ASCII85, run-length and chained ASCIIHex/Flate data. |
+| LZW | Embedded files, page streams, resets, code-width changes, and chained ASCIIHex/LZW filters. [LZW comparisons](../tests/object_pdf_lzw.rs) |
 | Page text | Parenthesized strings in page text arrays. The normalized bytes can match a whole-file hash. |
 | Nested inputs | ZIP containing a PDF and a PDF with competing raw and child rules. |
 | Policies and truncated input | Parser disabled, recursion and expanded-size alerts, a missing final trailer, and a truncated stream. |
 | Packed indirect objects | Stored and Flate object streams, packed page dictionaries, content arrays, indirect lengths, and physical stream order. [Object-stream comparisons](../tests/object_pdf_streams.rs) |
 | Additional PDF stages | Encryption, JavaScript actions and other stream filters require further comparisons. |
+
+Stock uses early LZW code-width changes for both `/LZWDecode` and `/LZW`, even with `/EarlyChange 0`.
+Both daemons matched the same 2,724 output bytes from a 7,500-byte late-change attachment. qpdf 12.4.2 decoded all 7,500 original bytes.
+The sampled unreferenced stream and grayscale image did not produce a decoded match.
+Both daemons scan a decoded page stream before its normalized text.
+
+At 262,143 expanded bytes, a 10,000-byte file limit suppresses the LZW output and records a size alert.
+At 262,144 bytes, stock requests another 256 KiB block. If that request exceeds the limit, both scanners scan the LZW input.
+For an ASCIIHex/LZW chain this input is the ASCIIHex output. Later filters are skipped.
+Barnacle uses a fixed 4,096-entry dictionary and spools at most the remaining object budget.
+It counts terminal output without writing it when file count or recursion excludes the child.
+The decoded size can still trigger a size alert. [LZW comparisons](../tests/object_pdf_lzw.rs)
 
 Both daemons scan PDF attachments in Adobe XDP forms. They visit the first matching PDF in XML order.
 If the form type appears in the first 1,024 bytes, its attached PDF can win over the form hash.
@@ -202,7 +224,20 @@ Barnacle checks each recorded extent against the image length and scans it direc
 The Rust fixtures cover single short, long, and extended allocation descriptors, cross-sector data, truncation, and nested ZIP input.
 Stock supplies an empty original filename and sets the scan parent to `CL_TYPE_UDF` for these members.
 An extent exceeding the remaining scan budget ends the UDF pass. A later smaller file receives no scan.
-The reference also stops at an unsupported allocation layout. Images with fragmented or embedded extents need further comparisons.
+
+Three UDF 1.02 controls place an ordinary text file before and after the ledger under test.
+They derive from an Apple-authored disc with its volume descriptors ordered for stock's reader.
+The single-extent control stores the 5,830-byte ledger contiguously.
+The fragmented control stores the same ledger in two short allocation descriptors at nonconsecutive offsets.
+The inline control stores 61 bytes inside the file entry. Debian 7-Zip 25.01 extracted all nine files byte-for-byte.
+
+Stock and Barnacle stop the UDF pass at the fragmented or inline entry. The later ordinary file receives no scan.
+Hashes for the joined ledger, each individual extent, and the inline payload all miss on their respective controls.
+The earlier file still matches with parent `CL_TYPE_UDF`. A competing whole-disc hash wins in every layout.
+With `MaxFiles 2`, the disc and its first member consume both slots. Only the single-extent control raises `MaxFiles`.
+With exactly 40 bytes left after the disc, only the single-extent control raises `MaxScanSize`.
+All three raise `MaxRecursion` at depth one when limit alerts are enabled.
+Stock reports `OK` on a member-hash miss. Barnacle reports incomplete detection coverage. [Allocation tests](../tests/object_udf.rs)
 
 Two independent control images contain the same harmless text files. Apple `hdiutil makehybrid` produced both with UDF version 1.02.
 Stock reported `OK` on the pure UDF control with the two local member hashes loaded.
@@ -239,6 +274,18 @@ A child inside a nested storage still has the enclosing compound file as its sca
 Rust tests compare competing raw streams and embedded packages in macro-free Word, Excel, and PowerPoint documents.
 They cover flat directories, nested storages, shared stream names, and the underlying filesystem’s scan order.
 Barnacle creates empty private directory entries when it needs that order. It reads each payload from the compound file.
+
+The Excel control contains a generated PNG in a macro-free workbook saved by Spreadsheet::WriteExcel 2.40.
+Stock scans its BIFF report, the original PNG bytes, and then the outer file. It skips the raw Workbook stream.
+The short report contains a 117-byte preamble. Generic body and whole-file signatures match it before the picture.
+A report miss leaves the file count and scan-byte budget available for the picture.
+Stock metadata describes an unnamed PNG under `CL_TYPE_MSXL`. Its parent signature matches `CL_TYPE_MSOLE2`. [Excel tests](../tests/object_ole_xls.rs)
+
+Barnacle joins drawing-group and continuation records in a private spool. The controls cover PNG, JPEG, TIFF, and a multi-record DIB.
+A bare JPEG followed by another store entry includes its next 17 bytes in the tested one-identifier layout.
+The first image exceeding the byte budget stops picture traversal. Disabling `ScanImage` preserves picture hashes. Disabling `ScanOLE2` skips them.
+Report layouts that might fill stock's 4,096-byte output buffer return incomplete coverage. Formula, Name, and String listings also return incomplete coverage.
+Delayed picture data, metafiles, multiple Workbook streams, and mixed Office extraction passes remain unverified. [OfficeArt picture records](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-odraw/c67b883b-8136-4e91-a1a3-2981d16e934f)
 
 Both daemons scan top-level PowerPoint `ExOleObjStg` zlib payloads before the root presentation stream and its file hash.
 A root native Package still wins. A presentation inside a storage receives its attachment pass after the root raw-stream pass.

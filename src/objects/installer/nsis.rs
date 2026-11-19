@@ -146,7 +146,7 @@ impl<'a> Decoder<'a> {
 
 fn visit(data: &[u8], first: bool, sink: &mut dyn ChildSink) -> io::Result<bool> {
     if first {
-        sink.installer_header(data)
+        sink.match_generic_view(data)
     } else {
         sink.child_bytes(data, None)
     }

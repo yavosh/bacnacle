@@ -1,11 +1,11 @@
 //! Scan PDF streams after the raw PDF matcher, in physical indirect-object order.
-use super::{ChildSink, Handling, Snapshot};
+use super::{ChildSink, Handling, Limit, Snapshot};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read};
 
 mod filters;
 mod object_stream;
-use filters::Filter;
+use filters::{Filter, Output};
 
 type Id = (usize, usize);
 const MAX_OBJECTS: usize = 65_536;
@@ -252,7 +252,7 @@ fn parse<'a>(data: &'a [u8], sink: &mut dyn ChildSink) -> io::Result<Option<Pdf<
                 b"/EmbeddedFile" => obj.embedded = true,
                 b"/ObjStm" => obj.object_stream = true,
                 b"/JS" | b"/JavaScript" | b"/OpenAction" | b"/Launch" => obj.unsupported = true,
-                // The pinned Flate, ASCII and run-length decoders ignore filter parameters.
+                // The sampled filters use their defaults even with explicit decode parameters.
                 b"/DecodeParms" | b"/DP" => {
                     if !input.skip_value() {
                         return Ok(None);
@@ -339,10 +339,14 @@ pub(super) fn extract(data: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handl
         let bytes = &bytes[..end];
         let mut decoded: Option<Snapshot> = None;
         let mut directory = obj.directory;
-        for filter in obj.filters {
-            if filter == Filter::Jpeg {
-                break;
-            }
+        let mut filters = obj
+            .filters
+            .into_iter()
+            .take_while(|f| *f != Filter::Jpeg)
+            .peekable();
+        while let Some(filter) = filters.next() {
+            let retain =
+                filters.peek().is_some() || directory.is_some() || sink.child_limit().is_none();
             let first_stage = decoded.is_none();
             let limit = if obj.object_stream && filter == Filter::Flate {
                 // Stock inflates the first 256 KiB before checking its next allocation.
@@ -350,36 +354,40 @@ pub(super) fn extract(data: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handl
             } else {
                 sink.remaining()
             };
-            let mut next = |data: &[u8]| -> io::Result<Option<Snapshot>> {
-                let dir = sink.temporary_directory().to_owned();
-                let mut source = filter.reader(data)?;
-                Snapshot::read_bounded(&mut *source, &dir, limit, || sink.check())
+            let mut input_verdict = None;
+            let mut next = |data: &[u8]| {
+                let result = filter.decode(data, limit, retain, sink)?;
+                if let Output::UseInput = result {
+                    // The current stage still owns this borrowed input, including earlier filters' output.
+                    input_verdict = Some(visit_stream(data, content, sink)?);
+                }
+                Ok(result)
             };
             let result = match decoded.take() {
                 Some(last) => last.with_bytes(next),
                 None => next(bytes),
             };
-            match result {
-                Ok(Some(output)) => decoded = Some(output),
-                Ok(None) => {
-                    sink.skip_declared_size(sink.remaining().saturating_add(1));
+            match result? {
+                Output::Counted(size) => {
+                    record_child_limit(size, sink);
+                    continue 'objects;
+                }
+                Output::Malformed => return Ok(Handling::Incomplete),
+                Output::Decoded(output) => decoded = Some(output),
+                Output::UseInput => {
+                    if input_verdict.expect("fallback visited the input") {
+                        return Ok(Handling::Stopped);
+                    }
+                    continue 'objects;
+                }
+                Output::TooLarge(required) => {
+                    sink.skip_declared_size(required);
                     if obj.object_stream && filter == Filter::Flate && first_stage {
                         directory = None;
                         break;
                     }
                     continue 'objects;
                 }
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        io::ErrorKind::InvalidData
-                            | io::ErrorKind::UnexpectedEof
-                            | io::ErrorKind::InvalidInput
-                    ) =>
-                {
-                    return Ok(Handling::Incomplete);
-                }
-                Err(e) => return Err(e),
             }
         }
         let mut visit = |data: &[u8]| -> io::Result<bool> {
@@ -389,16 +397,7 @@ pub(super) fn extract(data: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handl
                     return Ok(false);
                 }
             }
-            if sink.child_bytes(data, None)? {
-                return Ok(true);
-            }
-            if content {
-                let mut text = ContentsText::new(data);
-                if sink.child(&mut text, None, None)? {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
+            visit_stream(data, content, sink)
         };
         let stopped = match decoded {
             Some(s) => s.with_bytes(visit)?,
@@ -409,6 +408,29 @@ pub(super) fn extract(data: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handl
         }
     }
     packed.map_or(Ok(Handling::Complete), |packed| packed.finish(sink))
+}
+
+fn record_child_limit(size: u64, sink: &mut dyn ChildSink) {
+    if size > 5 || sink.child_limit() == Some(Limit::MaxFiles) {
+        sink.can_enter_child();
+    }
+}
+
+fn visit_stream(data: &[u8], content: bool, sink: &mut dyn ChildSink) -> io::Result<bool> {
+    if sink.child_limit().is_some() {
+        record_child_limit(data.len() as u64, sink);
+        return Ok(false);
+    }
+    if sink.child_bytes(data, None)? {
+        return Ok(true);
+    }
+    if content {
+        let mut text = ContentsText::new(data);
+        if sink.child(&mut text, None, None)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 // The pinned contents pass reads parenthesized strings from text arrays starting a line.

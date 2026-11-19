@@ -38,15 +38,18 @@ impl View {
                 64 * 1024,
                 sink.temporary_directory(),
             )),
-            limit: sink.remaining(),
+            limit: if sink.child_limit().is_none() {
+                sink.remaining()
+            } else {
+                0
+            },
             count: 0,
             last_space: false,
         }
     }
 
     fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
-        // Preserve one extra byte so the normal child reader enforces its limit.
-        let left = self.limit.saturating_add(1).saturating_sub(self.count);
+        let left = self.limit.saturating_sub(self.count);
         let keep = left.min(bytes.len() as u64) as usize;
         self.out.write_all(&bytes[..keep])?;
         self.count = self.count.saturating_add(bytes.len() as u64);
@@ -66,6 +69,10 @@ impl View {
     fn submit(self, sink: &mut dyn ChildSink, name: &[u8], targets: &[Target]) -> io::Result<bool> {
         let mut file = self.out.into_inner().map_err(|e| e.into_error())?;
         for &target in targets {
+            // Stock checks the normalized size before file count and recursion.
+            if sink.skip_declared_size(self.count) || !sink.can_enter_child() {
+                break;
+            }
             file.rewind()?;
             if sink.child(&mut file, Some(target), Some(name))? {
                 return Ok(true);
@@ -125,7 +132,10 @@ fn tag(
     if close {
         bytes = &bytes[1..];
     }
-    let len = bytes.iter().take_while(|b| name_byte(**b)).count();
+    let len = bytes
+        .iter()
+        .take_while(|b| !b.is_ascii_whitespace() && **b != b'>')
+        .count();
     if len == 0 {
         return Ok(None);
     }
@@ -225,19 +235,14 @@ fn tag(
 pub(super) fn extract(
     bytes: &[u8],
     sink: &mut dyn ChildSink,
-    bom_little: Option<bool>,
+    input_size: usize,
 ) -> io::Result<Handling> {
     let (max_html, max_notags, _) = sink.text_limits();
-    if bytes.len() as u64 > max_html {
+    if input_size as u64 > max_html {
         return Ok(Handling::Complete);
     }
     let mut full = View::new(sink);
     let mut text = View::new(sink);
-    if let Some(little) = bom_little {
-        // The two stock HTML views retain different leading bytes after UTF-16 conversion.
-        full.write(if little { &[0xdf] } else { &[0xfe, 0xff] })?;
-        text.write(if little { &[0] } else { &[0xfe, 0xfe] })?;
-    }
     let mut pending = false;
     let mut skip_space = true;
     let mut script = false;
@@ -335,7 +340,7 @@ pub(super) fn extract(
             pos += n;
             continue;
         }
-        if b.is_ascii_control() {
+        if b == 0 {
             return Ok(Handling::Incomplete);
         }
         skip_space = false;
@@ -360,13 +365,17 @@ pub(super) fn extract(
             };
             full.write(&[c])?;
             if !script {
-                text.write(&[c])?;
+                if b < 0x20 {
+                    text.separate()?;
+                } else {
+                    text.write(&[c])?;
+                }
             }
             pos += 1;
         }
     }
     if full.submit(sink, b"nocomment.html", &[Target::Html])?
-        || (bytes.len() as u64 <= max_notags
+        || (input_size as u64 <= max_notags
             && text.submit(sink, b"notags.html", &[Target::Html])?)
     {
         return Ok(Handling::Stopped);

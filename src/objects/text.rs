@@ -1,5 +1,5 @@
 //! Typed streams produced by the stock HTML, script, and mail parsers.
-use super::{ChildSink, Handling};
+use super::{ChildSink, Handling, classify::Parser};
 use crate::body::Target;
 use std::io::{self, Read, Write};
 
@@ -45,91 +45,111 @@ pub(super) fn plain(bytes: &[u8]) -> bool {
     file_type(bytes) != "CL_TYPE_BINARY_DATA"
 }
 
-// The reference recognizes BOM-marked text, and unmarked little-endian ASCII HTML.
-fn utf16(bytes: &[u8]) -> Option<(bool, bool)> {
-    if bytes.starts_with(&[0xff, 0xfe]) {
-        return Some((true, true));
-    }
-    if bytes.starts_with(&[0xfe, 0xff]) {
-        return Some((false, true));
-    }
-    if bytes.len() >= 6
-        && bytes
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .all(|p| p[0].is_ascii() && p[0] != 0 && p[1] == 0)
-    {
-        return Some((true, false));
-    }
-    None
-}
-
-pub(super) fn raw_target(bytes: &[u8]) -> Option<Target> {
+pub(super) fn parser(bytes: &[u8]) -> Option<Parser> {
     let head = &bytes[..bytes.len().min(1024)];
     if mail::recognizes(head) {
-        return Some(Target::Mail);
-    }
-    if let Some((little, bom)) = utf16(head) {
-        let decoded: Vec<_> = head[if bom { 2 } else { 0 }..]
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|pair| pair[usize::from(!little)])
-            .collect();
-        return html::recognizes(&decoded).then_some(Target::Html);
+        return Some(Parser::Mail);
     }
     if plain(head) && html::recognizes(head) {
-        return Some(Target::Html);
+        return Some(Parser::Html { big_endian: false });
+    }
+    if !head.contains(&0) {
+        return None;
+    }
+    let pairs = head.as_chunks::<2>().0;
+    let mut projected = [0; 512];
+    let sample = &mut projected[..pairs.len()];
+    if pairs.contains(&[b'<', 0]) {
+        for (dst, &pair) in sample.iter_mut().zip(pairs) {
+            *dst = html_byte(pair);
+        }
+        if html::recognizes(sample) {
+            return Some(Parser::Utf16Html);
+        }
+    }
+    if head.starts_with(&[0xfe, 0xff]) {
+        for (dst, &pair) in sample.iter_mut().zip(pairs) {
+            *dst = if pair[0] == 0 { pair[1] } else { 0xff };
+        }
+        if html::recognizes(sample) {
+            return Some(Parser::Html { big_endian: true });
+        }
     }
     None
-}
-
-// Call after raw_target identified HTML. The pinned engine calls the separately
-// decoded little-endian form HTML_UTF16 and still scans its generic outer bytes.
-pub(super) fn little_endian_html(bytes: &[u8]) -> bool {
-    matches!(utf16(&bytes[..bytes.len().min(1024)]), Some((true, _)))
 }
 
 pub(super) fn container_type(bytes: &[u8]) -> Option<&'static str> {
     attachments::file_type(bytes)
 }
 
-pub(super) fn before_raw(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handling> {
-    match container_type(bytes) {
-        Some("CL_TYPE_TNEF") => return attachments::tnef(bytes, sink),
-        Some("CL_TYPE_UUENCODED") => return attachments::uu(bytes, sink),
-        _ => (),
-    }
-    match raw_target(bytes) {
-        Some(Target::Html) => {
-            if let Some((little, bom)) = utf16(&bytes[..bytes.len().min(1024)]) {
-                let content = if bom { &bytes[2..] } else { bytes };
-                let mut spool = super::Snapshot::new(sink.temporary_directory());
-                {
-                    let mut output = io::BufWriter::new(&mut spool);
-                    for block in content.chunks(8192) {
-                        sink.check()?;
-                        let (pairs, remainder) = block.as_chunks::<2>();
-                        if !remainder.is_empty() {
-                            return Ok(Handling::Incomplete);
-                        }
-                        for pair in pairs {
-                            if pair[usize::from(little)] != 0 {
-                                return Ok(Handling::Incomplete);
-                            }
-                            output.write_all(&[pair[usize::from(!little)]])?;
-                        }
-                    }
-                    output.flush()?;
-                }
-                return spool.with_bytes(|ascii| html::extract(ascii, sink, bom.then_some(little)));
-            }
-            html::extract(bytes, sink, None)
-        }
-        Some(Target::Mail) => mail::extract(bytes, sink),
+pub(super) fn before_raw(
+    parser: Parser,
+    bytes: &[u8],
+    sink: &mut dyn ChildSink,
+) -> io::Result<Handling> {
+    match parser {
+        Parser::Tnef => attachments::tnef(bytes, sink),
+        Parser::Uuencoded => attachments::uu(bytes, sink),
+        Parser::Utf16Html => sink.utf16_html(bytes),
+        Parser::Html { big_endian: true } => unicode_html(bytes, false, sink),
+        Parser::Html { big_endian: false } => html::extract(bytes, sink, bytes.len()),
+        Parser::Mail => mail::extract(bytes, sink),
         _ => Ok(Handling::Unrecognized),
     }
+}
+
+// ClamAV's little-endian HTML projection combines the upper byte at bit four.
+fn html_byte(pair: [u8; 2]) -> u8 {
+    pair[0].wrapping_add(pair[1] << 4)
+}
+
+pub(super) fn unicode_html(
+    bytes: &[u8],
+    little: bool,
+    sink: &mut dyn ChildSink,
+) -> io::Result<Handling> {
+    let size = if little { bytes.len() / 2 } else { bytes.len() };
+    if size as u64 > sink.text_limits().0 {
+        return Ok(Handling::Complete);
+    }
+    let mut spool = super::Snapshot::new(sink.temporary_directory());
+    // The reference fills 8,191 nonzero bytes, then rewinds the source by the
+    // number of output bytes after the last space. These units differ for UTF-16BE.
+    const BLOCK: usize = 8191;
+    let byte = |at: usize| {
+        if little {
+            html_byte([bytes[2 * at], bytes[2 * at + 1]])
+        } else {
+            bytes[at]
+        }
+    };
+    let mut buffer = Vec::with_capacity(BLOCK);
+    let mut at = 0;
+    while at < size {
+        buffer.clear();
+        while at < size && buffer.len() < BLOCK {
+            sink.check()?;
+            let end = (at + BLOCK).min(size);
+            while at < end && buffer.len() < BLOCK {
+                let b = byte(at);
+                if b != 0 {
+                    buffer.push(b);
+                }
+                at += 1;
+            }
+        }
+        if at < size
+            && !byte(at).is_ascii_whitespace()
+            && let Some(space) = buffer.iter().rposition(u8::is_ascii_whitespace)
+            && space > 0
+        {
+            at -= buffer.len() - space - 1;
+            buffer.truncate(space + 1);
+        }
+        buffer.retain(|b| *b != b'\r');
+        spool.write_all(buffer.trim_ascii_start())?;
+    }
+    spool.with_bytes(|data| html::extract(data, sink, size))
 }
 
 struct NormalizedText<'a> {
@@ -159,7 +179,7 @@ impl Read for NormalizedText<'_> {
 }
 
 pub(super) fn after_raw(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handling> {
-    if !plain(bytes) || raw_target(bytes).is_some() {
+    if !plain(bytes) || parser(bytes).is_some() {
         return Ok(Handling::Unrecognized);
     }
     let mut reader = NormalizedText {

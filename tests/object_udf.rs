@@ -174,6 +174,23 @@ fn authored(source: &[u8]) -> io::Result<Vec<u8>> {
     GzDecoder::new(source).read_to_end(&mut out)?;
     Ok(out)
 }
+
+fn allocation_images() -> io::Result<[Vec<u8>; 3]> {
+    Ok([
+        authored(include_bytes!("fixtures/udf/allocation-single.udf.gz"))?,
+        authored(include_bytes!("fixtures/udf/allocation-fragmented.udf.gz"))?,
+        authored(include_bytes!("fixtures/udf/allocation-inline.udf.gz"))?,
+    ])
+}
+
+fn hash_rule(name: &str, data: &[u8]) -> io::Result<String> {
+    Ok(format!(
+        "{}:{}:Udf.{name}\n",
+        barnacle::hash_reader(data)?.md5_hex(),
+        data.len()
+    ))
+}
+
 fn compare(exe: &Path, stock: bool) -> io::Result<()> {
     let tmp = tempfile::tempdir_in("/tmp")?;
     let root = tmp.path();
@@ -194,11 +211,7 @@ fn compare(exe: &Path, stock: bool) -> io::Result<()> {
         ("Large", big.as_slice()),
         ("Outer", outer.as_slice()),
     ] {
-        rules.push_str(&format!(
-            "{}:{}:Udf.{name}\n",
-            barnacle::hash_reader(b)?.md5_hex(),
-            b.len()
-        ));
+        rules.push_str(&hash_rule(name, b)?);
     }
     fs::write(db.join("local.hdb"), rules)?;
     let start = |id: &str, opts: &str| -> io::Result<_> {
@@ -306,6 +319,63 @@ fn compare(exe: &Path, stock: bool) -> io::Result<()> {
         let (_daemon, socket) = start(id, &opt)?;
         check(&socket, id, data, name)?;
     }
+    // Physical order is c.txt (SECOND), b.txt (the allocation control), a.txt (FIRST).
+    let discs = allocation_images()?;
+    let ledger: String = (1..=110)
+        .map(|i| format!("Quarterly allocation ledger for ordinary record {i:03}.\n"))
+        .collect();
+    let inline = b"Quarterly allocation ledger stored inside its UDF file entry.";
+    let late = hash_rule("Later", FIRST)?;
+    let (prefix, suffix) = ledger.as_bytes().split_at(SECTOR);
+    let mut middle = late.clone();
+    for (name, data) in [
+        ("Ledger", ledger.as_bytes()),
+        ("Extent1", prefix),
+        ("Extent2", suffix),
+        ("Inline", inline.as_slice()),
+    ] {
+        middle.push_str(&hash_rule(name, data)?);
+    }
+    let early = middle.clone() + &hash_rule("Earlier", SECOND)?;
+    let mut outer = early.clone();
+    for disc in &discs {
+        outer.push_str(&hash_rule("Disc", disc)?);
+    }
+    for (id, rules, expected) in [
+        ("middle", middle, [Some("Ledger"), None, None]),
+        ("later", late.clone(), [Some("Later"), None, None]),
+        ("earlier", early, [Some("Earlier"); 3]),
+        ("raw", outer, [Some("Disc"); 3]),
+    ] {
+        fs::write(db.join("local.hdb"), rules)?;
+        let (_daemon, socket) = start(id, "")?;
+        for (disc, name) in discs.iter().zip(expected) {
+            check(&socket, id, disc, name)?;
+        }
+    }
+    fs::write(db.join("local.hdb"), late)?;
+    for (id, opt, expected) in [
+        (
+            "allocation-count",
+            "MaxFiles 2".into(),
+            [Some("Heuristics.Limits.Exceeded.MaxFiles"), None, None],
+        ),
+        (
+            "allocation-size",
+            format!("MaxScanSize {}", discs[0].len() + SECOND.len()),
+            [Some("Heuristics.Limits.Exceeded.MaxScanSize"), None, None],
+        ),
+        (
+            "allocation-depth",
+            "MaxRecursion 1".into(),
+            [Some("Heuristics.Limits.Exceeded.MaxRecursion"); 3],
+        ),
+    ] {
+        let (_daemon, socket) = start(id, &format!("{opt}\nAlertExceedsMax yes"))?;
+        for (disc, name) in discs.iter().zip(expected) {
+            check(&socket, id, disc, name)?;
+        }
+    }
     Ok(())
 }
 #[test]
@@ -327,10 +397,13 @@ fn optical_members_use_the_post_raw_parent_type() -> io::Result<()> {
     use barnacle::objects::{Options, Verdict, scan};
     let temp = tempfile::tempdir()?;
     let bridge = authored(include_bytes!("fixtures/udf/hdiutil-bridge.iso.gz"))?;
-    for (disc, ty) in [
-        (image(FIRST, SECOND, 0), "CL_TYPE_UDF"),
-        (bridge, "CL_TYPE_ISO9660"),
-    ] {
+    let discs = [
+        (image(FIRST, SECOND, 0), "CL_TYPE_UDF", FIRST),
+        (bridge, "CL_TYPE_ISO9660", FIRST),
+    ]
+    .into_iter()
+    .chain(allocation_images()?.map(|disc| (disc, "CL_TYPE_UDF", SECOND)));
+    for (disc, ty, marker) in discs {
         let archive = zip::zip(&[("notes.iso", &disc)], true, false, false)?;
         let verdict = scan(
             &archive,
@@ -340,7 +413,7 @@ fn optical_members_use_the_post_raw_parent_type() -> io::Result<()> {
                 if object.bytes == disc {
                     assert_eq!(object.layer.file_type, "CL_TYPE_BINARY_DATA");
                 }
-                if object.bytes == FIRST {
+                if object.bytes == marker {
                     assert_eq!(
                         object
                             .parents
@@ -373,10 +446,21 @@ fn stock_optical_parent_types() -> io::Result<()> {
     let tmp = tempfile::tempdir_in("/tmp")?;
     let db = tmp.path().join("db");
     fs::create_dir(&db)?;
-    let hex: String = FIRST.iter().map(|b| format!("{b:02x}")).collect();
+    let hex = |marker: &[u8]| {
+        marker
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    };
     let rules: String = ["CL_TYPE_UDF", "CL_TYPE_ISO9660"]
         .iter()
-        .map(|ty| format!("Optical.{ty};Engine:81-255,Target:0,Container:{ty};0;{hex}\n"))
+        .map(|ty| {
+            format!(
+                "Optical.{ty};Engine:81-255,Target:0,Container:{ty};0|1;{};{}\n",
+                hex(FIRST),
+                hex(SECOND)
+            )
+        })
         .collect();
     fs::write(db.join("parent.ldb"), rules)?;
     let sock = tmp.path().join("sock");
@@ -391,10 +475,13 @@ fn stock_optical_parent_types() -> io::Result<()> {
     )?;
     let _service = Daemon::start(Path::new("/usr/sbin/clamd"), &conf, &sock)?;
     let bridge = authored(include_bytes!("fixtures/udf/hdiutil-bridge.iso.gz"))?;
-    for (disc, ty) in [
+    let discs = [
         (image(FIRST, SECOND, 0), "CL_TYPE_UDF"),
         (bridge, "CL_TYPE_ISO9660"),
-    ] {
+    ]
+    .into_iter()
+    .chain(allocation_images()?.map(|disc| (disc, "CL_TYPE_UDF")));
+    for (disc, ty) in discs {
         let zip = zip::zip(&[("notes.iso", &disc)], true, false, false)?;
         assert_eq!(
             unix_request(&sock, &stream_frame(&zip)?)?,
