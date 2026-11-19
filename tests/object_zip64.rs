@@ -393,6 +393,11 @@ fn mixed_encryption(stock: bool) -> io::Result<()> {
     let exact = archive.len() + receipt.len();
     for (rules, options, expected) in [
         (&both, String::new(), "Receipt"),
+        (
+            &both,
+            "AlertEncrypted no\nAlertEncryptedArchive no\nAlertEncryptedDoc no".into(),
+            "Receipt",
+        ),
         (&locked, String::new(), ""),
         (&outer, String::new(), "Envelope"),
         (&both, "ScanArchive no".into(), "Envelope"),

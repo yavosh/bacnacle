@@ -313,7 +313,10 @@ fn reference_engine_value(key: &str, value: &str) -> bool {
         "AlgorithmicDetection" | "PhishingSignatures" | "PhishingScanURLs" | "Bytecode" => {
             boolean(value).ok() == Some(true)
         }
-        "ArchiveBlockEncrypted"
+        "AlertEncrypted"
+        | "AlertEncryptedArchive"
+        | "AlertEncryptedDoc"
+        | "ArchiveBlockEncrypted"
         | "PhishingAlwaysBlockSSLMismatch"
         | "PhishingAlwaysBlockCloak"
         | "PartitionIntersection"
@@ -438,6 +441,8 @@ mod tests {
             "LocalSocketMode 688",
             "LogSyslog yes",
             "AlertEncrypted yes",
+            "AlertEncryptedArchive yes",
+            "AlertEncryptedDoc yes",
             "VirusEvent touch %v",
             "MaxFileSize 18446744073709551615G",
             "ExcludePath [",
