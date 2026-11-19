@@ -5,13 +5,16 @@ use std::path::Path;
 
 mod archive;
 mod classify;
+mod embedded;
 mod iso;
 mod office;
 mod ole;
+mod onenote;
 mod pdf;
 mod rtf;
 mod swf;
 mod text;
+mod udf;
 
 /// A handler can recognize a format without proving that it visited every object.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,6 +46,7 @@ trait ChildSink {
         name: Option<&[u8]>,
     ) -> io::Result<bool>;
     fn child_bytes(&mut self, bytes: &[u8], name: Option<&[u8]>) -> io::Result<bool>;
+    fn embedded_archive(&mut self, kind: &'static str, bytes: &[u8]) -> io::Result<Handling>;
     fn view(&mut self, data: &mut dyn Read, target: Target) -> io::Result<bool>;
 
     fn check(&mut self) -> io::Result<()>;
@@ -66,6 +70,9 @@ pub struct Options {
     pub scan_pdf: bool,
     pub scan_ole2: bool,
     pub scan_swf: bool,
+    pub scan_onenote: bool,
+    pub scan_image: bool,
+    pub alert_broken_media: bool,
     pub scan_html: bool,
     pub scan_mail: bool,
     pub max_html_normalize: u64,
@@ -86,6 +93,9 @@ impl Default for Options {
             scan_pdf: true,
             scan_ole2: true,
             scan_swf: true,
+            scan_onenote: true,
+            scan_image: true,
+            alert_broken_media: false,
             scan_html: true,
             scan_mail: true,
             max_html_normalize: 40 << 20,
@@ -118,6 +128,8 @@ pub enum Verdict {
     Found(String),
     Miss,
     Incomplete,
+    /// The pinned engine omits this entire top-level object.
+    Skipped,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -263,6 +275,12 @@ impl Traversal<'_> {
         }
         self.files_scanned += 1;
         self.bytes_scanned += bytes.len() as u64;
+        if typed.is_none() && classify::ignored(bytes) {
+            if self.parents.is_empty() {
+                self.stopped = Some(Verdict::Skipped);
+            }
+            return Ok(());
+        }
         let file_type = classify::FileType::classify(bytes, typed, self)?;
         self.parents.push(Layer {
             target: file_type.context.target(),
@@ -293,15 +311,40 @@ impl Traversal<'_> {
             }
         }
         if self.stopped.is_none() {
-            if matches!(file_type.parser, classify::Parser::Iso(_)) && self.options.scan_archive {
-                self.parents.last_mut().expect("current image").file_type = "CL_TYPE_ISO9660";
-            }
-            if file_type.parser.after_raw(bytes, self.options, self)? == Handling::Incomplete {
+            let recognize = typed.is_none()
+                && self.options.scan_archive
+                && (file_type.parser != classify::Parser::Html || !self.options.scan_html);
+            if self.after_raw(bytes, &file_type, recognize)? == Handling::Incomplete {
                 self.stopped = Some(Verdict::Incomplete);
             }
         }
         self.parents.pop();
         Ok(())
+    }
+
+    fn after_raw(
+        &mut self,
+        bytes: &[u8],
+        file_type: &classify::FileType,
+        recognize: bool,
+    ) -> io::Result<Handling> {
+        let mut count = 0;
+        let disk = file_type.parser.disk_descriptor().filter(|_| recognize);
+        let split = disk.map_or(bytes.len(), |(offset, _)| offset);
+        if recognize {
+            let result = embedded::extract(bytes, file_type.name, 0..split, &mut count, self)?;
+            if result == Handling::Incomplete || self.stopped.is_some() {
+                return Ok(result);
+            }
+        }
+        if let Some((_, name)) = disk {
+            self.parents.last_mut().expect("current image").file_type = name;
+        }
+        let result = file_type.parser.after_raw(bytes, self.options, self)?;
+        if disk.is_some() && self.stopped.is_none() && result != Handling::Incomplete {
+            return embedded::extract(bytes, file_type.name, split..bytes.len(), &mut count, self);
+        }
+        Ok(result)
     }
 
     fn record_size_limit(&mut self, size: u64) {
@@ -328,6 +371,23 @@ impl Traversal<'_> {
 }
 
 impl ChildSink for Traversal<'_> {
+    fn embedded_archive(&mut self, kind: &'static str, bytes: &[u8]) -> io::Result<Handling> {
+        if self.skip_declared_size(bytes.len() as u64) || !self.can_enter_child() {
+            return Ok(Handling::Complete);
+        }
+        // A suffix is another map of the same input. Stock checks its size
+        // and pushes its type, then charges only the newly extracted children.
+        self.parents.push(Layer {
+            file_type: kind,
+            target: Target::Generic,
+            name: None,
+            size: bytes.len(),
+        });
+        let result = embedded::contents(bytes, kind, self);
+        self.parents.pop();
+        result
+    }
+
     fn read_child(&mut self, data: &mut dyn Read) -> io::Result<Option<Snapshot>> {
         if !self.can_enter_child() {
             return Ok(None);

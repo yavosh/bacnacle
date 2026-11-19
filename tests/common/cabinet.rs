@@ -28,19 +28,18 @@ pub fn cabinet(first: &[u8], second: &[u8], method: u16) -> io::Result<Vec<u8>> 
         records.extend(name.bytes());
         records.push(0);
     }
-    let parts: Vec<Vec<u8>> = if method == 3 {
-        vec![[first, second].concat()]
-    } else {
-        vec![first.to_vec(), second.to_vec()]
-    };
+    let folder = [first, second].concat();
+    let parts = folder.chunks(32768);
     let mut blocks = Vec::new();
-    for (i, data) in parts.iter().enumerate() {
+    for (i, data) in parts.clone().enumerate() {
         let encoded = match method {
             0 => data.to_vec(),
             1 => {
                 let mut stream = Compress::new(Compression::best(), false);
                 if i != 0 {
-                    stream.set_dictionary(first).map_err(io::Error::other)?;
+                    stream
+                        .set_dictionary(&folder[(i - 1) * 32768..i * 32768])
+                        .map_err(io::Error::other)?;
                 }
                 let mut bytes = Vec::with_capacity(data.len() * 2 + 100);
                 bytes.extend(b"CK");

@@ -25,6 +25,7 @@ sevenz-rust2 = { version = "0.25", default-features = false, features = ["bzip2"
 tar = "0.4"
 rustix = { version = "1", features = ["fs", "net"] }
 aho-corasick = "1"
+quick-xml = "0.42.0"
 
 [dev-dependencies]
 sevenz-rust2 = { version = "0.25", default-features = false, features = ["compress"] }

@@ -5,6 +5,10 @@ mod cabinet;
 mod chm;
 #[path = "../examples/compat_oracle/daemon.rs"]
 mod client;
+#[path = "common/legacy.rs"]
+mod legacy;
+#[path = "common/sis.rs"]
+mod sis;
 #[path = "common/zip.rs"]
 mod zip;
 
@@ -28,36 +32,6 @@ fn bzip(data: &[u8]) -> io::Result<Vec<u8>> {
     let mut encoder = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
     encoder.write_all(data)?;
     encoder.finish()
-}
-
-fn sevenzip(solid: bool) -> io::Result<Vec<u8>> {
-    use sevenz_rust2::{ArchiveEntry, ArchiveWriter, SourceReader};
-    let mut writer = ArchiveWriter::new(io::Cursor::new(Vec::new())).map_err(io::Error::other)?;
-    let entries = [
-        ("notes", b"ordinary unmarked archive entry".as_slice()),
-        ("report", FIRST),
-    ];
-    if solid {
-        writer
-            .push_archive_entries(
-                entries
-                    .iter()
-                    .map(|(name, _)| ArchiveEntry::new_file(name))
-                    .collect(),
-                entries
-                    .iter()
-                    .map(|(_, data)| SourceReader::new(*data))
-                    .collect(),
-            )
-            .map_err(io::Error::other)?;
-    } else {
-        for (name, data) in entries {
-            writer
-                .push_archive_entry(ArchiveEntry::new_file(name), Some(data))
-                .map_err(io::Error::other)?;
-        }
-    }
-    Ok(writer.finish()?.into_inner())
 }
 
 fn szdd(data: &[u8]) -> Vec<u8> {
@@ -145,75 +119,11 @@ fn egg(method: u8, comment: bool) -> io::Result<Vec<u8>> {
     Ok(out)
 }
 
-fn pack_bits(words: impl IntoIterator<Item = (u16, u8)>) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut bits = 0;
-    for (word, width) in words {
-        for bit in (0..width).rev() {
-            if bits == 0 {
-                out.push(0);
-            }
-            *out.last_mut().unwrap() |= ((word >> bit) as u8 & 1) << (7 - bits);
-            bits = (bits + 1) % 8;
-        }
-    }
-    out
-}
-
-fn huffman_literals(data: &[u8], position_bits: u8) -> Vec<u8> {
-    // Each block contains one command and a single-symbol literal tree.
-    pack_bits(data.iter().flat_map(|&b| {
-        [
-            (1, 16),
-            (0, 10),
-            (0, 9),
-            (u16::from(b), 9),
-            (0, 2 * position_bits),
-        ]
-    }))
-}
-
-fn arj(method: u8) -> Vec<u8> {
-    fn header(out: &mut Vec<u8>, head: &[u8]) {
-        out.extend([0x60, 0xea]);
-        out.extend((head.len() as u16).to_le_bytes());
-        out.extend(head);
-        let mut crc = flate2::Crc::new();
-        crc.update(head);
-        out.extend(crc.sum().to_le_bytes());
-        out.extend([0, 0]);
-    }
-    let mut out = Vec::new();
-    let mut main = vec![0; 30];
-    main[..7].copy_from_slice(&[30, 11, 1, 0, 0, 0, 2]);
-    main.extend(b"notes.arj\0\0");
-    header(&mut out, &main);
-    for data in [FIRST, SECOND] {
-        let packed = match method {
-            0 => data.to_vec(),
-            1..=3 => huffman_literals(data, 5),
-            _ => pack_bits(data.iter().map(|&b| (u16::from(b), 9))),
-        };
-        let mut file = vec![0; 30];
-        file[..6].copy_from_slice(&[30, 11, 1, 0, 0, method]);
-        file[12..16].copy_from_slice(&(packed.len() as u32).to_le_bytes());
-        file[16..20].copy_from_slice(&(data.len() as u32).to_le_bytes());
-        let mut crc = flate2::Crc::new();
-        crc.update(data);
-        file[20..24].copy_from_slice(&crc.sum().to_le_bytes());
-        file.extend(b"notes\0\0");
-        header(&mut out, &file);
-        out.extend(packed);
-    }
-    out.extend([0x60, 0xea, 0, 0]);
-    out
-}
-
 fn lha(compressed: bool) -> Vec<u8> {
     let mut out = Vec::new();
     for data in [FIRST, SECOND] {
         let packed = if compressed {
-            huffman_literals(data, 4)
+            legacy::huffman_literals(data, 4)
         } else {
             data.to_vec()
         };
@@ -449,8 +359,26 @@ fn compare(exe: &Path) -> io::Result<()> {
         ("two bzip2 members", bzip_members),
         ("XZ", xz.to_vec()),
         ("SZDD", szdd(FIRST)),
-        ("7z", sevenzip(false)?),
-        ("solid 7z", sevenzip(true)?),
+        (
+            "7z",
+            legacy::sevenzip(
+                false,
+                &[
+                    ("notes", b"ordinary unmarked archive entry"),
+                    ("report", FIRST),
+                ],
+            )?,
+        ),
+        (
+            "solid 7z",
+            legacy::sevenzip(
+                true,
+                &[
+                    ("notes", b"ordinary unmarked archive entry"),
+                    ("report", FIRST),
+                ],
+            )?,
+        ),
         ("stored ALZ", alz(0)?),
         ("bzip2 ALZ", alz(1)?),
         ("deflated ALZ", alz(2)?),
@@ -458,12 +386,17 @@ fn compare(exe: &Path) -> io::Result<()> {
         ("deflated EGG blocks", egg(1, false)?),
         ("bzip2 EGG blocks", egg(2, false)?),
         ("EGG comment before members", egg(0, true)?),
-        ("stored ARJ", arj(0)),
+        ("stored ARJ", legacy::arj(0, &[FIRST, SECOND])),
+        ("Symbian SIS stored", sis::package(&[FIRST, SECOND], false)?),
+        (
+            "Symbian SIS language variants",
+            sis::package(&[b"a different language", FIRST], true)?,
+        ),
         ("CHM uncompressed section", chm::chm(FIRST, SECOND, false)),
-        ("ARJ method 1", arj(1)),
-        ("ARJ method 2", arj(2)),
-        ("ARJ method 3", arj(3)),
-        ("ARJ method 4", arj(4)),
+        ("ARJ method 1", legacy::arj(1, &[FIRST, SECOND])),
+        ("ARJ method 2", legacy::arj(2, &[FIRST, SECOND])),
+        ("ARJ method 3", legacy::arj(3, &[FIRST, SECOND])),
+        ("ARJ method 4", legacy::arj(4, &[FIRST, SECOND])),
         ("stored LHA", lha(false)),
         ("LH5 archive", lha(true)),
         ("BinHex data fork", binhex(FIRST, SECOND)),
@@ -530,6 +463,11 @@ fn compare(exe: &Path) -> io::Result<()> {
         unix_request(&socket, &stream_frame(&stored_rar(FIRST))?)?,
         expected,
         "the pinned Debian clamd has no optional UnRAR module"
+    );
+    assert_eq!(
+        unix_request(&socket, &stream_frame(&sis::v9(FIRST))?)?,
+        expected,
+        "ordinary Symbian SIS v9 with a stored data unit"
     );
     assert_eq!(
         unix_request(&socket, &stream_frame(&local_zip)?)?,

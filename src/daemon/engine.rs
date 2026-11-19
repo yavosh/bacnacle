@@ -369,7 +369,9 @@ impl Generation {
                 &self.temporary_directory,
                 |obj, check| {
                     let header = &obj.bytes[..obj.bytes.len().min(raw::HEADER_SIZE)];
-                    let eligible = obj.normalized || obj.handled_format || raw::eligible(header);
+                    let eligible = obj.normalized
+                        || obj.handled_format
+                        || raw::eligible(header, obj.layer.file_type);
                     if !eligible && !obj.context.is_valid_pe() {
                         return Ok(Verdict::Incomplete);
                     }
@@ -416,6 +418,7 @@ impl Generation {
         Ok(match verdict? {
             Verdict::Found(name) => ScanResult::Found(Detection { name, hashes }),
             Verdict::Incomplete | Verdict::Miss => ScanResult::Incomplete,
+            Verdict::Skipped => ScanResult::Skipped,
         })
     }
 

@@ -1,5 +1,7 @@
 #[path = "../examples/compat_oracle/daemon.rs"]
 mod daemon;
+#[path = "common/zip.rs"]
+mod zip;
 
 use barnacle::objects::{self, Options, Verdict};
 use std::{fs, io, path::Path};
@@ -109,6 +111,8 @@ fn compare(exe: &Path, stock: bool) -> io::Result<()> {
         let first = FIRST.repeat(88);
         let primary = image(false, SECTOR, &first);
         let supplementary = image(true, SECTOR, &first);
+        let mut appended = primary.clone();
+        appended.extend(zip::zip(&[("notes.txt", SECOND)], true, false, false)?);
         let images = [
             raw_cd(&primary, 2352, 16),
             raw_cd(&supplementary, 2352, 24),
@@ -118,6 +122,7 @@ fn compare(exe: &Path, stock: bool) -> io::Result<()> {
             image(true, 1024, &first),
             primary,
             supplementary,
+            appended,
         ];
         let mut hashes = signature(&first, "First")? + &signature(SECOND, "Second")?;
         if outer {

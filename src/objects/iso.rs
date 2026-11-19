@@ -11,10 +11,14 @@ pub(super) struct Layout {
 }
 
 impl Layout {
+    pub fn descriptor_offset(self) -> usize {
+        16 * self.stride + self.prefix
+    }
+
     pub fn recognize(bytes: &[u8]) -> Option<Self> {
         for (stride, prefix) in [(SECTOR, 0), (2352, 16), (2352, 24), (2448, 16), (2448, 24)] {
             let layout = Self { stride, prefix };
-            let primary = 16 * stride + prefix;
+            let primary = layout.descriptor_offset();
             if bytes.get(primary..primary + 7) == Some(b"\x01CD001\x01")
                 && bytes.get(primary + stride + 1..primary + stride + 6) == Some(b"CD001")
                 && (0..16).all(|i| {

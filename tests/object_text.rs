@@ -107,6 +107,8 @@ fn compare(executable: &Path, stock: bool) -> io::Result<()> {
         (b"<html><a href=\"data:text/plain,First%20Letter\">word</a></html>", Some("FirstLetter")),
         (b"<html><p>HTML LaBeL</p><img src=\"data:text/plain,First%20Letter\"></html>", Some("Markup")),
         (b"ordinary LOUD MARK document", Some("Raw")),
+        (b"<?xml version=\"1.0\"?><report>LOUD MARK</report>", Some("Raw")),
+        (b"<xar><toc><file><name>LOUD MARK</name></file></toc></xar>", Some("Raw")),
         (b"ZZZ       ", Some("ShortText")),
         ("ordinary CaSéE  FoLd\tHere".as_bytes(), Some("Folded")),
         (&utf16, Some("Markup")),

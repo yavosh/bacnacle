@@ -150,6 +150,9 @@ impl Config {
             "ScanPDF" => self.objects.scan_pdf = boolean(value)?,
             "ScanOLE2" => self.objects.scan_ole2 = boolean(value)?,
             "ScanSWF" => self.objects.scan_swf = boolean(value)?,
+            "ScanOneNote" => self.objects.scan_onenote = boolean(value)?,
+            "ScanImage" => self.objects.scan_image = boolean(value)?,
+            "AlertBrokenMedia" => self.objects.alert_broken_media = boolean(value)?,
             "ScanHTML" => self.objects.scan_html = boolean(value)?,
             "ScanMail" => self.objects.scan_mail = boolean(value)?,
             "MaxHTMLNormalize" | "MaxHTMLNoTags" | "MaxScriptNormalize" => {

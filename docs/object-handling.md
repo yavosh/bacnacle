@@ -10,12 +10,12 @@ The raw engine inventory lists individual submodules, including disabled entries
 
 | Stage | Formats or features in the reference | Comparison coverage |
 | --- | --- | --- |
-| Archives and compressed streams | ZIP, gzip, bzip2, XZ, TAR, CPIO, 7z, RAR, ARJ, CAB, SZDD, CHM, BinHex, EGG, LHA, ALZ and SIS | Rust fixtures cover those formats except SIS. The RAR comparison checks the reference installation without UnRAR. [Archive comparisons](../tests/object_archives.rs) |
-| Disk images and partitions | ISO 9660, UDF, DMG, XAR, HFS+, MBR, GPT and APM | Tests cover ISO 9660 and Joliet directories. Partition and other image handlers still need comparisons. [ISO comparisons](../tests/object_iso.rs) |
+| Archives and compressed streams | ZIP, gzip, bzip2, XZ, TAR, CPIO, 7z, RAR, ARJ, CAB, SZDD, CHM, BinHex, EGG, LHA, ALZ and SIS | Rust fixtures cover all listed families, including stored and compressed legacy SIS members. The RAR comparison checks the reference installation without UnRAR. [Archive comparisons](../tests/object_archives.rs) |
+| Disk images and partitions | ISO 9660, UDF, DMG, XAR, HFS+, MBR, GPT and APM | Tests cover ISO 9660, Joliet directories, and XAR catalogs and members. Other disk image formats need further comparisons. [ISO comparisons](../tests/object_iso.rs) |
 | Installers and embedded files | NSIS, AutoIt, InstallShield and embedded file recognition | These handlers need individual fixtures. |
 | Documents | OLE2, OOXML, Word/Excel XML, HWP, OneNote, PDF, RTF and SWF | Tests cover ordinary PDF, Office, RTF and Flash documents, including competing child detections and scan limits. [PDF comparisons](../tests/object_pdf.rs) · [OLE comparisons](../tests/object_ole.rs) |
 | Text and mail | HTML, UTF-16 HTML, script normalization, JavaScript, script encoding, mbox/MIME, TNEF and uuencoding | Rust fixtures exercise ordinary scripts, HTML, MIME, TNEF, uuencoded files, and data URLs. [Text comparisons](../tests/object_text.rs) |
-| Executables and graphics | PE, ELF, Mach-O, universal Mach-O, RIFF, GIF, PNG, JPEG and TIFF | Executable body offsets have separate [matcher tests](body-patterns.md). Unpacking and image parsing need independent fixtures. |
+| Executables and graphics | PE, ELF, Mach-O, universal Mach-O, RIFF, GIF, PNG, JPEG and TIFF | BMP and GIF fixtures compare raw body and whole-file winners. Full image heuristics and executable unpacking remain open. [Image comparisons](../tests/object_images.rs) · [Executable offsets](body-patterns.md) |
 
 The engine also enables password support for archives and format-specific detection heuristics.
 The reference image lacks an installed UnRAR helper even though its engine configuration lists RAR.
@@ -43,6 +43,35 @@ Document names come from the winning signature. [End-to-end fixtures](../tests/o
 | Policies and truncated input | Parser disabled, recursion and expanded-size alerts, a missing final trailer, and a truncated stream. |
 | Additional PDF stages | Encryption, compressed object streams, JavaScript actions and other stream filters require further comparisons. |
 
+### UDF optical images
+
+Stock scans the raw disc before its UDF members. An outer whole-file hash takes precedence.
+The reference visits file entries in physical descriptor order. The test rearranges entries while preserving their directory names and references.
+Barnacle checks each recorded extent against the image length and scans it directly. [UDF comparisons](../tests/object_udf.rs)
+
+The Rust fixtures cover single short, long, and extended allocation descriptors, cross-sector data, truncation, and nested ZIP input.
+Stock supplies an empty original filename and sets the scan parent to `CL_TYPE_UDF` for these members.
+An extent exceeding the remaining scan budget ends the UDF pass. A later smaller file receives no scan.
+The reference also stops at an unsupported allocation layout. Images with fragmented or embedded extents need further comparisons.
+
+Two independent control images contain the same harmless text files. Apple `hdiutil makehybrid` produced both with UDF version 1.02.
+Stock reported `OK` on the pure UDF control with the two local member hashes loaded.
+The ISO/UDF bridge detected the first text file and assigned `CL_TYPE_ISO9660` as its parent.
+The checked-in images are gzip-compressed and the Rust tests expand them before scanning. [Authoring controls](../tests/fixtures/udf)
+
+### XAR archives
+
+Stock checks the decompressed XML catalog first. It then visits XML subdocuments, heap entries, and the raw archive.
+Catalog order selects the first matching extended attribute or file. Heap offsets can appear in a different order.
+Stock serializes a subdocument’s inner XML before matching it. [XAR comparisons](../tests/object_xar.rs)
+
+Barnacle scans stored data, zlib, and LZMA directly. Bzip2 and XZ entries pass through their respective archive handlers.
+An incorrect entry checksum does not suppress a detection. A damaged zlib member can precede a valid matching file.
+An oversized catalog prevents scanning its heap. Byte, file count, and recursion limits use the daemon configuration.
+
+Catalog decoding spills to a private file after 64 KiB. The pinned allocation ceiling is one GiB, including the terminating byte.
+LZMA dictionary estimates above 64 MiB and subdocuments needing namespace or extended XML serialization still return incomplete coverage.
+
 ### OLE compound documents
 
 Stock scans an ordinary compound document’s streams before checking the outer file hash.
@@ -57,8 +86,9 @@ A child inside a nested storage still has the enclosing compound file as its sca
 | Limits | File count, storage depth, scan recursion, remaining scan bytes, and scanning with `ScanOLE2 no`. |
 | Coverage gaps | VBA, XLM, embedded Office images, HWP, encryption, and larger version 4 directories require further comparisons. |
 
-A root Package hit can precede Office-specific processing. Rust tests compare flat directories with competing raw streams in Word, Excel, and PowerPoint documents.
-Some Office files with several populated storages still produce an incomplete scan.
+Rust tests compare competing raw streams and embedded packages in macro-free Word, Excel, and PowerPoint documents.
+They cover flat directories, nested storages, shared stream names, and the underlying filesystem’s scan order.
+Barnacle creates empty private directory entries when it needs that order. It reads each payload from the compound file.
 Barnacle reads streams with the MIT-licensed `cfb` crate. [Dependency license](https://github.com/mdsteele/rust-cfb/blob/master/LICENSE)
 
 ## Reference order and limits

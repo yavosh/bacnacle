@@ -165,6 +165,17 @@ pub(in crate::objects) fn directory(
     Ok(None)
 }
 
+pub(in crate::objects) fn single(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handling> {
+    if bytes.len() < 30 || u16_at(bytes, 6) & 8 != 0 {
+        // The embedded reader has no central directory for data-descriptor sizes.
+        return Ok(Handling::Complete);
+    }
+    match Entry::parse(bytes, (0, 0)) {
+        Some(member) => member.visit(sink),
+        None => Ok(Handling::Incomplete),
+    }
+}
+
 pub(super) fn extract(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handling> {
     if let Some((directory_offset, count)) = directory(bytes, sink)? {
         let mut directory = &bytes[directory_offset..];

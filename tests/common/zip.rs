@@ -27,8 +27,14 @@ pub fn zip_with_method(
     for &(name, bytes) in entries {
         let compressed = match method {
             0 => bytes.to_vec(),
-            8 => {
-                let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+            8 | 9 => {
+                // Uncompressed DEFLATE blocks also represent valid Deflate64 data.
+                let level = if method == 9 {
+                    Compression::none()
+                } else {
+                    Compression::default()
+                };
+                let mut encoder = DeflateEncoder::new(Vec::new(), level);
                 encoder.write_all(bytes)?;
                 encoder.finish()?
             }

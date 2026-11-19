@@ -14,11 +14,17 @@ mod cpio;
 mod egg;
 mod lha;
 mod sevenzip;
+mod sis;
 mod szdd;
+mod xar;
 mod zip;
 pub(super) use zip::directory as zip_directory;
+pub(super) use zip::single as zip_single;
 
 pub(super) fn file_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"xar!") {
+        return Some("CL_TYPE_XAR");
+    }
     if bytes.starts_with(b"PK\x03\x04") || bytes.starts_with(b"PK00PK\x03\x04") {
         return Some("CL_TYPE_ZIP");
     }
@@ -58,6 +64,12 @@ pub(super) fn file_type(bytes: &[u8]) -> Option<&'static str> {
     if lha::recognized(bytes) {
         return Some("CL_TYPE_LHA_LZH");
     }
+    if bytes
+        .get(8..bytes.len().min(24))
+        .is_some_and(|v| v.windows(4).any(|w| w == [0x19, 4, 0, 0x10]))
+    {
+        return Some("CL_TYPE_SIS");
+    }
     if bytes.starts_with(b"SZDD") {
         return Some("CL_TYPE_MSSZDD");
     }
@@ -80,6 +92,7 @@ pub(super) fn file_type(bytes: &[u8]) -> Option<&'static str> {
 
 pub(super) fn extract(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handling> {
     match file_type(bytes) {
+        Some("CL_TYPE_XAR") => xar::extract(bytes, sink),
         Some("CL_TYPE_ZIP") => zip::extract(bytes, sink),
         Some("CL_TYPE_7Z") => sevenzip::extract(bytes, sink),
         Some("CL_TYPE_MSCAB") => cabinet::extract(bytes, sink),
@@ -91,6 +104,7 @@ pub(super) fn extract(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Hand
         Some("CL_TYPE_RAR") => Ok(Handling::Complete),
         Some("CL_TYPE_BINHEX") => binhex::extract(bytes, sink),
         Some("CL_TYPE_LHA_LZH") => lha::extract(bytes, sink),
+        Some("CL_TYPE_SIS") => sis::extract(bytes, sink),
         Some("CL_TYPE_MSSZDD") => szdd::extract(bytes, sink),
         // Stock concatenates all gzip members into a single child.
         Some("CL_TYPE_GZ") => decoded(MultiGzDecoder::new(bytes), None, true, sink),

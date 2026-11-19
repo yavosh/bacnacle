@@ -192,6 +192,15 @@ fn compare(exe: &Path, stock: bool) -> io::Result<()> {
         ),
         ("ordinary neighbor of short package", odd, Some("First")),
         (
+            "WordDocument with several storages",
+            cfb(&[
+                ("WordDocument", &word_document()),
+                ("FolderA/Notes", muted),
+                ("FolderB/Notes", FIRST),
+            ])?,
+            Some("First"),
+        ),
+        (
             "ZIP containing OLE",
             zip::zip(&[("ordinary.ole", &packed)], true, false, false)?,
             Some("Second"),
@@ -373,6 +382,8 @@ fn stock_and_barnacle_office_stream_priority() -> io::Result<()> {
         "candidate",
         "",
     )?;
+    let first_package = package(FIRST);
+    let second_package = package(SECOND);
     for (name, office) in [
         ("WordDocument", word_document()),
         ("PowerPoint Document", powerpoint()),
@@ -389,6 +400,26 @@ fn stock_and_barnacle_office_stream_priority() -> io::Result<()> {
                 ("NotesA", SECOND),
                 (name, office.as_slice()),
             ],
+            vec![
+                (name, office.as_slice()),
+                ("FolderA/Child/Notes", FIRST),
+                ("FolderB/Notes", SECOND),
+            ],
+            vec![
+                ("FolderB/Notes", FIRST),
+                ("FolderA/Child/Notes", SECOND),
+                (name, office.as_slice()),
+            ],
+            vec![
+                ("ObjectPool/B/\x01Ole10Native", first_package.as_slice()),
+                (name, office.as_slice()),
+                ("ObjectPool/A/\x01Ole10Native", second_package.as_slice()),
+            ],
+            vec![
+                ("ObjectPool/B/\x01Ole10Native", second_package.as_slice()),
+                (name, office.as_slice()),
+                ("FolderA/Summary", FIRST),
+            ],
         ] {
             let request = stream_frame(&cfb(&streams)?)?;
             let expected = unix_request(&stock, &request)?;
@@ -398,6 +429,34 @@ fn stock_and_barnacle_office_stream_priority() -> io::Result<()> {
             ));
             assert_eq!(unix_request(&candidate, &request)?, expected, "{name}");
         }
+    }
+    let multi = cfb(&[
+        ("WordDocument", &word_document()),
+        ("FolderA/Notes", FIRST),
+        ("FolderB/\x01Ole10Native", &second_package),
+    ])?;
+    let request = stream_frame(&multi)?;
+    for count in [2, 3, 4] {
+        let options = format!("MaxFiles {count}\nAlertExceedsMax yes");
+        let (_stock, stock) = start_daemon(
+            Path::new("/usr/sbin/clamd"),
+            root,
+            &db,
+            &format!("stock{count}"),
+            &options,
+        )?;
+        let (_bn, bn) = start_daemon(
+            Path::new(env!("CARGO_BIN_EXE_barnacle")),
+            root,
+            &db,
+            &format!("bn{count}"),
+            &options,
+        )?;
+        assert_eq!(
+            unix_request(&bn, &request)?,
+            unix_request(&stock, &request)?,
+            "MaxFiles {count}"
+        );
     }
     Ok(())
 }
