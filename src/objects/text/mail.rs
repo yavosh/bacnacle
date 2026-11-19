@@ -383,32 +383,39 @@ struct ForwardFiles<'a> {
     multiple_notes: bool,
 }
 
+fn transfer_line(row: &[u8]) -> bool {
+    const MARKER: &[u8] = b"Content-Transfer-Encoding";
+    // Stock checks this case-insensitive prefix even in prose, without a colon.
+    row.split_at_checked(MARKER.len())
+        .is_some_and(|(name, rest)| {
+            name.eq_ignore_ascii_case(MARKER) && !rest.windows(4).any(|w| w == b"7bit")
+        })
+}
+
+fn uu_begin(row: &[u8]) -> bool {
+    row.starts_with(b"b")
+        && row
+            .get(..6)
+            .is_some_and(|p| p.eq_ignore_ascii_case(b"begin "))
+        && row
+            .get(6..9)
+            .is_some_and(|p| p.iter().all(u8::is_ascii_digit))
+        && row.get(9) == Some(&b' ')
+}
+
 fn forward_files<'a>(
     mut body: &'a [u8],
     mut check: impl FnMut() -> io::Result<()>,
     next_line: impl Fn(&[u8]) -> (&[u8], &[u8]),
 ) -> io::Result<ForwardFiles<'a>> {
-    const MARKER: &[u8] = b"Content-Transfer-Encoding";
     let mut files = ForwardFiles::default();
     while !body.is_empty() {
         check()?;
         let (row, next) = next_line(body);
-        // Stock checks this case-insensitive prefix even in prose, without a colon.
-        if let Some((name, rest)) = row.split_at_checked(MARKER.len())
-            && name.eq_ignore_ascii_case(MARKER)
-            && !rest.windows(4).any(|w| w == b"7bit")
-        {
+        if transfer_line(row) {
             files.transfer = true;
         }
-        if row.starts_with(b"b")
-            && row
-                .get(..6)
-                .is_some_and(|p| p.eq_ignore_ascii_case(b"begin "))
-            && row
-                .get(6..9)
-                .is_some_and(|p| p.iter().all(u8::is_ascii_digit))
-            && row.get(9) == Some(&b' ')
-        {
+        if uu_begin(row) {
             files.multiple_notes |= files.note.is_some();
             files.note.get_or_insert(body);
         }

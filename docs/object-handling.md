@@ -163,7 +163,8 @@ Stock scans ordinary mbox attachments in message order before visiting the share
 Named Base64 PDF, PNG, CSV, XLSX and WAV attachments followed this order both standalone and inside multipart/mixed.
 Unencoded named CSV joined the saved letters when standalone. Inside multipart/mixed, stock scanned it directly.
 Unencoded plain bodies get private filenames. With competing signatures, overlayfs returned the first body and tmpfs returned the second.
-Barnacle revisits the mailbox without retaining a list of bodies. It scans each ordinary saved letter once when all fit. It reports a shared or unique winning signature.
+Barnacle caches up to 16 borrowed body spans and revisits later messages as needed.
+It scans each ordinary saved letter once when all fit, then reports a shared or unique winning signature.
 Different winners or a budget that makes the winner depend on directory order produce incomplete coverage.
 Empty bodies produce no saved file. Nonempty saved bodies of five bytes or fewer count toward the MIME limit but consume no scanned-file slot.
 MaxFileSize applies to each letter and eligible script view. MaxScanSize covers their shared remaining byte allowance.
@@ -448,7 +449,12 @@ A 350-term sum produced a 4,213-byte report. An independently authored 120-row n
 Both report hashes beat the embedded picture. A matching generic body signature beat the competing report hash.
 Barnacle counts output first when the report might exceed the remaining budget. A rejected report can still leave a smaller picture eligible.
 Unverified text inside a visible block returns incomplete coverage. This includes unsupported records and formula suffixes inside earlier blocks. [BIFF formula example](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-xls/bccb00ac-67a1-490a-9f0b-5ce59978eb9a)
-Delayed picture data, metafiles, multiple Workbook streams, and mixed Office extraction passes remain unverified. [OfficeArt picture records](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-odraw/c67b883b-8136-4e91-a1a3-2981d16e934f)
+An Apache POI workbook contains three crate outlines in WMF, EMF, and PICT format.
+Both daemons scan the 4,213-byte report first, then the three stored picture payloads in workbook order.
+At 4,212 available scan bytes, the WMF signature wins. The WMF and EMF payloads retain their zlib encoding.
+With OLE scanning disabled, the workbook hash wins. [Authored workbook](../tests/fixtures/xls/README.md)
+
+Delayed picture data, multiple Workbook streams, and mixed Office extraction passes remain unverified. [OfficeArt picture records](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-odraw/c67b883b-8136-4e91-a1a3-2981d16e934f)
 
 Both daemons scan top-level PowerPoint `ExOleObjStg` zlib payloads before the root presentation stream and its file hash.
 A root native Package still wins. A presentation inside a storage receives its attachment pass after the root raw-stream pass.

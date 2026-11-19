@@ -1435,3 +1435,80 @@ fn business_attachment_mbox() -> io::Result<()> {
 fn stock_business_attachment_mbox() -> io::Result<()> {
     business_messages(true)
 }
+
+fn saved_mailbox_spans(stock: bool) -> io::Result<()> {
+    // Exercise borrowed LF, folded whitespace, CRLF, and replay beyond cached spans.
+    let mut doc = String::new();
+    let mut signatures = Vec::new();
+    for i in 0..21 {
+        let fold = i % 3 == 1;
+        let crlf = i % 3 == 2;
+        let body = if fold {
+            format!("Office delivery {i}\n\t \nFiled.\n")
+        } else {
+            format!("Office delivery {i}\nFiled.\n")
+        };
+        let saved = if fold {
+            body.replace("\t ", " ")
+        } else {
+            body.clone()
+        };
+        let rendered = if crlf {
+            body.replace('\n', "\r\n")
+        } else {
+            body
+        };
+        doc += &format!(
+            "From stockroom@example.invalid Fri Nov 19 01:59:00 2026\n{HEAD}Content-Type: text/plain\n\n{rendered}"
+        );
+        let mut saved = saved;
+        if i != 20 {
+            doc += "\n";
+            saved += "\n";
+        }
+        signatures.push(hash("Letter", saved.as_bytes())?);
+    }
+    let outer = hash("Outer", doc.as_bytes())?;
+    for i in [0, 1, 2, 15, 16, 17, 20] {
+        check(
+            &Server::new(stock, "", &(signatures[i].clone() + &outer))?,
+            &doc,
+            "Letter",
+        )?;
+    }
+    check(&Server::new(stock, "", &outer)?, &doc, "Outer")?;
+
+    let server = Server::new(stock, "", &hash("Contact", CONTACT.as_bytes())?)?;
+    let first_header = format!("{HEAD}Content-Type: text/plain\n\n");
+    let second = format!(
+        "{HEAD}Content-Type: text/plain\nContent-Transfer-Encoding: base64\n\n{}\n",
+        b64(CONTACT.as_bytes())
+    );
+    let envelope = "From stockroom@example.invalid Fri Nov 19 02:00:00 2026\n";
+    for at in 16382..=16389 {
+        let body = "x".repeat(at - first_header.len() - 2);
+        let doc = format!("{envelope}{first_header}{body}\n\n{envelope}{second}");
+        check(&server, &doc, "Contact")?;
+    }
+    // A physical 999-byte row leaves its newline in an empty row before the separator.
+    let body = "x".repeat(999);
+    let doc = format!("{envelope}{first_header}{body}\n{envelope}{second}");
+    check(&server, &doc, "Contact")?;
+    let body = "Updates From accounting\nFrom Monday to Friday\nFiled.\n";
+    check(
+        &server,
+        &mbox_pair(&(first_header + body), &second),
+        "Contact",
+    )
+}
+
+#[test]
+fn large_saved_mailbox() -> io::Result<()> {
+    saved_mailbox_spans(false)
+}
+
+#[test]
+#[ignore = "requires pinned Debian clamd"]
+fn stock_large_saved_mailbox() -> io::Result<()> {
+    saved_mailbox_spans(true)
+}

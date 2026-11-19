@@ -231,19 +231,23 @@ fn image<'a>(record: Record<'a>, storage: &'a [u8]) -> Option<&'a [u8]> {
     if record.version != 0 {
         return None;
     }
-    let first = match (record.kind, record.instance) {
-        (0xf01d | 0xf02a, 0x46a | 0x46b) => 0x46a, // JPEG
-        (0xf01d | 0xf02a, 0x6e2 | 0x6e3) => 0x6e2, // CMYK JPEG
-        (0xf01e, _) => 0x6e0,                      // PNG
-        (0xf01f, _) => 0x7a8,                      // DIB
-        (0xf029, _) => 0x6e4,                      // TIFF
+    // After the identifiers, stock skips a 34-byte metafile header or one bitmap tag.
+    let (first, header) = match (record.kind, record.instance) {
+        (0xf01a, _) => (0x3d4, 34),                     // EMF
+        (0xf01b, _) => (0x216, 34),                     // WMF
+        (0xf01c, _) => (0x542, 34),                     // PICT
+        (0xf01d | 0xf02a, 0x46a | 0x46b) => (0x46a, 1), // JPEG
+        (0xf01d | 0xf02a, 0x6e2 | 0x6e3) => (0x6e2, 1), // CMYK JPEG
+        (0xf01e, _) => (0x6e0, 1),                      // PNG
+        (0xf01f, _) => (0x7a8, 1),                      // DIB
+        (0xf029, _) => (0x6e4, 1),                      // TIFF
         _ => return None,
     };
-    let offset = match record.instance.checked_sub(first)? {
-        0 => 17, // One identifier and one tag byte
-        1 => 33, // Two identifiers and one tag byte
+    let identifiers = match record.instance.checked_sub(first)? {
+        0 => 16,
+        1 => 32,
         _ => return None,
     };
-    let bytes = storage.get(offset..)?;
+    let bytes = storage.get(identifiers + header..)?;
     Some(&bytes[..record.body.len().min(bytes.len())])
 }

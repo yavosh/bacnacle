@@ -132,10 +132,15 @@ pub(super) fn eligible(header: &[u8], file_type: &str) -> bool {
         b"/RGB",
         b"\x19\x04\x00\x10",
     ];
-    if MARKERS
-        .iter()
-        .any(|m| header.windows(m.len()).any(|s| s.eq_ignore_ascii_case(m)))
-    {
+    static CONTENT_MARKERS: std::sync::LazyLock<aho_corasick::AhoCorasick> =
+        std::sync::LazyLock::new(|| {
+            aho_corasick::AhoCorasick::builder()
+                .kind(Some(aho_corasick::AhoCorasickKind::ContiguousNFA))
+                .ascii_case_insensitive(true)
+                .build(MARKERS)
+                .expect("static raw-stage markers")
+        });
+    if CONTENT_MARKERS.is_match(header) {
         return false;
     }
     // The classifier already checked HTML, mail and legacy Office XML.
@@ -207,6 +212,16 @@ pub(super) fn eligible(header: &[u8], file_type: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::eligible;
+
+    #[test]
+    fn content_markers_fold_ascii_inside_binary_headers() {
+        let test = |bytes: &[u8]| eligible(bytes, "CL_TYPE_BINARY_DATA");
+        for marker in [b"bill %pDf".as_slice(), b"bill \xa3h", b"bill\nfRoM"] {
+            assert!(!test(marker));
+        }
+        assert!(test(b"bill %pDx"));
+        assert!(test(b"bill \xa4h"));
+    }
 
     #[test]
     fn powerpoint_atom_and_boot_sector_reach_the_raw_stage() {

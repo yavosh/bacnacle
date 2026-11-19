@@ -147,6 +147,7 @@ impl Server {
     }
 }
 fn compare(stock: bool) -> io::Result<()> {
+    authored_metafiles(stock)?;
     let mut wb = Vec::new();
     cfb::CompoundFile::open(Cursor::new(EXCEL))?
         .open_stream("Workbook")?
@@ -434,6 +435,47 @@ fn compare(stock: bool) -> io::Result<()> {
     Ok(())
 }
 
+fn authored_metafiles(stock: bool) -> io::Result<()> {
+    let book = include_bytes!("fixtures/xls/crate-outlines.xls");
+    let wmf = "b80c156709b188c8bc263b8a0e7b256a:41:Xls.WMF\n";
+    let emf = "40e48a9cff66ac7b104bd8a40ef763e2:72:Xls.EMF\n";
+    let pict = "00a277a99f11444c41d1c67e7ec959f1:501:Xls.PICT\n";
+    let originals = "d3958a6410d157a69a68f9a93b893bf8:48:Xls.OriginalWMF\n\
+        1b40ff308054784c0f4adc36229e8aa7:132:Xls.OriginalEMF\n\
+        544b96154f8d71b8cd42bc47e3a35554:534:Xls.OriginalPICT\n";
+    let outer = hash("Outer", book)?;
+    let all = [wmf, emf, pict, originals, &outer].concat();
+    for (rules, options, expected) in [
+        (all.as_str(), "", Some("WMF")),
+        (emf, "", Some("EMF")),
+        (pict, "", Some("PICT")),
+        (originals, "", None),
+        (outer.as_str(), "", Some("Outer")),
+        (all.as_str(), "ScanOLE2 no", Some("Outer")),
+    ] {
+        Server::start(stock, options, rules, "", "")?.check("crate outlines", book, expected)?;
+    }
+    let drawings = Server::start(stock, "", &all, "", "")?;
+    for (kind, first, expected) in [
+        (0xf01bu16, 0x216u16, "WMF"),
+        (0xf01a, 0x3d4, "EMF"),
+        (0xf01c, 0x542, "PICT"),
+    ] {
+        let tag = [(first << 4).to_le_bytes(), kind.to_le_bytes()].concat();
+        let start = book.windows(4).position(|bytes| bytes == tag).unwrap();
+        let size = u32::from_le_bytes(book[start + 4..start + 8].try_into().unwrap()) as usize;
+        let body = &book[start + 8..][..size];
+        // Keep the writer's image and metadata. Add a second 16-byte identifier.
+        let two = [[0x3b; 16].as_slice(), body].concat();
+        for (instance, payload) in [(first, body), (first + 1, two.as_slice())] {
+            let blip = art(kind, instance << 4, payload);
+            let bare = single(&workbook(&[blip], &[], 0x3c))?;
+            drawings.check("bare metafile", &bare, Some(expected))?;
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn barnacle_excel_pictures() -> io::Result<()> {
     compare(false)
@@ -610,6 +652,18 @@ fn authored_drawing() -> io::Result<Vec<u8>> {
 }
 
 fn compare_large_reports(stock: bool) -> io::Result<()> {
+    let outlines = include_bytes!("fixtures/xls/crate-outlines.xls");
+    // The pinned daemon matches its preamble and the first 4,096 report bytes.
+    let poi_report = "3beb549f5169220d13ee4707287885c1:4213:Xls.PoiReport\n";
+    let competing = poi_report.to_owned() + &hash("WholeWorkbook", outlines)?;
+    for (room, expected) in [(4212, "WholeWorkbook"), (4213, "PoiReport")] {
+        let options = format!("MaxScanSize {}\nAlertExceedsMax yes", outlines.len() + room);
+        Server::start(stock, &options, &competing, "", "")?.check(
+            "Apache POI report cutoff and outer hash",
+            outlines,
+            Some(expected),
+        )?;
+    }
     // The pinned daemon accepted each exact hash with the picture HDB loaded at the same time.
     let rules = hash("Dots", DOTS)?
         + &hash("Preamble", REPORT)?
@@ -774,9 +828,9 @@ fn compare_unknown_report_limits(stock: bool) -> io::Result<()> {
     for row in 0..128u16 {
         let mut data = [0; 16];
         data[..2].copy_from_slice(&row.to_le_bytes());
-        data[4..6].copy_from_slice(&1u16.to_le_bytes());
-        data[6..8].copy_from_slice(&255u16.to_le_bytes());
-        records.extend(biff(0x0208, &data));
+        // MULBLANK describes five empty cells with default formatting.
+        data[14..16].copy_from_slice(&4u16.to_le_bytes());
+        records.extend(biff(0x00be, &data));
     }
     records.extend(authored_drawing()?);
     let doc = single(&records)?;

@@ -8,6 +8,29 @@ fn next<'a>(
     message: &'a [u8],
     sink: &mut dyn ChildSink,
 ) -> io::Result<(&'a [u8], Option<&'a [u8]>)> {
+    // A separator always contains this literal. Return immediately for the usual
+    // empty LF or CRLF line. The physical-row parser verifies ambiguous occurrences.
+    let mut at = 0;
+    while at < message.len() {
+        sink.check()?;
+        let end = (at + 16 * 1024 + 4).min(message.len());
+        if let Some(start) = memchr::memmem::find(&message[at..end], b"From ") {
+            let start = at + start;
+            let prefix = &message[..start];
+            if prefix.ends_with(b"\n\n")
+                || prefix.ends_with(b"\n\r\n")
+                || matches!(prefix, b"\n" | b"\r\n")
+            {
+                let (_, _, following) = physical_row(&message[start..]);
+                return Ok((prefix, Some(following)));
+            }
+            break;
+        }
+        if end == message.len() {
+            return Ok((message, None));
+        }
+        at = end - 4;
+    }
     let mut rest = message;
     let mut empty = false;
     while !rest.is_empty() {
@@ -22,8 +45,28 @@ fn next<'a>(
     Ok((message, None))
 }
 
+#[derive(Clone, Copy, Default)]
+struct SavedBody<'a> {
+    bytes: &'a [u8],
+    borrowed: bool,
+}
+
+impl<'a> SavedBody<'a> {
+    fn read(self, sink: &mut dyn ChildSink) -> io::Result<Option<ObjectBytes<'a>>> {
+        if self.borrowed {
+            Ok(Some(ObjectBytes::Borrowed(self.bytes)))
+        } else {
+            canonical(self.bytes, true, sink)
+        }
+    }
+}
+
+const CACHED_LETTERS: usize = 16;
+
 #[derive(Default)]
 pub(in crate::objects) struct SavedLetters<'a> {
+    cached: [SavedBody<'a>; CACHED_LETTERS],
+    index: usize,
     rest: Option<&'a [u8]>,
     pub count: usize,
     pub total: u64,
@@ -60,12 +103,16 @@ fn plain_letter(p: &super::Part<'_>) -> bool {
 }
 
 impl SavedLetters<'_> {
-    // The first pass has validated these immutable messages. Revisit their spans
-    // instead of retaining one allocation or decoded snapshot per letter.
+    // Common mailboxes reuse validated body spans. Larger ones replay the remaining messages.
     pub(in crate::objects) fn read(
         &mut self,
         sink: &mut dyn ChildSink,
     ) -> io::Result<Option<ObjectBytes<'_>>> {
+        if self.index < self.count.min(CACHED_LETTERS) {
+            let saved = self.cached[self.index];
+            self.index += 1;
+            return saved.read(sink);
+        }
         while let Some(rest) = self.rest.take() {
             let (message, next_message) = next(rest, sink)?;
             self.rest = next_message;
@@ -86,7 +133,6 @@ impl SavedLetters<'_> {
 
 #[derive(Default)]
 struct Directory<'a> {
-    first: Option<&'a [u8]>,
     letters: SavedLetters<'a>,
     members: usize,
     uncertain_size: bool,
@@ -100,14 +146,12 @@ impl<'a> Directory<'a> {
         };
         let kind = p.media_type();
         let text = kind.is_empty() || kind.eq_ignore_ascii_case(b"text/plain");
-        if !kind.eq_ignore_ascii_case(b"multipart/mixed") {
-            let files = forward_files(p.body, || sink.check(), mailbox_line)?;
-            if files.transfer || files.note.is_some() {
+        if plain_letter(&p) {
+            let inspected = inspect_letter(p.body, sink)?;
+            if inspected.recovery {
                 return Ok(Handling::Incomplete);
             }
-        }
-        if plain_letter(&p) {
-            let Some(size) = canonical_size(p.body, sink)? else {
+            let Some(size) = inspected.size else {
                 self.uncertain_size = true;
                 return Ok(Handling::Complete);
             };
@@ -117,7 +161,9 @@ impl<'a> Directory<'a> {
             if size <= 5 {
                 return Ok(Handling::Complete);
             }
-            self.first.get_or_insert(p.body);
+            if let Some(slot) = self.letters.cached.get_mut(self.letters.count) {
+                *slot = inspected.body;
+            }
             if size <= sink.text_limits().2 {
                 self.letters.largest_script = self.letters.largest_script.max(size);
             }
@@ -130,6 +176,12 @@ impl<'a> Directory<'a> {
             self.letters.total += size;
             self.letters.largest = self.letters.largest.max(size);
             return Ok(Handling::Complete);
+        }
+        if !kind.eq_ignore_ascii_case(b"multipart/mixed") {
+            let files = forward_files(p.body, || sink.check(), mailbox_line)?;
+            if files.transfer || files.note.is_some() {
+                return Ok(Handling::Incomplete);
+            }
         }
         // Explicit 7bit can create an additional decoded recovery file.
         let mixed = kind.eq_ignore_ascii_case(b"multipart/mixed") && p.encoding.is_empty();
@@ -153,9 +205,9 @@ impl<'a> Directory<'a> {
         if self.uncertain_size {
             return Ok(Handling::Incomplete);
         }
-        let Some(first) = self.first else {
+        if self.letters.count == 0 {
             return Ok(Handling::Complete);
-        };
+        }
         if sink.child_limit() == Some(Limit::MaxFiles) {
             sink.can_enter_child();
             return Ok(Handling::Complete);
@@ -179,7 +231,7 @@ impl<'a> Directory<'a> {
         let result = if self.letters.count > 1 {
             sink.mailbox_letters(&mut self.letters)?
         } else {
-            let Some(first) = canonical(first, true, sink)? else {
+            let Some(first) = self.letters.read(sink)? else {
                 return Ok(Handling::Incomplete);
             };
             if sink.child_bytes(first.as_ref(), None)? {
@@ -203,7 +255,6 @@ pub(super) fn extract(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Hand
         return super::parse_message(first, false, sink);
     };
     let mut dir = Directory::default();
-    dir.letters.rest = Some(rest);
     let mut message = first;
     let mut following = Some(second);
     loop {
@@ -215,7 +266,7 @@ pub(super) fn extract(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Hand
                 let Some(p) = message_headers(message, sink)? else {
                     return Ok(Handling::Incomplete);
                 };
-                match canonical_size(p.body, sink)? {
+                match inspect_letter(p.body, sink)?.size {
                     None => return Ok(Handling::Incomplete),
                     Some(0) => break,
                     Some(_) => sink.record_file_limit(),
@@ -229,6 +280,9 @@ pub(super) fn extract(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Hand
             }
         }
         let Some(rest) = following else { break };
+        if dir.letters.count == CACHED_LETTERS {
+            dir.letters.rest.get_or_insert(rest);
+        }
         (message, following) = next(rest, sink)?;
     }
     dir.finish(bytes, sink)
@@ -273,18 +327,52 @@ fn rows(mut bytes: &[u8], mut empty: bool) -> impl Iterator<Item = (&[u8], Optio
     })
 }
 
-fn canonical_size(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Option<u64>> {
+struct Inspected<'a> {
+    body: SavedBody<'a>,
+    size: Option<u64>,
+    recovery: bool,
+}
+
+fn inspect_letter<'a>(bytes: &'a [u8], sink: &mut dyn ChildSink) -> io::Result<Inspected<'a>> {
     let mut size = 0;
+    let mut offset = 0;
+    let mut start = None;
+    let mut end = 0;
+    let mut contiguous = true;
+    let mut next_check = 0;
+    let mut binary = false;
+    let mut recovery = false;
     for (wire, row) in rows(bytes, true) {
-        sink.check()?;
-        if wire.contains(&0) {
-            return Ok(None);
+        if offset >= next_check {
+            sink.check()?;
+            next_check = offset + 4096;
         }
+        binary |= wire.contains(&0);
         if let Some(row) = row {
+            recovery |= super::transfer_line(row) || super::uu_begin(row);
             size += row.len() as u64 + 1;
+            if contiguous {
+                contiguous =
+                    (start.is_none() || offset == end) && wire.strip_suffix(b"\n") == Some(row);
+                start.get_or_insert(offset);
+                end = offset + wire.len();
+            }
         }
+        offset += wire.len();
     }
-    Ok(Some(size))
+    let source = if contiguous {
+        &bytes[start.unwrap_or(0)..end]
+    } else {
+        bytes
+    };
+    Ok(Inspected {
+        body: SavedBody {
+            bytes: source,
+            borrowed: contiguous,
+        },
+        size: (!binary).then_some(size),
+        recovery,
+    })
 }
 
 fn canonical<'a>(
