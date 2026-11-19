@@ -1,5 +1,5 @@
 //! HWP5 stores named streams in a compound file. Selected streams use raw DEFLATE.
-use super::{ChildSink, Document, Handling, Inventory, named, normalized_name};
+use super::{ChildSink, Document, Handling, Input, Inventory, named, normalized_name};
 use std::io::{self, Read};
 
 pub(super) fn header(
@@ -13,7 +13,7 @@ pub(super) fn header(
         .filter(|e| named(e, &["fileheader"]))
     {
         sink.check()?;
-        let mut source = doc.open_stream(directory.path(entry))?;
+        let mut source = Input::open(doc, directory, entry)?;
         let mut header = [0; 40];
         let n = source.len().min(header.len() as u64) as usize;
         source.read_exact(&mut header[..n])?;
@@ -50,7 +50,7 @@ pub(super) fn scan(
         let Some(name) = normalized_name(&entry.name) else {
             return Ok(Handling::Incomplete);
         };
-        let mut source = doc.open_stream(directory.path(entry))?;
+        let mut source = Input::open(doc, directory, entry)?;
         let stop = if flags & 1 != 0 && flags & 2 == 0 && compressed_kind(&name) {
             super::super::xml::scan_deflated(&mut source, sink)?
         } else {

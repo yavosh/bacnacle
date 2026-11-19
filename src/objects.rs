@@ -64,6 +64,8 @@ trait ChildSink {
     fn view(&mut self, data: &mut dyn Read, target: Target) -> io::Result<bool>;
 
     fn check(&mut self) -> io::Result<()>;
+    fn child_limit(&self) -> Option<Limit>;
+    fn can_enter_child(&mut self) -> bool;
     fn remaining(&self) -> u64;
     fn max_file_size(&self) -> u64;
     fn max_files(&self) -> usize;
@@ -425,20 +427,26 @@ impl Traversal<'_> {
         };
         self.first_limit.get_or_insert(reason);
     }
+}
+
+impl ChildSink for Traversal<'_> {
     fn can_enter_child(&mut self) -> bool {
-        if self.options.max_files != 0 && self.files_scanned >= self.options.max_files {
-            self.first_limit.get_or_insert(Limit::MaxFiles);
-            return false;
-        }
-        if self.parents.len() >= self.recursion_limit() {
-            self.first_limit.get_or_insert(Limit::MaxRecursion);
+        if let Some(reason) = self.child_limit() {
+            self.first_limit.get_or_insert(reason);
             return false;
         }
         true
     }
-}
+    fn child_limit(&self) -> Option<Limit> {
+        if self.options.max_files != 0 && self.files_scanned >= self.options.max_files {
+            Some(Limit::MaxFiles)
+        } else if self.parents.len() >= self.recursion_limit() {
+            Some(Limit::MaxRecursion)
+        } else {
+            None
+        }
+    }
 
-impl ChildSink for Traversal<'_> {
     fn installer_header(&mut self, bytes: &[u8]) -> io::Result<bool> {
         if !self.can_enter_child() || self.skip_declared_size(bytes.len() as u64) {
             return Ok(false);

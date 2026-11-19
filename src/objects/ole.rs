@@ -2,12 +2,15 @@
 use super::{ChildSink, Handling};
 use cfb::CompoundFile;
 use directory::{Inventory, Stream};
+use input::Input;
 use md5::{Digest, Md5};
 use std::io::{self, BufRead, BufReader, Cursor, Read};
 
 mod directory;
 mod hwp;
+mod input;
 mod office;
+mod powerpoint;
 mod temporary;
 type Document<'a> = CompoundFile<Cursor<&'a [u8]>>;
 
@@ -21,7 +24,7 @@ fn named(entry: &Stream, names: &[&str]) -> bool {
 
 fn size(input: &mut dyn Read) -> io::Result<u32> {
     let mut bytes = [0; 4];
-    input.read_exact(&mut bytes)?;
+    input.read_exact(&mut bytes).map_err(input::mark)?;
     Ok(u32::from_le_bytes(bytes))
 }
 
@@ -41,7 +44,7 @@ fn skip_name(input: &mut dyn BufRead, sink: &mut dyn ChildSink) -> io::Result<bo
     }
 }
 
-fn payload(stream: cfb::Stream<Cursor<&[u8]>>, sink: &mut dyn ChildSink) -> io::Result<bool> {
+fn payload(stream: Input, sink: &mut dyn ChildSink) -> io::Result<bool> {
     let total = stream.len();
     let mut input = BufReader::new(stream);
     if total < 4 {
@@ -50,11 +53,11 @@ fn payload(stream: cfb::Stream<Cursor<&[u8]>>, sink: &mut dyn ChildSink) -> io::
     let mut n = size(&mut input)?;
     if u64::from(n) <= total - 4 {
         let mut scratch = [0; 8];
-        input.read_exact(&mut scratch[..2])?;
+        input.read_exact(&mut scratch[..2]).map_err(input::mark)?;
         if !skip_name(&mut input, sink)? || !skip_name(&mut input, sink)? {
             return Ok(false);
         }
-        input.read_exact(&mut scratch)?;
+        input.read_exact(&mut scratch).map_err(input::mark)?;
         if !skip_name(&mut input, sink)? {
             return Ok(false);
         }
@@ -70,7 +73,7 @@ fn raw(
     filename: Option<&[u8]>,
     sink: &mut dyn ChildSink,
 ) -> io::Result<bool> {
-    let mut stream = doc.open_stream(directory.path(entry))?;
+    let mut stream = Input::open(doc, directory, entry)?;
     sink.child(&mut stream, None, filename)
 }
 
@@ -102,8 +105,8 @@ fn native_payload(
     entry: &Stream,
     sink: &mut dyn ChildSink,
 ) -> io::Result<bool> {
-    match payload(doc.open_stream(directory.path(entry))?, sink) {
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+    match payload(Input::open(doc, directory, entry)?, sink) {
+        Err(e) if input::malformed(&e) && e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
         result => result,
     }
 }
@@ -116,7 +119,8 @@ fn visit(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handling> {
     let mut doc = cfb::OpenOptions::new()
         .strict()
         .max_buffer_size(8192)
-        .open_with(Cursor::new(bytes))?;
+        .open_with(Cursor::new(bytes))
+        .map_err(input::mark)?;
     sink.check()?;
     if directory
         .streams
@@ -199,6 +203,12 @@ fn visit(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handling> {
         {
             return Ok(Handling::Stopped);
         }
+        if level == entry.depth
+            && named(entry, &["powerpoint document"])
+            && let Some(result) = powerpoint::scan(&mut doc, &directory, entry, sink)?
+        {
+            return Ok(result);
+        }
         if raw(&mut doc, &directory, entry, Some(name.as_bytes()), sink)? {
             return Ok(Handling::Stopped);
         }
@@ -208,14 +218,7 @@ fn visit(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handling> {
 
 pub(super) fn extract(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handling> {
     match visit(bytes, sink) {
-        Err(e)
-            if matches!(
-                e.kind(),
-                io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof | io::ErrorKind::NotFound
-            ) =>
-        {
-            Ok(Handling::Incomplete)
-        }
+        Err(e) if input::malformed(&e) => Ok(Handling::Incomplete),
         result => result,
     }
 }
