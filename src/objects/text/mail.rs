@@ -112,15 +112,20 @@ fn parameter<'a>(value: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
     })
 }
 
+const BASE64: [u8; 256] = {
+    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut table = [u8::MAX; 256];
+    let mut i = 0;
+    while i < alphabet.len() {
+        table[alphabet[i] as usize] = i as u8;
+        i += 1;
+    }
+    table
+};
+
 fn b64(b: u8) -> Option<u8> {
-    Some(match b {
-        b'A'..=b'Z' => b - b'A',
-        b'a'..=b'z' => b - b'a' + 26,
-        b'0'..=b'9' => b - b'0' + 52,
-        b'+' => 62,
-        b'/' => 63,
-        _ => return None,
-    })
+    let value = BASE64[b as usize];
+    (value != u8::MAX).then_some(value)
 }
 
 #[derive(Clone, Copy)]
@@ -179,6 +184,9 @@ impl<'a> Body<'a> {
         }
     }
 
+    // Both read paths call this for individual bytes. An out-of-line call here
+    // reduced throughput even for messages with no Base64 content.
+    #[inline(always)]
     fn next_byte(&mut self) -> io::Result<Option<u8>> {
         while let Some((&b, rest)) = self.data.split_first() {
             self.data = rest;
@@ -224,10 +232,40 @@ impl<'a> Body<'a> {
         }
         Ok(std::mem::take(&mut self.final_lf).then_some(b'\n'))
     }
+
+    fn read_base64(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        let mut written = 0;
+        while written < output.len() {
+            // A complete quartet has no residual bits. Whitespace, padding, and
+            // split quartets still go through the streaming decoder.
+            if self.bits == 0 {
+                let groups = self.data.as_chunks::<4>().0;
+                for (&group, dst) in groups.iter().zip(output[written..].as_chunks_mut::<3>().0) {
+                    let [a, b, c, d] = group.map(|byte| BASE64[byte as usize]);
+                    if a | b | c | d == u8::MAX {
+                        break;
+                    }
+                    dst.copy_from_slice(&[a << 2 | b >> 4, b << 4 | c >> 2, c << 6 | d]);
+                    self.data = &self.data[4..];
+                    written += 3;
+                }
+                if written == output.len() {
+                    break;
+                }
+            }
+            let Some(b) = self.next_byte()? else { break };
+            output[written] = b;
+            written += 1;
+        }
+        Ok(written)
+    }
 }
 
 impl Read for Body<'_> {
     fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if matches!(self.mode, Encoding::Base64) {
+            return self.read_base64(output);
+        }
         for (i, dest) in output.iter_mut().enumerate() {
             let Some(b) = self.next_byte()? else {
                 return Ok(i);
@@ -557,4 +595,74 @@ pub(super) fn extract(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Hand
         return parse_message(message, sink);
     }
     parse_message(bytes, sink)
+}
+
+#[cfg(test)]
+mod base64_tests {
+    use super::*;
+
+    #[test]
+    fn base64_output_across_read_boundaries() -> io::Result<()> {
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"", b""),
+            (b"Zg==", b"f"),
+            (b"Zm8=", b"fo"),
+            (b"Zm9vYmFy", b"foobar"),
+            (b"Zm9vYmE", b"fooba"),
+            (b"Zm9vYg", b"foob"),
+            (b" Zm\r\n9v\tY mFy\n", b"foobar"),
+            (b"AAECA/7/\nZm9vOg= =", b"\x00\x01\x02\x03\xfe\xfffoo:"),
+        ];
+        for &(encoded, expected) in cases {
+            for size in 1..=13 {
+                let mut reader = base64_reader(encoded);
+                let mut decoded = Vec::new();
+                let mut block = [0; 13];
+                loop {
+                    assert_eq!(reader.read(&mut [])?, 0);
+                    let n = reader.read(&mut block[..size])?;
+                    if n == 0 {
+                        break;
+                    }
+                    decoded.extend_from_slice(&block[..n]);
+                }
+                assert_eq!(decoded, expected, "input {encoded:?}, read size {size}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn base64_errors_preserve_scalar_read_progress() {
+        let text = b"Zm9vYmFyAAECA/7/";
+        for at in 0..text.len() {
+            for invalid in [b'!', 0xff] {
+                let mut encoded = text.to_vec();
+                encoded[at] = invalid;
+                for size in 1..=9 {
+                    let mut reader = base64_reader(&encoded);
+                    let mut scalar = Body::new(&encoded, Encoding::Base64);
+                    loop {
+                        let mut actual = [0; 9];
+                        let mut expected = actual;
+                        let reference = (|| {
+                            for (i, dst) in expected[..size].iter_mut().enumerate() {
+                                let Some(byte) = scalar.next_byte()? else {
+                                    return Ok(i);
+                                };
+                                *dst = byte;
+                            }
+                            Ok(size)
+                        })();
+                        let result = reader.read(&mut actual[..size]).map_err(|e| e.kind());
+                        assert_eq!(result, reference.map_err(|e: io::Error| e.kind()));
+                        assert_eq!(actual, expected, "invalid byte at {at}, read size {size}");
+                        if result == Ok(0) {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

@@ -125,7 +125,7 @@ Multiple deferred forwards and the extra recovery file produced by explicit 7bit
 
 A standalone `message/rfc822` uses the literal embedded headers. A Base64 body without headers produced no mail child.
 A simple quoted-printable-wrapped text message retained its literal body. More complex standalone quoted-printable layouts remain incomplete.
-[Forwarded mail comparisons](../tests/object_mail_forward.rs)
+[Forwarded mail comparisons](../tests/object_mail_forward.rs) · [Throughput and memory](benchmarks/object-forwarded-mail.md)
 
 ### Binary HWP documents
 
