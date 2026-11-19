@@ -121,6 +121,9 @@ The note wins before a raw body signature or the mail hash. Stock assigns the no
 Notes of five bytes or fewer are skipped before checking file count. Larger notes check decoded size before count and depth.
 For an 8bit or binary forward with one note and a transfer marker, stock retains the `end` line.
 It scans that revised forward immediately. A following contact remains eligible before the deferred note.
+If the revised forward exceeds the byte budget, its saved file can stop directory traversal before a smaller note.
+For a standalone printable mail with this one member, Barnacle preserves the outer scan after a note miss.
+A matching note is indeterminate here. Stock returned the note on overlayfs and the size limit on tmpfs.
 Multiple notes and mixed forwards with an absent or 7bit declaration remain incomplete after direct attachments miss.
 The marker is a case-insensitive line prefix, `Content-Transfer-Encoding`, including in prose. A lowercase `7bit` anywhere on that line suppresses it. With a marker, 8bit or binary members are scanned immediately.
 An absent or 7bit declaration defers the saved forward until after ordinary attachments.
@@ -130,6 +133,8 @@ Different saved forwards and the extra recovery file from explicit 7bit remain i
 
 A standalone `message/rfc822` uses the literal embedded headers. A Base64 body without headers produced no mail child.
 A simple quoted-printable-wrapped text message retained its literal body. More complex standalone quoted-printable layouts remain incomplete.
+For the two-letter mbox fixture, stock selected the first letter on overlayfs and the second on tmpfs.
+Barnacle selected the first on both. [Mbox comparison](../tests/object_text.rs)
 [Forwarded mail comparisons](../tests/object_mail_forward.rs) · [Throughput and memory](benchmarks/object-forwarded-mail.md)
 
 ### Binary HWP documents

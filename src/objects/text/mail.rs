@@ -276,6 +276,20 @@ impl Read for Body<'_> {
     }
 }
 
+fn decoded_size(mut data: impl Read, stop_after: u64, sink: &mut dyn ChildSink) -> io::Result<u64> {
+    let mut size = 0;
+    let mut block = [0; 8192];
+    while size <= stop_after {
+        sink.check()?;
+        let n = data.read(&mut block)?;
+        if n == 0 {
+            break;
+        }
+        size += n as u64;
+    }
+    Ok(size)
+}
+
 fn submit(
     bytes: &[u8],
     mode: Encoding,
@@ -299,16 +313,7 @@ fn submit_parts(
     if sink.child_limit().is_some() {
         // Stock checks the decoded byte count before the file and map limits.
         if bound > sink.remaining() {
-            let mut total = 0;
-            let mut block = [0; 8192];
-            loop {
-                sink.check()?;
-                let n = data.read(&mut block)?;
-                if n == 0 {
-                    break;
-                }
-                total += n as u64;
-            }
+            let total = decoded_size(&mut data, u64::MAX, sink)?;
             if sink.skip_declared_size(total) {
                 return Ok(Handling::Complete);
             }
@@ -373,6 +378,8 @@ struct Deferred<'a> {
     max_bytes: u64,
     prior_limit: bool,
     has_uu: bool,
+    oversized_mixed: bool,
+    direct_members: usize,
 }
 
 // Identical saved messages have the same children and scan cost in either directory order.
@@ -480,6 +487,7 @@ fn part<'a>(
         .iter()
         .any(|e| enc.eq_ignore_ascii_case(e))
     {
+        deferred.direct_members += 1;
         return super::attachments::uu(p.body, sink);
     }
     let mode = if enc.eq_ignore_ascii_case(b"base64") {
@@ -534,6 +542,14 @@ fn part<'a>(
                 // line stays in the forward that it submits before direct siblings.
                 prefix = &p.body[..p.body.len() - encoded.len()];
                 body = note.tail;
+                let remaining = sink.remaining();
+                let upper = (prefix.len() + body.len()) as u64 + u64::from(!body.ends_with(b"\n"));
+                if upper > remaining {
+                    // Only CRLF normalization can shrink this forward below its wire length.
+                    let file =
+                        Body::new(prefix, Encoding::Plain).chain(Body::new(body, Encoding::Plain));
+                    deferred.oversized_mixed |= decoded_size(file, remaining, sink)? > remaining;
+                }
                 deferred.add(Saved::Uuencoded(Some(note)), encoded.len() as u64, false);
             } else {
                 deferred.add(
@@ -560,17 +576,18 @@ fn part<'a>(
     let filename = parameter(&p.disposition, b"filename")
         .or_else(|| parameter(&p.kind, b"name"))
         .or(forwarded.then_some(b"textportion".as_slice()));
+    deferred.direct_members += 1;
     deferred.prior_limit |= sink.child_limit().is_some();
     submit_parts(prefix, body, mode, filename, sink)
 }
 
-fn parse_message(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handling> {
+fn parse_message(bytes: &[u8], standalone: bool, sink: &mut dyn ChildSink) -> io::Result<Handling> {
     let mut deferred = Deferred::default();
     let result = part(bytes, sink, 0, false, &mut deferred)?;
     if result != Handling::Complete {
         return Ok(result);
     }
-    let Some(bytes) = deferred.first else {
+    let Some(saved) = deferred.first else {
         return Ok(Handling::Complete);
     };
     if deferred.uncertain {
@@ -592,7 +609,7 @@ fn parse_message(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handling>
         }
         return Ok(Handling::Incomplete);
     }
-    match bytes {
+    match saved {
         Saved::Forward(body) => {
             for _ in 0..=deferred.copies {
                 sink.check()?;
@@ -602,6 +619,29 @@ fn parse_message(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handling>
                 }
             }
             Ok(Handling::Complete)
+        }
+        Saved::Uuencoded(Some(note)) if deferred.oversized_mixed && note.can_enter(sink) => {
+            // The rejected forward remains beside the note. Directory traversal may stop
+            // at the forward before reaching the note. A later map could see either budget.
+            if !standalone || !sink.at_root() || deferred.direct_members != 1 {
+                return Ok(Handling::Incomplete);
+            }
+            for block in bytes.chunks(8192) {
+                sink.check()?;
+                if !block
+                    .iter()
+                    .all(|b| b.is_ascii_graphic() || b.is_ascii_whitespace())
+                {
+                    return Ok(Handling::Incomplete);
+                }
+            }
+            // Printable top-level mail has no subsequent embedded map. A note miss leaves
+            // the outer raw matcher and the already recorded size limit identical in both orders.
+            Ok(if note.submit(sink)? == Handling::Complete {
+                Handling::Complete
+            } else {
+                Handling::Incomplete
+            })
         }
         Saved::Uuencoded(Some(note)) => note.submit(sink),
         Saved::Uuencoded(None) => Ok(Handling::Incomplete),
@@ -621,7 +661,7 @@ pub(super) fn extract(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Hand
             sink.check()?;
             if empty && row.starts_with(b"From ") {
                 let previous = &message[..message.len() - rest.len()];
-                let result = parse_message(previous, sink)?;
+                let result = parse_message(previous, false, sink)?;
                 if result != Handling::Complete {
                     return Ok(result);
                 }
@@ -630,9 +670,9 @@ pub(super) fn extract(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Hand
             empty = row.is_empty();
             rest = next;
         }
-        return parse_message(message, sink);
+        return parse_message(message, false, sink);
     }
-    parse_message(bytes, sink)
+    parse_message(bytes, true, sink)
 }
 
 #[cfg(test)]

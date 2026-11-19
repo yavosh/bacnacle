@@ -65,6 +65,7 @@ trait ChildSink {
     fn view(&mut self, data: &mut dyn Read, target: Target) -> io::Result<bool>;
 
     fn check(&mut self) -> io::Result<()>;
+    fn at_root(&self) -> bool;
     fn child_limit(&self) -> Option<Limit>;
     fn can_enter_child(&mut self) -> bool;
     fn remaining(&self) -> u64;
@@ -454,6 +455,10 @@ impl Traversal<'_> {
 }
 
 impl ChildSink for Traversal<'_> {
+    fn at_root(&self) -> bool {
+        self.parents.len() == 1
+    }
+
     fn can_enter_child(&mut self) -> bool {
         if let Some(reason) = self.child_limit() {
             self.first_limit.get_or_insert(reason);

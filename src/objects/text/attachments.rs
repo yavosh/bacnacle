@@ -241,6 +241,10 @@ pub(super) fn recovered_note<'a>(
 }
 
 impl RecoveredNote<'_> {
+    pub(super) fn can_enter(&self, sink: &dyn ChildSink) -> bool {
+        self.size > 5 && sink.size_limit(self.size).is_none() && sink.child_limit().is_none()
+    }
+
     pub(super) fn submit(mut self, sink: &mut dyn ChildSink) -> io::Result<Handling> {
         if self.size <= 5 || sink.skip_declared_size(self.size) {
             return Ok(Handling::Complete);

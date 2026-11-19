@@ -683,7 +683,6 @@ fn mixed_forward_note(stock: bool) -> io::Result<()> {
             format!("{prefix}MaxScanSize"),
         ),
         (format!("MaxScanSize {file_budget}"), 2, "Emitted".into()),
-        (format!("MaxScanSize {}", file_budget - 1), 4, "Note".into()),
         ("MaxFiles 3".into(), 1, format!("{prefix}MaxFiles")),
         ("MaxFiles 4".into(), 1, "Receipt".into()),
         ("MaxFiles 4".into(), 4, format!("{prefix}MaxFiles")),
@@ -694,6 +693,73 @@ fn mixed_forward_note(stock: bool) -> io::Result<()> {
         let server = Server::new(stock, &format!("{options}\nAlertExceedsMax yes"), &rules[i])?;
         check(&server, doc, &name)?;
     }
+    for doc in [doc.clone(), doc.replace('\n', "\r\n")] {
+        let known = rules[2].clone() + &hash("Outer", doc.as_bytes())?;
+        for extra in [
+            NOTE.len() - 1,
+            NOTE.len(),
+            emitted.len() - 1,
+            emitted.len(),
+            emitted.len() + NOTE.len(),
+        ] {
+            let options = format!("MaxScanSize {}\nAlertExceedsMax yes", doc.len() + extra);
+            let server = Server::new(stock, &options, &rules[4])?;
+            if (NOTE.len()..emitted.len()).contains(&extra) {
+                if stock {
+                    let reply = server.scan(doc.as_bytes())?;
+                    assert!(
+                        reply == "stream: Fwd.Note.UNOFFICIAL FOUND\0"
+                            || reply == "stream: Heuristics.Limits.Exceeded.MaxScanSize FOUND\0",
+                        "{reply:?}"
+                    );
+                } else {
+                    check(&server, &doc, "Incomplete")?;
+                }
+            } else {
+                check(
+                    &server,
+                    &doc,
+                    if extra == emitted.len() + NOTE.len() {
+                        "Note"
+                    } else {
+                        "Heuristics.Limits.Exceeded.MaxScanSize"
+                    },
+                )?;
+            }
+            check(
+                &Server::new(stock, &options, &known)?,
+                &doc,
+                if extra >= emitted.len() {
+                    "Emitted"
+                } else {
+                    "Outer"
+                },
+            )?;
+        }
+    }
+    // Both file count and recursion can exclude the note after size excluded the forward.
+    for limit in ["MaxFiles 1", "MaxRecursion 1"] {
+        let options = format!(
+            "MaxScanSize {}\n{limit}\nAlertExceedsMax yes",
+            doc.len() + NOTE.len()
+        );
+        check(
+            &Server::new(stock, &options, &rules[4])?,
+            doc,
+            "Heuristics.Limits.Exceeded.MaxScanSize",
+        )?;
+    }
+    // A direct contact still wins before the private recovery directory is opened.
+    let with_contact = &samples.iter().find(|s| s.1).unwrap().0;
+    let options = format!(
+        "MaxScanSize {}\nAlertExceedsMax yes",
+        with_contact.len() + CONTACT.len() + NOTE.len()
+    );
+    check(
+        &Server::new(stock, &options, &(rules[3].clone() + &rules[4]))?,
+        with_contact,
+        "Contact",
+    )?;
     Ok(())
 }
 
