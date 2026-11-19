@@ -380,6 +380,49 @@ fn stock_zip64_directory_sentinels() -> io::Result<()> {
     compare_sentinels(true)
 }
 
+fn mixed_encryption(stock: bool) -> io::Result<()> {
+    let archive = include_bytes!("fixtures/zip/mixed-encryption.zip");
+    let receipt = b"Quarterly statement from accounting.";
+    let locked = hdb(
+        "Packing",
+        b"Ordinary packing note for the weekly office inventory.\n",
+    )?;
+    let readable = hdb("Receipt", receipt)?;
+    let outer = hdb("Envelope", archive)?;
+    let both = readable.clone() + &outer + &locked;
+    let exact = archive.len() + receipt.len();
+    for (rules, options, expected) in [
+        (&both, String::new(), "Receipt"),
+        (&locked, String::new(), ""),
+        (&outer, String::new(), "Envelope"),
+        (&both, "ScanArchive no".into(), "Envelope"),
+        (&readable, "MaxFiles 1".into(), "MaxFiles"),
+        (&readable, "MaxFiles 2".into(), "Receipt"),
+        (&readable, "MaxRecursion 1".into(), "MaxRecursion"),
+        (&readable, format!("MaxScanSize {exact}"), "Receipt"),
+        (
+            &readable,
+            format!("MaxScanSize {}", exact - 1),
+            "MaxScanSize",
+        ),
+    ] {
+        let server = Server::start(stock, rules, &format!("AlertExceedsMax yes\n{options}"))?;
+        server.check(&options, archive, expected, stock)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn mixed_encryption_members() -> io::Result<()> {
+    mixed_encryption(false)
+}
+
+#[test]
+#[ignore = "requires the pinned Debian clamd"]
+fn stock_mixed_encryption_members() -> io::Result<()> {
+    mixed_encryption(true)
+}
+
 #[test]
 fn stored_member_scans_without_scratch() -> io::Result<()> {
     use barnacle::objects::{self, Options, Verdict};

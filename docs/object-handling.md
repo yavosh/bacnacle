@@ -70,6 +70,11 @@ The Apache fixtures exercise per-member sentinels. Stock skips those members and
 The comparisons cover single-disk archives with a fixed ZIP64 trailer. Large offsets, split archives, and extended trailers remain unverified.
 [Rust comparisons](../tests/object_zip64.rs) · [Writer settings](../tests/fixtures/zip64/README.md)
 
+With local hash rules and encrypted-archive alerts disabled, stock skips a protected ZIP member and scans later readable members.
+The protected entry counts toward the ZIP directory limit. Its plaintext consumes no scan bytes.
+The comparisons cover an Info-ZIP archive with a protected packing note and a readable receipt.
+[Info-ZIP fixture](../tests/fixtures/zip/README.md#mixed-encryption)
+
 For a 1 MiB stored ledger, four clients reached 301 scans/s with Barnacle and 247 scans/s with stock.
 Peak cgroup memory was 6.94 MiB and 22.28 MiB respectively. Borrowing the member saved 1,048,593 written bytes per scan.
 The preceding Barnacle build reached 287 scans/s at 10.36 MiB. Each median covers three fresh containers, one CPU, and 2 GiB RAM.

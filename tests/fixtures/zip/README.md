@@ -12,3 +12,10 @@ chmod 644 ledger.txt second.txt
 ```
 
 The archive SHA-256 is `2d13d256a5ce7bf3e4337ca9e9f39a0ff302732fce93c85518f04b293ea0fa2a`.
+
+## Mixed encryption
+
+Info-ZIP created `mixed-encryption.zip` by adding a protected packing note followed by an ordinary accounting receipt.
+The packing note contains `Ordinary packing note for the weekly office inventory.` and a newline.
+The receipt contains `Quarterly statement from accounting.` with no final newline.
+Both use the stored compression method. The fixture SHA-256 is `92098913570b0057a5c27fe57c2e55ef646515db2bffe2ef378833999ec1df50`.

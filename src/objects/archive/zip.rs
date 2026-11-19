@@ -61,10 +61,12 @@ impl<'a> Entry<'a> {
     }
 
     fn visit(&self, sink: &mut dyn ChildSink) -> io::Result<Handling> {
-        if self.flags & (1 | 0x2000) != 0 {
+        if self.flags & 0x2000 != 0 {
             return Ok(Handling::Incomplete);
         }
-        if self.compressed.is_empty() {
+        // The active local matcher has no password database or encrypted-archive alert.
+        // Stock counts an encrypted directory entry but opens no child for it.
+        if self.flags & 1 != 0 || self.compressed.is_empty() {
             return Ok(Handling::Complete);
         }
         let max_file_size = sink.max_file_size();
