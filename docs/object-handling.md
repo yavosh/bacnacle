@@ -573,3 +573,17 @@ Each file had one or two XZ layers, encoded at preset 5. All 4,608 replies retur
 
 Run the same benchmark command with `xz` as its last argument. The body-rule database and VM settings match the gzip experiment.
 The measured Barnacle binary had SHA-256 `e2e85a9bdc8ffb909bc3c704b0025316163ad4ad0490ccd6a1d3a66dc91a5d3c`. [Raw observations](benchmarks/object-xz-profile-samples.csv)
+
+The integrated build at `e27c145` repeated the four-client XZ experiment on six fresh reference guests.
+Each guest used one vCPU and 2 GiB RAM without swap. All 4,608 replies matched the expected local signature.
+
+| Median of three boots | Stock clamd | Barnacle |
+| --- | ---: | ---: |
+| Warm scans/s | 328.33 | 460.24 |
+| Warm p95 ms | 34.63 | 24.01 |
+| Scan peak MiB | 113.69 | 79.28 |
+| Sampled scratch growth MiB | 2.34 | 2.01 |
+| Ready ms | 257.81 | 291.87 |
+
+The compiled Barnacle binary had SHA-256 `15a5d95fae48cc20a5bffa50a487120bfeec5620aa6dea79c83544c17de7a2ed`.
+[Integrated reference-guest results](benchmarks/object-xz-integrated.csv)
