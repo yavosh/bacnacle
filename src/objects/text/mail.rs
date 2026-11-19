@@ -368,10 +368,25 @@ enum Saved<'a> {
 #[derive(Default)]
 struct Deferred<'a> {
     first: Option<Saved<'a>>,
+    copies: usize,
     uncertain: bool,
     max_bytes: u64,
     prior_limit: bool,
     has_uu: bool,
+}
+
+// Identical saved messages have the same children and scan cost in either directory order.
+fn identical_forward(left: &[u8], right: &[u8], sink: &mut dyn ChildSink) -> io::Result<bool> {
+    if left.len() != right.len() {
+        return Ok(false);
+    }
+    for (a, b) in left.chunks(8192).zip(right.chunks(8192)) {
+        sink.check()?;
+        if a != b {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 impl<'a> Deferred<'a> {
@@ -380,6 +395,25 @@ impl<'a> Deferred<'a> {
         self.has_uu |= matches!(file, Saved::Uuencoded(_));
         self.max_bytes = self.max_bytes.max(bound);
         self.first.get_or_insert(file);
+    }
+
+    fn add_forward(
+        &mut self,
+        body: &'a [u8],
+        extra: bool,
+        sink: &mut dyn ChildSink,
+    ) -> io::Result<()> {
+        if !self.uncertain
+            && !extra
+            && let Some(Saved::Forward(first)) = &self.first
+            && identical_forward(first, body, sink)?
+        {
+            self.copies += 1;
+        } else {
+            let bound = body.len() as u64 + u64::from(!body.ends_with(b"\n"));
+            self.add(Saved::Forward(body), bound, extra);
+        }
+        Ok(())
     }
 }
 
@@ -516,12 +550,7 @@ fn part<'a>(
         if enc.is_empty() || enc.eq_ignore_ascii_case(b"7bit") {
             // These saved messages follow directly scanned attachments. With explicit
             // 7bit the reference also writes a second transfer-decoding recovery file.
-            let bound = p.body.len() as u64 + u64::from(!p.body.ends_with(b"\n"));
-            deferred.add(
-                Saved::Forward(p.body),
-                bound,
-                enc.eq_ignore_ascii_case(b"7bit"),
-            );
+            deferred.add_forward(p.body, enc.eq_ignore_ascii_case(b"7bit"), sink)?;
             return Ok(Handling::Complete);
         }
     }
@@ -564,7 +593,16 @@ fn parse_message(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handling>
         return Ok(Handling::Incomplete);
     }
     match bytes {
-        Saved::Forward(body) => submit(body, Encoding::Plain, None, sink),
+        Saved::Forward(body) => {
+            for _ in 0..=deferred.copies {
+                sink.check()?;
+                let result = submit(body, Encoding::Plain, None, sink)?;
+                if result != Handling::Complete {
+                    return Ok(result);
+                }
+            }
+            Ok(Handling::Complete)
+        }
         Saved::Uuencoded(Some(note)) => note.submit(sink),
         Saved::Uuencoded(None) => Ok(Handling::Incomplete),
     }

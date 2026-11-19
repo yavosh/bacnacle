@@ -124,7 +124,9 @@ It scans that revised forward immediately. A following contact remains eligible 
 Multiple notes and mixed forwards with an absent or 7bit declaration remain incomplete after direct attachments miss.
 The marker is a case-insensitive line prefix, `Content-Transfer-Encoding`, including in prose. A lowercase `7bit` anywhere on that line suppresses it. With a marker, 8bit or binary members are scanned immediately.
 An absent or 7bit declaration defers the saved forward until after ordinary attachments.
-Multiple deferred forwards and the extra recovery file produced by explicit 7bit remain incomplete after direct attachments miss.
+Stock scans saved messages in private-directory order. Two competing receipts produced opposite winners on Linux overlayfs and tmpfs.
+Barnacle scans each copy when all deferred forwards have identical bytes and omit the transfer declaration.
+Different saved forwards and the extra recovery file from explicit 7bit remain incomplete after direct attachments miss.
 
 A standalone `message/rfc822` uses the literal embedded headers. A Base64 body without headers produced no mail child.
 A simple quoted-printable-wrapped text message retained its literal body. More complex standalone quoted-printable layouts remain incomplete.

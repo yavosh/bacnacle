@@ -354,12 +354,19 @@ fn forwarded_child_has_mail_parent_and_part_name() -> io::Result<()> {
 }
 
 fn forwarded_attachment(inner: &[u8], mode: &str, contact: bool) -> Vec<u8> {
-    let mut doc = format!("{HEAD}Content-Type: multipart/mixed; boundary=box\n\n--box\nContent-Type: message/rfc822; name=source.eml\nContent-Disposition: attachment; filename=source.eml\n").into_bytes();
-    if !mode.is_empty() {
-        doc.extend(format!("Content-Transfer-Encoding: {mode}\n").bytes());
+    multipart_forwards(&[(inner, mode, "source")], contact)
+}
+
+fn multipart_forwards(messages: &[(&[u8], &str, &str)], contact: bool) -> Vec<u8> {
+    let mut doc = format!("{HEAD}Content-Type: multipart/mixed; boundary=box\n\n").into_bytes();
+    for &(inner, mode, name) in messages {
+        doc.extend(format!("--box\nContent-Type: message/rfc822; name={name}.eml\nContent-Disposition: attachment; filename={name}.eml\n").bytes());
+        if !mode.is_empty() {
+            doc.extend(format!("Content-Transfer-Encoding: {mode}\n").bytes());
+        }
+        doc.push(b'\n');
+        doc.extend(inner);
     }
-    doc.push(b'\n');
-    doc.extend(inner);
     if contact {
         doc.extend(format!("--box\nContent-Type: text/vcard; name=contact.vcf\nContent-Transfer-Encoding: base64\n\n{}\n",b64(CONTACT.as_bytes())).bytes());
     }
@@ -699,4 +706,197 @@ fn mixed_forward_note_winners() -> io::Result<()> {
 #[ignore = "requires pinned Debian clamd"]
 fn stock_mixed_forward_note_winners() -> io::Result<()> {
     mixed_forward_note(true)
+}
+
+fn duplicate_forwards(stock: bool) -> io::Result<()> {
+    let message = inner();
+    let parts = ["office", "finance", "archive"].map(|name| (message.as_bytes(), "", name));
+    let receipt = hash("Receipt", RECEIPT.as_bytes())?;
+    let saved = hash("Forward", message.as_bytes())?;
+    let contact = hash("Contact", CONTACT.as_bytes())?;
+    for count in [2, 3] {
+        let lf = String::from_utf8(multipart_forwards(&parts[..count], false)).unwrap();
+        let with_contact = String::from_utf8(multipart_forwards(&parts[..count], true)).unwrap();
+        for doc in [lf.clone(), lf.replace('\n', "\r\n")] {
+            let outer = hash("Outer", doc.as_bytes())?;
+            let child = receipt.clone() + &saved + &outer;
+            check(&Server::new(stock, "", &child)?, &doc, "Receipt")?;
+            check(
+                &Server::new(stock, "", &(saved.clone() + &outer))?,
+                &doc,
+                "Forward",
+            )?;
+            check(&Server::new(stock, "", &outer)?, &doc, "Outer")?;
+            // The forward contains the plain introduction and the decoded receipt.
+            for (limits, hdb, expected) in [
+                ("MaxRecursion 2".to_owned(), &child, "Forward"),
+                ("MaxRecursion 3".into(), &child, "Receipt"),
+                ("MaxFiles 3".into(), &child, "Forward"),
+                ("MaxFiles 4".into(), &child, "Receipt"),
+                (
+                    format!("MaxScanSize {}", doc.len() + message.len() - 1),
+                    &child,
+                    "Outer",
+                ),
+                (
+                    format!("MaxScanSize {}", doc.len() + message.len()),
+                    &child,
+                    "Forward",
+                ),
+                (
+                    format!("MaxFiles {}", 3 * count),
+                    &contact,
+                    "Heuristics.Limits.Exceeded.MaxFiles",
+                ),
+                (
+                    format!("MaxFiles {}", 3 * count + 1),
+                    &contact,
+                    if stock { "OK" } else { "Incomplete" },
+                ),
+            ] {
+                check(
+                    &Server::new(stock, &format!("{limits}\nAlertExceedsMax yes"), hdb)?,
+                    &doc,
+                    expected,
+                )?;
+            }
+        }
+        check(
+            &Server::new(stock, "", &(receipt.clone() + &contact))?,
+            &with_contact,
+            "Contact",
+        )?;
+    }
+    Ok(())
+}
+
+fn competing_deferred_receipts(stock: bool) -> io::Result<()> {
+    let second_receipt =
+        "South office: the monthly expense summary lists local travel and office supplies.\n"
+            .repeat(3);
+    let first = inner();
+    let second = first.replace(&b64(RECEIPT.as_bytes()), &b64(second_receipt.as_bytes()));
+    let db = hash("Receipt", RECEIPT.as_bytes())? + &hash("Expenses", second_receipt.as_bytes())?;
+    for parts in [
+        [
+            (first.as_bytes(), "", "zulu"),
+            (second.as_bytes(), "", "alpha"),
+        ],
+        [
+            (second.as_bytes(), "", "alpha"),
+            (first.as_bytes(), "", "zulu"),
+        ],
+    ] {
+        let doc = multipart_forwards(&parts, false);
+        let available = first.len() + "Attached receipt.\n".len() + RECEIPT.len();
+        assert!(available < second.len());
+        for restricted in [false, true] {
+            let options = if restricted {
+                format!("MaxScanSize {}\nAlertExceedsMax yes", doc.len() + available)
+            } else {
+                String::new()
+            };
+            let server = Server::new(stock, &options, &db)?;
+            if stock {
+                // Each scan creates a fresh directory with randomly named saved forwards.
+                let reply = server.scan(&doc)?;
+                let other = if restricted {
+                    "stream: Heuristics.Limits.Exceeded.MaxScanSize FOUND\0"
+                } else {
+                    "stream: Fwd.Expenses.UNOFFICIAL FOUND\0"
+                };
+                assert!(
+                    reply == "stream: Fwd.Receipt.UNOFFICIAL FOUND\0" || reply == other,
+                    "{reply:?}"
+                );
+            } else {
+                check(&server, std::str::from_utf8(&doc).unwrap(), "Incomplete")?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn duplicate_forward_winners() -> io::Result<()> {
+    duplicate_forwards(false)?;
+    competing_deferred_receipts(false)?;
+    // A third, different message can win before either of the first two saved files.
+    let message = inner();
+    let other = message.replace("Market receipt", "Office invoice");
+    for members in [
+        vec![
+            (message.as_bytes(), "", "one"),
+            (message.as_bytes(), "", "two"),
+            (other.as_bytes(), "", "three"),
+        ],
+        vec![
+            (message.as_bytes(), "", "one"),
+            (message.as_bytes(), "7bit", "two"),
+        ],
+    ] {
+        let doc = String::from_utf8(multipart_forwards(&members, false)).unwrap();
+        check(
+            &Server::new(false, "", &hash("Receipt", RECEIPT.as_bytes())?)?,
+            &doc,
+            "Incomplete",
+        )?;
+    }
+    use barnacle::objects::{Options, Verdict, scan};
+    let tmp = tempfile::tempdir()?;
+    let mut seen = 0;
+    let pair = [
+        (message.as_bytes(), "", "one"),
+        (message.as_bytes(), "", "two"),
+    ];
+    scan(
+        &multipart_forwards(&pair, false),
+        &Options::default(),
+        tmp.path(),
+        |obj, _| {
+            if obj.bytes == RECEIPT.as_bytes() {
+                assert_eq!(
+                    obj.parents.iter().map(|p| p.file_type).collect::<Vec<_>>(),
+                    ["CL_TYPE_MAIL", "CL_TYPE_MAIL"]
+                );
+                assert!(obj.parents[1].name.is_none());
+                seen += 1;
+            }
+            Ok(Verdict::Miss)
+        },
+        || Ok(()),
+    )?;
+    assert_eq!(seen, 2);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires pinned Debian clamd"]
+fn stock_duplicate_forward_winners() -> io::Result<()> {
+    duplicate_forwards(true)?;
+    competing_deferred_receipts(true)?;
+    let message = inner();
+    let pair = [
+        (message.as_bytes(), "", "one"),
+        (message.as_bytes(), "", "two"),
+    ];
+    let doc = String::from_utf8(multipart_forwards(&pair, false)).unwrap();
+    let marker: String = RECEIPT.bytes().map(|b| format!("{b:02x}")).collect();
+    for (parent, winner) in [("CL_TYPE_MAIL", "Parent"), ("CL_TYPE_ZIP", "OK")] {
+        let rule = format!(
+            "Fwd.Parent;Engine:81-255,Target:0,Container:{parent},FileSize:{0}-{0};0;{marker}\n",
+            RECEIPT.len()
+        );
+        check(
+            &Server::with_rules(
+                true,
+                "",
+                &hash("Miss", CONTACT.as_bytes())?,
+                Some(("parent.ldb", &rule)),
+            )?,
+            &doc,
+            winner,
+        )?;
+    }
+    Ok(())
 }
