@@ -257,7 +257,7 @@ The tests cover Flate expansion across the reference's initial 256 KiB buffer.
 An oversized decoded directory can still supply a page reference when it fits this buffer.
 If the next allocation exceeds the limit, the reference can scan the encoded carrier instead.
 Barnacle stores deferred arrays and selected dictionaries in one private spool, bounded by the initial remaining object budget.
-If the spool fills, a later selected object can produce incomplete coverage. [Object-stream layout](https://qpdf.readthedocs.io/en/stable/object-streams.html)
+If the spool fills, a later selected object can produce incomplete coverage. [Object-stream layout](https://qpdf.readthedocs.io/en/stable/object-streams.html) · [Catalog benchmarks](benchmarks/object-pdf-catalog.md)
 
 ### Apple disk images
 
@@ -358,7 +358,7 @@ The size check precedes the file-count check. Without inherited bindings, the so
 If that bound fits, Barnacle serializes once. Otherwise it counts the output before spilling an admitted subdocument larger than 64 KiB.
 It supports up to 256 live namespace bindings and 256 attributes per element. Names beyond 1,024 bytes, prefixes beyond 256 bytes,
 namespace URIs beyond 2,048 bytes, escaped attribute values, and extended XML serialization return incomplete coverage.
-LZMA dictionary estimates above 64 MiB also return incomplete coverage. [Apple fixture](../tests/fixtures/xar/README.md)
+LZMA dictionary estimates above 64 MiB also return incomplete coverage. [Apple fixture](../tests/fixtures/xar/README.md) · [Inventory benchmarks](benchmarks/object-xar-inventory.md)
 
 ### OLE compound documents
 

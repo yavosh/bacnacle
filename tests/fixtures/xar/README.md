@@ -6,7 +6,8 @@ The archive contains a named subdocument, a gzip-compressed receipt, and SHA-1 c
 To build an equivalent archive on macOS, run this command in the fixture directory.
 
 ```sh
-xar -cf inventory.xar -s catalog.xml -n stockroom receipt.txt
+xar --prop-include=name --prop-include=type --prop-include=data \
+  -n stockroom -s catalog.xml -cf inventory.xar receipt.txt
 ```
 
 File timestamps and the ordering of declarations in the archived XML can differ between runs.
