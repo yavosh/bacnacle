@@ -15,6 +15,10 @@ mod zip;
 use client::{Daemon, stream_frame, unix_request};
 use flate2::{Compression, write::GzEncoder};
 use md5::{Digest, Md5};
+use sevenz_rust2::{
+    ArchiveEntry, ArchiveWriter, EncoderConfiguration, SourceReader,
+    encoder_options::{LzmaOptions, PpmdOptions},
+};
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
@@ -28,12 +32,20 @@ fn gzip(data: &[u8]) -> io::Result<Vec<u8>> {
     encoder.finish()
 }
 
-fn lzma_archive(data: &[u8]) -> io::Result<Vec<u8>> {
-    use sevenz_rust2::{ArchiveEntry, ArchiveWriter, encoder_options::LzmaOptions};
+fn solid_archive(entries: &[(&str, &[u8])], method: EncoderConfiguration) -> io::Result<Vec<u8>> {
     let mut writer = ArchiveWriter::new(io::Cursor::new(Vec::new())).map_err(io::Error::other)?;
-    writer.set_content_methods(vec![LzmaOptions::from_level(0).into()]);
+    writer.set_content_methods(vec![method]);
     writer
-        .push_archive_entry(ArchiveEntry::new_file("report"), Some(data))
+        .push_archive_entries(
+            entries
+                .iter()
+                .map(|(name, _)| ArchiveEntry::new_file(name))
+                .collect(),
+            entries
+                .iter()
+                .map(|(_, data)| SourceReader::new(*data))
+                .collect(),
+        )
         .map_err(io::Error::other)?;
     Ok(writer.finish()?.into_inner())
 }
@@ -362,13 +374,25 @@ fn compare(exe: &Path) -> io::Result<()> {
             .unwrap(),
     );
     local_zip.truncate(offset as usize);
+    let model = || PpmdOptions::from_order_memory_size(6, 64 << 20).into();
+    let nested_model = solid_archive(
+        &[("report", FIRST)],
+        PpmdOptions::from_order_memory_size(6, 96 << 20).into(),
+    )?;
     let mut cases = vec![
         ("gzip", gzip(FIRST)?),
         ("concatenated gzip", gzip_members),
         ("bzip2", bzip(FIRST)?),
         ("two bzip2 members", bzip_members),
         ("XZ", xz.to_vec()),
-        ("7z LZMA", lzma_archive(FIRST)?),
+        (
+            "7z LZMA",
+            solid_archive(&[("report", FIRST)], LzmaOptions::from_level(0).into())?,
+        ),
+        (
+            "solid PPMd nested winner before a later member",
+            solid_archive(&[("first", &nested_model), ("later", SECOND)], model())?,
+        ),
         ("SZDD", szdd(FIRST)),
         (
             "7z",
@@ -542,13 +566,18 @@ fn compare(exe: &Path) -> io::Result<()> {
         ),
     )?;
     let report = b"Ordinary monthly filing notes.\n".repeat(512 * 1024);
-    let archive = legacy::sevenzip(true, &[("report", &report), ("later", SECOND)])?;
+    let entries = [("report", report.as_slice()), ("later", SECOND)];
     let _deadline_daemon = Daemon::start(exe, &config, &socket)?;
-    assert_eq!(
-        unix_request(&socket, &stream_frame(&archive)?)?,
-        "stream: Heuristics.Limits.Exceeded.MaxScanTime FOUND\0",
-        "deadline during solid 7z before a later match"
-    );
+    for archive in [
+        legacy::sevenzip(true, &entries)?,
+        solid_archive(&entries, model())?,
+    ] {
+        assert_eq!(
+            unix_request(&socket, &stream_frame(&archive)?)?,
+            "stream: Heuristics.Limits.Exceeded.MaxScanTime FOUND\0",
+            "deadline during solid 7z before a later match"
+        );
+    }
     Ok(())
 }
 

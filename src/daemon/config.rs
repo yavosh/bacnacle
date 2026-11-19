@@ -144,11 +144,13 @@ impl Config {
             "MaxFileSize" => self.objects.max_file_size = size(value)?,
             "MaxScanSize" => self.objects.max_scan_size = size(value)?,
             "MaxFiles" => self.objects.max_files = number(value)?,
+            "MaxPartitions" => self.objects.max_partitions = number(value)?,
             "MaxRecursion" => self.objects.max_recursion = number(value)?,
             "AlertExceedsMax" => self.objects.alert_exceeds_max = boolean(value)?,
             "ScanArchive" => self.objects.scan_archive = boolean(value)?,
             "ScanPDF" => self.objects.scan_pdf = boolean(value)?,
             "ScanOLE2" => self.objects.scan_ole2 = boolean(value)?,
+            "ScanXMLDOCS" => self.objects.scan_xml_docs = boolean(value)?,
             "ScanSWF" => self.objects.scan_swf = boolean(value)?,
             "ScanOneNote" => self.objects.scan_onenote = boolean(value)?,
             "ScanImage" => self.objects.scan_image = boolean(value)?,
@@ -308,7 +310,6 @@ fn reference_engine_value(key: &str, value: &str) -> bool {
         | "ScanELF"
         | "PhishingSignatures"
         | "PhishingScanURLs"
-        | "ScanXMLDOCS"
         | "ScanHWP3"
         | "Bytecode" => boolean(value).ok() == Some(true),
         "ArchiveBlockEncrypted"
@@ -325,7 +326,6 @@ fn reference_engine_value(key: &str, value: &str) -> bool {
         "MaxEmbeddedPE" => matches!(size(value), Ok(10485760 | 41943040)),
         "MaxZipTypeRcg" => size(value).ok() == Some(1 << 20),
         "PCREMaxFileSize" => matches!(size(value), Ok(26214400 | 104857600)),
-        "MaxPartitions" => value == "50",
         "MaxIconsPE" => value == "100",
         "PCREMatchLimit" => value == "10000" || value == "100000",
         "PCRERecMatchLimit" => value == "5000" || value == "2000",

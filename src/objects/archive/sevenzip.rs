@@ -21,13 +21,15 @@ fn header_workspace(bytes: &[u8]) -> Option<u64> {
     (size > 0 && bytes.get(position) == Some(&1)).then_some(size.saturating_add(2 << 20))
 }
 
-fn block_workspace(block: &Block) -> u64 {
+fn block_workspace(block: &Block) -> (u64, u64) {
     let history = if block.coders.len() == 1 {
         workspace::history(block.get_unpack_size())
     } else {
         u64::MAX
     };
-    block.coders.iter().fold(0u64, |total, coder| {
+    let mut total = 0u64;
+    let mut models = 0u64;
+    for coder in &block.coders {
         let props = coder.properties();
         let dictionary = || {
             props
@@ -36,7 +38,11 @@ fn block_workspace(block: &Block) -> u64 {
                 .unwrap_or(workspace::BUDGET)
         };
         let bytes = match coder.encoder_method_id() {
-            EncoderMethod::ID_PPMD => dictionary(),
+            EncoderMethod::ID_PPMD => {
+                let model = dictionary();
+                models = models.saturating_add(model);
+                model
+            }
             EncoderMethod::ID_LZMA => props
                 .first()
                 .and_then(|&property| {
@@ -56,8 +62,9 @@ fn block_workspace(block: &Block) -> u64 {
             EncoderMethod::ID_BZIP2 => 8 << 20,
             _ => 0,
         };
-        total.saturating_add(bytes).saturating_add(2 << 20)
-    })
+        total = total.saturating_add(bytes).saturating_add(2 << 20);
+    }
+    (total, models)
 }
 
 pub(super) fn extract(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handling> {
@@ -117,8 +124,8 @@ pub(super) fn extract(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Hand
                 &password,
                 &mut source,
             );
-            let lease =
-                workspace::acquire(block_workspace(&archive.blocks[index]), || sink.check())?;
+            let (bytes, models) = block_workspace(&archive.blocks[index]);
+            let lease = workspace::acquire_with_ppmd(bytes, models, || sink.check())?;
             let result = scan_batch(block, entries, start..end, limit, lease, sink)?;
             if result != Handling::Complete {
                 return Ok(result);

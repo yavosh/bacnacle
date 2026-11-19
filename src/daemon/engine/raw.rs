@@ -107,7 +107,6 @@ pub(super) fn eligible(header: &[u8], file_type: &str) -> bool {
         || header[1..4] == *b"\r\r\n"
         || header.get(2..4).is_some_and(|p| p == b"-l" || p == b"-p")
         || header.get(4..6) == Some(b"\xd0\xcf")
-        || header.get(510..512) == Some(b"\x55\xaa")
         || header.get(512..516) == Some(b"EFI ")
         || header.get(257..262) == Some(b"ustar")
     {
@@ -216,7 +215,7 @@ mod tests {
     use super::eligible;
 
     #[test]
-    fn powerpoint_atom_admission_preserves_zero_prefix_and_partition_checks() {
+    fn powerpoint_atom_and_boot_sector_reach_the_raw_stage() {
         let eligible = |header: &[u8]| eligible(header, "CL_TYPE_BINARY_DATA");
         assert!(eligible(b"\0\0\xa0\x0f\x04\0\0\0H\0i\0"));
         for guarded in [
@@ -230,7 +229,7 @@ mod tests {
         let mut partition = [0; 516];
         partition[..4].copy_from_slice(b"\0\0\xa0\x0f");
         partition[510..512].copy_from_slice(b"\x55\xaa");
-        assert!(!eligible(&partition));
+        assert!(eligible(&partition));
         partition[510..512].fill(0);
         partition[512..].copy_from_slice(b"EFI ");
         assert!(!eligible(&partition));

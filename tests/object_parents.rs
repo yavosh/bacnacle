@@ -46,6 +46,19 @@ fn samples() -> io::Result<Vec<(Vec<u8>, &'static str)>> {
     Ok(out)
 }
 
+fn archive_with_disk_marker() -> io::Result<Vec<u8>> {
+    let mut note = vec![b' '; 512 - 30 - "notes.txt".len()];
+    note.extend_from_slice(b"EFI PART documentation\n");
+    let office = zip::zip(
+        &[("notes.txt", &note), ("word/document.xml", MARKER)],
+        false,
+        false,
+        false,
+    )?;
+    assert_eq!(&office[512..520], b"EFI PART");
+    Ok(office)
+}
+
 #[test]
 fn member_type_and_parent_context() -> io::Result<()> {
     let tmp = tempfile::tempdir()?;
@@ -69,6 +82,22 @@ fn member_type_and_parent_context() -> io::Result<()> {
         )?;
         assert_eq!(result, Verdict::Found(ty.into()));
     }
+    let data = archive_with_disk_marker()?;
+    let result = objects::scan(
+        &data,
+        &Options::default(),
+        tmp.path(),
+        |obj, _| {
+            if obj.bytes == MARKER {
+                let types: Vec<_> = obj.parents.iter().map(|p| p.file_type).collect();
+                assert_eq!(types, ["CL_TYPE_GPT", "CL_TYPE_ZIP"]);
+                return Ok(Verdict::Found("Disk note".into()));
+            }
+            Ok(Verdict::Miss)
+        },
+        || Ok(()),
+    )?;
+    assert_eq!(result, Verdict::Found("Disk note".into()));
     Ok(())
 }
 
@@ -96,6 +125,11 @@ fn stock_parent_type_selects_the_same_member() -> io::Result<()> {
         ),
     )?;
     let _clamd = daemon::Daemon::start(Path::new("/usr/sbin/clamd"), &config, &sock)?;
+    let data = archive_with_disk_marker()?;
+    assert_eq!(
+        daemon::unix_request(&sock, &daemon::stream_frame(&data)?)?,
+        "stream: Parent.CL_TYPE_ZIP.UNOFFICIAL FOUND\0"
+    );
     for (bytes, ty) in samples()? {
         assert_eq!(
             daemon::unix_request(&sock, &daemon::stream_frame(&bytes)?)?,
@@ -104,4 +138,48 @@ fn stock_parent_type_selects_the_same_member() -> io::Result<()> {
         );
     }
     Ok(())
+}
+
+fn ooxml_member_with_xml_disabled(executable: &Path) -> io::Result<()> {
+    let tmp = tempfile::tempdir_in("/tmp")?;
+    let db = tmp.path().join("db");
+    fs::create_dir(&db)?;
+    fs::write(
+        db.join("member.hdb"),
+        format!(
+            "{}:{}:Office.Member\n",
+            barnacle::hash_reader(MARKER)?.md5_hex(),
+            MARKER.len()
+        ),
+    )?;
+    let socket = tmp.path().join("sock");
+    let config = tmp.path().join("clamd.conf");
+    fs::write(
+        &config,
+        format!(
+            "Foreground yes\nDisableCache yes\nScanXMLDOCS no\nDatabaseDirectory {}\nLocalSocket {}\n",
+            db.display(),
+            socket.display()
+        ),
+    )?;
+    let _daemon = daemon::Daemon::start(executable, &config, &socket)?;
+    for (data, ty) in samples()? {
+        assert_eq!(
+            daemon::unix_request(&socket, &daemon::stream_frame(&data)?)?,
+            "stream: Office.Member.UNOFFICIAL FOUND\0",
+            "{ty}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn xml_setting_preserves_office_zip_members() -> io::Result<()> {
+    ooxml_member_with_xml_disabled(Path::new(env!("CARGO_BIN_EXE_barnacle")))
+}
+
+#[test]
+#[ignore = "requires the pinned Debian clamd"]
+fn stock_xml_setting_preserves_office_zip_members() -> io::Result<()> {
+    ooxml_member_with_xml_disabled(Path::new("/usr/sbin/clamd"))
 }

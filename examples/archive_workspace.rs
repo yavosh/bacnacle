@@ -41,10 +41,20 @@ fn prepare(dir: &Path) -> io::Result<()> {
     fs::create_dir_all(dir)?;
     let mut data = MARKER.to_vec();
     data.resize(16 * MIB, b'q');
+    let mut ledger = MARKER.to_vec();
+    for number in 0..32_768 {
+        writeln!(
+            ledger,
+            "Order {number:05}: item {}, quantity {}, zone {}.",
+            number * 19 % 8009,
+            number * 13 % 127,
+            number * 7 % 43
+        )?;
+    }
     let database = dir.join("db");
     fs::create_dir_all(&database)?;
     let mut rule = fs::File::create(database.join("reference.hdb"))?;
-    for bytes in [MARKER, data.as_slice()] {
+    for bytes in [MARKER, data.as_slice(), ledger.as_slice()] {
         for byte in Md5::digest(bytes) {
             write!(rule, "{byte:02x}")?;
         }
@@ -89,6 +99,13 @@ fn prepare(dir: &Path) -> io::Result<()> {
         dir.join("model64.7z"),
         seven(
             &[("notes", &data)],
+            PpmdOptions::from_order_memory_size(6, 64 * MIB as u32).into(),
+        )?,
+    )?;
+    fs::write(
+        dir.join("ledger64.7z"),
+        seven(
+            &[("ledger", &ledger)],
             PpmdOptions::from_order_memory_size(6, 64 * MIB as u32).into(),
         )?,
     )?;
@@ -141,44 +158,53 @@ fn run(path: &Path, worker_count: usize, executable: Option<&Path>) -> io::Resul
         let frame = frame.clone();
         let socket = socket.clone();
         let start = Arc::clone(&barrier);
-        workers.push(std::thread::spawn(move || -> io::Result<()> {
-            start.wait();
-            if let Some(frame) = frame {
-                let reply = daemon::unix_request(&socket, &frame)?;
-                return if reply == "stream: Workspace.Reference.UNOFFICIAL FOUND\0" {
-                    Ok(())
-                } else {
-                    Err(io::Error::other(format!(
-                        "unexpected daemon reply {reply:?}"
-                    )))
-                };
-            }
-            let verdict = objects::scan(
-                &input,
-                &Options::default(),
-                Path::new("/tmp"),
-                |obj, _| {
-                    Ok(if obj.bytes.starts_with(MARKER) {
-                        Verdict::Found("reference".into())
+        workers.push(std::thread::spawn(
+            move || -> io::Result<std::time::Duration> {
+                start.wait();
+                let request = Instant::now();
+                if let Some(frame) = frame {
+                    let reply = daemon::unix_request(&socket, &frame)?;
+                    return if reply == "stream: Workspace.Reference.UNOFFICIAL FOUND\0" {
+                        Ok(request.elapsed())
                     } else {
-                        Verdict::Miss
-                    })
-                },
-                || Ok(()),
-            )?;
-            if verdict != Verdict::Found("reference".into()) {
-                return Err(io::Error::other(format!(
-                    "unexpected scan verdict {verdict:?}"
-                )));
-            }
-            Ok(())
-        }));
+                        Err(io::Error::other(format!(
+                            "unexpected daemon reply {reply:?}"
+                        )))
+                    };
+                }
+                let verdict = objects::scan(
+                    &input,
+                    &Options::default(),
+                    Path::new("/tmp"),
+                    |obj, _| {
+                        Ok(if obj.bytes.starts_with(MARKER) {
+                            Verdict::Found("reference".into())
+                        } else {
+                            Verdict::Miss
+                        })
+                    },
+                    || Ok(()),
+                )?;
+                if verdict != Verdict::Found("reference".into()) {
+                    return Err(io::Error::other(format!(
+                        "unexpected scan verdict {verdict:?}"
+                    )));
+                }
+                Ok(request.elapsed())
+            },
+        ));
     }
+    let mut requests = Vec::with_capacity(worker_count);
     for worker in workers {
-        worker
-            .join()
-            .map_err(|_| io::Error::other("scan worker panicked"))??;
+        requests.push(
+            worker
+                .join()
+                .map_err(|_| io::Error::other("scan worker panicked"))??,
+        );
     }
+    let elapsed = timer.elapsed();
+    requests.sort_unstable();
+    let p95 = requests[(95 * requests.len()).div_ceil(100) - 1];
     let status = fs::read_to_string(format!("/proc/{process}/status"))?;
     let hwm = status
         .lines()
@@ -186,12 +212,14 @@ fn run(path: &Path, worker_count: usize, executable: Option<&Path>) -> io::Resul
         .ok_or_else(|| io::Error::other("VmHWM missing from /proc/self/status"))?;
     let cgroup_peak = fs::read_to_string("/sys/fs/cgroup/memory.peak")?;
     println!(
-        "{} workers={} elapsed_ms={} {} cgroup_peak_bytes={}",
+        "{} workers={} elapsed_ms={} {} cgroup_peak_bytes={} requests_s={:.2} p95_us={}",
         path.display(),
         worker_count,
-        timer.elapsed().as_millis(),
+        elapsed.as_millis(),
         hwm,
-        cgroup_peak.trim()
+        cgroup_peak.trim(),
+        worker_count as f64 / elapsed.as_secs_f64(),
+        p95.as_micros()
     );
     Ok(())
 }

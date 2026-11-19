@@ -1,6 +1,6 @@
 # Archive decoder workspace
 
-The Rust probe creates ordinary XZ and 7z documents with two harmless whole-file signatures.
+The Rust probe creates ordinary XZ and 7z documents with harmless whole-file signatures.
 The direct mode runs Barnacle object traversal with a marker callback.
 The daemon mode sends the same files over INSTREAM and checks the signature in every response.
 
@@ -36,6 +36,8 @@ probe() {
 probe model64.7z 10
 probe model64.7z 10 /usr/sbin/clamd
 probe model64.7z 10 /barnacle
+probe ledger64.7z 10 /usr/sbin/clamd
+probe ledger64.7z 10 /barnacle
 probe nested8.7z 4
 ```
 
@@ -45,11 +47,31 @@ The tiny inputs contain a 43-byte marker. The larger inputs expand to 16 MiB.
 XZ declares a 64 MiB dictionary. The plain 7z inputs use a 16 MiB LZMA2 dictionary.
 Each nested solid block contains an 8 MiB ordinary report, its child archive, and a small tail.
 The PPMd depth series uses one member per layer and a 16 MiB model.
-The ten-worker comparison uses one 16 MiB report and a 64 MiB PPMd model.
+The ten-worker PPMd tests use a 16 MiB repeated report and a ledger containing 32,768 distinct order lines.
+Both declare a 64 MiB PPMd model. The ledger adds a third whole-file signature to the original two-rule database.
 
-## Results
+## PPMd model admission
 
-| Workload | Original traversal | Final traversal |
+Five interleaved trials compared each daemon on a single pinned CPU. Every batch contained ten simultaneous INSTREAM requests.
+The table reports median cgroup peak, throughput, and within-batch p95 request latency.
+
+| Document | Daemon | Peak MiB | Requests/s | p95 ms |
+| --- | --- | ---: | ---: | ---: |
+| Repeated report | Debian clamd | 395.6 | 6.06 | 1,649 |
+| Repeated report | Barnacle before model admission | 560.6 | 9.56 | 1,046 |
+| Repeated report | Barnacle with model admission | 92.2 | 10.10 | 988 |
+| Order ledger | Debian clamd | 50.4 | 41.77 | 239 |
+| Order ledger | Barnacle before model admission | 461.9 | 39.76 | 251 |
+| Order ledger | Barnacle with model admission | 70.6 | 41.01 | 239 |
+
+Model admission improved Barnacle's median throughput and memory use on both documents.
+Stock still used 20.2 MiB less on the ledger. Individual batch times varied across trials.
+The CSV preserves the preliminary one-, three-, and seven-model comparisons.
+One preliminary stock run failed with a permission error before producing metrics. All 30 final batches returned the expected signature.
+
+## Earlier traversal measurements
+
+| Workload | Original traversal | General decoder admission |
 | --- | ---: | ---: |
 | Eight nested solid archives, four workers | 478.8 MiB, 399 ms | 98.7 MiB, 315 ms |
 | Eight nested PPMd archives, four workers | 452.7 MiB, 16 ms | 65.9 MiB, 7 ms |
@@ -58,13 +80,12 @@ The ten-worker comparison uses one 16 MiB report and a 64 MiB PPMd model.
 
 Memory values use cgroup peaks. The medians for XZ use three separate process runs.
 
-| Daemon workload pinned to one CPU | Debian clamd | Barnacle |
+| Daemon workload pinned to one CPU | Debian clamd | Barnacle before model admission |
 | --- | ---: | ---: |
 | Eight nested solid archives, four workers | 326.0 MiB, 1,018 ms | 98.8 MiB, 709 ms |
 | 64 MiB PPMd model, ten workers | 399.4 MiB, 1,314 ms | 560.7 MiB, 1,038 ms |
 | Signature after nine 8 MiB reports in one solid block, one worker | 107.2 MiB, 296 ms | 84.2 MiB, 215 ms |
 
-Barnacle used more memory than stock on the simultaneous PPMd workload.
 
 ## Decoder behavior
 
@@ -80,6 +101,8 @@ Admission accounts for declared PPMd models and estimates LZ history from the av
 XZ first reserves up to one quarter of the budget and enforces that bound on each block.
 A larger model triggers one replay under the stock ceiling. The earlier decoder releases its reservation first.
 The process-wide target is 512 MiB. An individually supported request above that target runs alone.
+PPMd also has a 64 MiB aggregate model target. A larger model runs at its declared size.
+A waiting PPMd request acquires its model reservation before reserving general decoder memory. Other codecs can keep using the general pool.
 Metadata parsing with an encoded 7z header also runs alone.
 The charge covers active archive decoders. Scanner indexes, retained metadata, snapshots, and file cache consume additional memory.
 

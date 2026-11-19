@@ -1,4 +1,6 @@
 //! Compare the order and bytes of benign PDF objects with the pinned daemon.
+#[path = "common/base64.rs"]
+mod base64;
 #[path = "../examples/compat_oracle/daemon.rs"]
 mod daemon;
 #[path = "common/zip.rs"]
@@ -83,6 +85,20 @@ fn document(catalog_note: &str, first: Vec<u8>, attachment: Vec<u8>) -> Vec<u8> 
     ])
 }
 
+fn xdp(chunks: &[&[u8]], padding: usize) -> Vec<u8> {
+    let mut xml = format!(
+        "<?xml version=\"1.0\"?>{}<xdp:xdp xmlns:xdp=\"http://ns.adobe.com/xdp/\"><pdf xmlns=\"http://ns.adobe.com/xdp/pdf/\"><document>",
+        " ".repeat(padding)
+    );
+    for chunk in chunks {
+        xml.push_str("<chunk>\n");
+        xml.push_str(&base64::encode(chunk));
+        xml.push_str("\n</chunk>");
+    }
+    xml.push_str("</document></pdf></xdp:xdp>");
+    xml.into_bytes()
+}
+
 fn compare(exe: &Path, stock: bool) -> io::Result<()> {
     let tmp = tempfile::tempdir_in("/tmp")?;
     let root = tmp.path();
@@ -90,11 +106,16 @@ fn compare(exe: &Path, stock: bool) -> io::Result<()> {
     fs::create_dir(&db)?;
     let mut rules = String::new();
     let first_line = [FIRST, b"\n"].concat();
+    let marked_pdf = document("OuterPdfMark", stream("", FIRST), stream("", SECOND));
+    let marked_form = xdp(&[&marked_pdf], 10);
+    let late_form = xdp(&[&marked_pdf], 1501);
     for (name, data) in [
         ("First", FIRST),
         ("Second", SECOND),
         ("FirstLine", first_line.as_slice()),
         ("Text", b"ordinary page text"),
+        ("Form", &marked_form),
+        ("LateForm", &late_form),
     ] {
         rules.push_str(&format!(
             "{}:{}:Pdf.{name}\n",
@@ -195,7 +216,32 @@ fn compare(exe: &Path, stock: bool) -> io::Result<()> {
     let mut cut_stream = flate.clone();
     let endstream = flate.windows(9).rposition(|w| w == b"endstream").unwrap();
     cut_stream.truncate(endstream - 12);
+    let mut truncated_chunk = xdp(&[&marked_pdf], 0);
+    truncated_chunk.truncate(truncated_chunk.len() / 2);
     let cases = [
+        ("XDP child before form", marked_form.clone(), Some("Outer")),
+        (
+            "XDP raw form before late child",
+            late_form,
+            Some("LateForm"),
+        ),
+        ("XDP truncated attachment", truncated_chunk, None),
+        ("XDP attached PDF", xdp(&[&flate], 0), Some("Second")),
+        (
+            "XDP first PDF wins",
+            xdp(&[&marked_pdf, &flate], 0),
+            Some("Outer"),
+        ),
+        (
+            "XDP non-PDF chunk precedes document",
+            xdp(&[b"ordinary text", &flate], 0),
+            None,
+        ),
+        (
+            "XDP beyond initial header",
+            xdp(&[&marked_pdf], 1500),
+            Some("Outer"),
+        ),
         ("page then attachment", bare, Some("FirstLine")),
         ("compressed attachment", flate.clone(), Some("Second")),
         ("Flate parameters", flate_params, Some("Second")),
@@ -231,6 +277,13 @@ fn compare(exe: &Path, stock: bool) -> io::Result<()> {
         );
     }
     drop(daemon);
+    let unmarked_form = xdp(&[&marked_pdf], 1500);
+    let (service, socket) = start("no-archives", "ScanArchive no")?;
+    assert_eq!(
+        unix_request(&socket, &stream_frame(&unmarked_form)?)?,
+        "stream: Pdf.Outer.UNOFFICIAL FOUND\0"
+    );
+    drop(service);
     let larger = b"ordinary expanded document page.\n".repeat(256);
     let compressed = document(
         "notes",
@@ -260,6 +313,10 @@ fn compare(exe: &Path, stock: bool) -> io::Result<()> {
         );
     }
     let (_service, socket) = start("disabled", "ScanPDF no")?;
+    assert_eq!(
+        unix_request(&socket, &stream_frame(&marked_form)?)?,
+        "stream: Pdf.Form.UNOFFICIAL FOUND\0"
+    );
     let reply = unix_request(&socket, &stream_frame(&flate)?)?;
     assert_eq!(
         reply,
@@ -275,6 +332,70 @@ fn compare(exe: &Path, stock: bool) -> io::Result<()> {
 #[test]
 fn barnacle_pdf_objects() -> io::Result<()> {
     compare(Path::new(env!("CARGO_BIN_EXE_barnacle")), false)
+}
+
+#[test]
+fn xdp_parent_for_embedded_pdf() -> io::Result<()> {
+    use barnacle::objects::{self, Options, Verdict};
+    let dir = tempfile::tempdir()?;
+    let pdf = document("parent check", stream("", FIRST), stream("", SECOND));
+    for pad in [0, 1500] {
+        let form = xdp(&[&pdf], pad);
+        let result = objects::scan(
+            &form,
+            &Options::default(),
+            dir.path(),
+            |obj, _| {
+                if obj.bytes == pdf {
+                    assert_eq!(obj.layer.file_type, "CL_TYPE_PDF");
+                    assert!(obj.layer.name.is_none());
+                    assert_eq!(obj.parents.len(), 1);
+                    assert_eq!(obj.parents[0].file_type, "CL_TYPE_XDP");
+                    return Ok(Verdict::Found("Attached PDF".into()));
+                }
+                Ok(Verdict::Miss)
+            },
+            || Ok(()),
+        )?;
+        assert_eq!(result, Verdict::Found("Attached PDF".into()));
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires the pinned Debian clamd package"]
+fn stock_xdp_parent_for_embedded_pdf() -> io::Result<()> {
+    let dir = tempfile::tempdir_in("/tmp")?;
+    let db = dir.path().join("db");
+    fs::create_dir(&db)?;
+    fs::write(
+        db.join("parent.ldb"),
+        format!(
+            "Pdf.InForm;Engine:81-255,Target:10,Container:CL_TYPE_XDP;0;{}\n",
+            hex(b"parent check")
+        ),
+    )?;
+    let conf = dir.path().join("clamd.conf");
+    let sock = dir.path().join("sock");
+    fs::write(
+        &conf,
+        format!(
+            "Foreground yes\nDatabaseDirectory {}\nLocalSocket {}\nDisableCache yes\n",
+            db.display(),
+            sock.display()
+        ),
+    )?;
+    let _service = Daemon::start(Path::new("/usr/sbin/clamd"), &conf, &sock)?;
+    let pdf = document("parent check", stream("", FIRST), stream("", SECOND));
+    for pad in [0, 1500] {
+        let form = xdp(&[&pdf], pad);
+        assert_eq!(
+            unix_request(&sock, &stream_frame(&form)?)?,
+            "stream: Pdf.InForm.UNOFFICIAL FOUND\0"
+        );
+    }
+    assert_eq!(unix_request(&sock, &stream_frame(&pdf)?)?, "stream: OK\0");
+    Ok(())
 }
 
 #[test]

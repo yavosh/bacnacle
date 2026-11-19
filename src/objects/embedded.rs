@@ -1,4 +1,4 @@
-use super::{ChildSink, Handling, archive};
+use super::{ChildSink, Handling, Options, archive, xdp};
 use aho_corasick::AhoCorasick;
 use std::io;
 use std::sync::LazyLock;
@@ -9,6 +9,7 @@ const MAGICS: &[(&[u8], &str)] = &[
     (b"7z\xbc\xaf\x27\x1c", "CL_TYPE_7Z"),
     (b"\x60\xea", "CL_TYPE_ARJ"),
     (b"Rar!\x1a\x07\0", "CL_TYPE_RAR"),
+    (xdp::MAGIC, "CL_TYPE_XDP"),
 ];
 static FINDER: LazyLock<AhoCorasick> = LazyLock::new(|| {
     AhoCorasick::new(MAGICS.iter().map(|(magic, _)| *magic)).expect("static archive file types")
@@ -39,6 +40,7 @@ pub(super) fn extract(
     carrier: &str,
     offsets: std::ops::Range<usize>,
     count: &mut usize,
+    options: &Options,
     sink: &mut dyn ChildSink,
 ) -> io::Result<Handling> {
     let mut result = Handling::Unrecognized;
@@ -55,6 +57,19 @@ pub(super) fn extract(
                 break;
             }
             let kind = MAGICS[found.pattern().as_usize()].1;
+            if kind == "CL_TYPE_XDP" {
+                if options.scan_pdf
+                    && xdp::can_retype(carrier)
+                    && let stopped @ (Handling::Incomplete | Handling::Stopped) =
+                        sink.embedded_xdp(bytes)?
+                {
+                    return Ok(stopped);
+                }
+                continue;
+            }
+            if !options.scan_archive {
+                continue;
+            }
             let suffix = &bytes[at..];
             if kind == "CL_TYPE_ARJ" && !matches!(suffix.get(9..11), Some([0..=2, 2])) {
                 continue;

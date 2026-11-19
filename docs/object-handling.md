@@ -11,7 +11,7 @@ The raw engine inventory lists individual submodules, including disabled entries
 | Stage | Formats or features in the reference | Comparison coverage |
 | --- | --- | --- |
 | Archives and compressed streams | ZIP, gzip, bzip2, XZ, TAR, CPIO, 7z, RAR, ARJ, CAB, SZDD, CHM, BinHex, EGG, LHA, ALZ and SIS | Rust fixtures cover all listed families, including stored and compressed legacy SIS members. The RAR comparison checks the reference installation without UnRAR. [Archive comparisons](../tests/object_archives.rs) |
-| Disk images and partitions | ISO 9660, UDF, DMG, XAR, HFS+, MBR, GPT and APM | Tests cover ISO 9660, Joliet directories, and XAR catalogs and members. Other disk image formats need further comparisons. [ISO comparisons](../tests/object_iso.rs) |
+| Disk images and partitions | ISO 9660, UDF, DMG, XAR, HFS+, MBR, GPT and APM | Tests cover optical images, XAR, DMG, three partition maps, and files inside HFS+ and HFSX. [ISO comparisons](../tests/object_iso.rs) · [DMG comparisons](../tests/object_dmg.rs) · [Partition comparisons](../tests/object_partition.rs) |
 | Installers and embedded files | NSIS, AutoIt, InstallShield and embedded file recognition | These handlers need individual fixtures. |
 | Documents | OLE2, OOXML, Word/Excel XML, HWP, OneNote, PDF, RTF and SWF | Tests cover ordinary PDF, Office, RTF and Flash documents, including competing child detections and scan limits. [PDF comparisons](../tests/object_pdf.rs) · [OLE comparisons](../tests/object_ole.rs) |
 | Text and mail | HTML, UTF-16 HTML, script normalization, JavaScript, script encoding, mbox/MIME, TNEF and uuencoding | Rust fixtures exercise ordinary scripts, HTML, MIME, TNEF, uuencoded files, and data URLs. [Text comparisons](../tests/object_text.rs) |
@@ -20,6 +20,27 @@ The raw engine inventory lists individual submodules, including disabled entries
 The engine also enables password support for archives and format-specific detection heuristics.
 The reference image lacks an installed UnRAR helper even though its engine configuration lists RAR.
 The reference applies format settings and limits individually. [Effective clamd options](compatibility/clamd-options.txt)
+
+`ScanXMLDOCS no` leaves ZIP member scanning enabled in packaged Word, Excel, PowerPoint, and HWP documents.
+Both daemons detect the same member hash with this setting. [Office container comparisons](../tests/object_parents.rs)
+
+### Word 2003 XML, Excel 2003 XML, and HWPML
+
+The reference recognizes Word and Excel XML markers within the first 1,024 bytes.
+Its HWPML marker includes the UTF-8 byte order mark.
+Both daemons scan attachments in document order before the XML document hash.
+The document supplies the parent type. Decoded attachments have no original filename.
+Turning off `ScanXMLDOCS` preserves the document hash. [XML comparisons](../tests/object_xml.rs)
+
+Word and Excel store binary data in Base64 text. The reference detects line-wrapped data and skips single-line data without a newline.
+It skips CDATA and contents beneath Office style and font elements.
+The tests cover numeric character references, nesting, and a 100,000-byte attachment.
+The reference stops parsing after a text node exceeds 10,000,000 bytes. [Word 2003 XML reference](https://learn.microsoft.com/en-us/previous-versions/office/developer/office-2003/aa196310(v=office.11))
+
+HWPML supports plain text, Base64, and raw DEFLATE attachments.
+With a 12,000-byte file limit, both daemons detect a hash of the first 8,192 expanded bytes.
+Barnacle streams expansion into a private spool. DTDs, names exceeding 1,024 bytes, and nesting beyond 256 levels produce incomplete coverage.
+These comparisons cover UTF-8 documents. Other declared encodings need separate fixtures. [Hancom HWPML specification](https://cdn.hancom.com/link/docs/%ED%95%9C%EA%B8%80%EB%AC%B8%EC%84%9C%ED%8C%8C%EC%9D%BC%ED%98%95%EC%8B%9D3.0_HWPML_revision1.2.pdf)
 
 ### ISO 9660 disk images
 
@@ -43,6 +64,11 @@ Document names come from the winning signature. [End-to-end fixtures](../tests/o
 | Policies and truncated input | Parser disabled, recursion and expanded-size alerts, a missing final trailer, and a truncated stream. |
 | Additional PDF stages | Encryption, compressed object streams, JavaScript actions and other stream filters require further comparisons. |
 
+Both daemons scan PDF attachments in Adobe XDP forms. They visit the first matching PDF in XML order.
+If the form type appears in the first 1,024 bytes, its attached PDF can win over the form hash.
+A later type marker allows the outer hash to win first. Both paths give the PDF a `CL_TYPE_XDP` parent.
+`ScanPDF no` disables attachment extraction. `ScanArchive no` leaves it enabled. [PDF form comparisons](../tests/object_pdf.rs)
+
 ### Apple disk images
 
 Stock scans the raw DMG, then its XML catalog, then each partition listed in the catalog.
@@ -55,6 +81,27 @@ They cover stored data (UDRO), ADC (UDCO), zlib (UDZO), and bzip2 (UDBZ).
 Rust fixtures cover zero-filled stripes, sparse-only partitions, multiple maps, and a DMG inside ZIP.
 A catalog or projected partition exceeding its size budget stops the pass, including when alerts are disabled.
 Segmented images, resource-only catalogs, and additional codecs need separate comparisons. [Control images](../tests/fixtures/dmg)
+
+### MBR, GPT, and Apple partition tables
+
+All three parsers run with `ScanArchive yes`. Barnacle checks partition extents and scans them directly from the image.
+Apple `hdiutil` authored three independent images using the MBRSPUD, GPTSPUD, and SPUD layouts.
+Both daemons found the same harmless text file inside all three HFS+ volumes. [Authoring controls](../tests/fixtures/partition)
+
+| Layout | Stock scan order and selection |
+| --- | --- |
+| MBR | Whole image, 512-byte boot sector, then primary entries in table order. Extended entries lead to logical partitions. |
+| GPT with 512-byte sectors | Partitions precede the whole image. A valid backup supplies entries if the primary checksum fails. Differing valid tables are scanned in primary then backup order. |
+| GPT with 4096-byte sectors | The protective MBR triggers GPT after the raw scan. A matching whole-image hash wins. |
+| Apple partition map | Partitions precede the whole image. Stock counts the map itself, then scans the named data partitions in table order. |
+
+`MaxPartitions 0` suppresses partition scans. Empty MBR and GPT slots count toward the limit.
+The MBR boot sector also consumes a file slot. An oversized first APM partition stops traversal before a later smaller partition.
+Stock finds the legacy APM with a map at byte 512. It misses the same payload with a native map at byte 2048.
+ZIP ancestry, container signatures, recursion, scan size, and file-count limits have paired controls. [Partition comparisons](../tests/object_partition.rs)
+
+Stock-only controls record the three intersection heuristic names and their order against a matching partition signature.
+Barnacle's heuristic matcher still needs that coverage. Vendor-specific extended layouts and non-ASCII partition names need additional comparisons.
 
 ### HFS+ and HFSX partitions
 

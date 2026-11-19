@@ -1,7 +1,7 @@
 use super::udf;
 use super::{
-    ChildSink, Handling, InputKind, Options, archive, iso, office, ole, onenote, pdf, rtf, swf,
-    text,
+    ChildSink, Handling, InputKind, Options, archive, iso, office, ole, onenote, partition, pdf,
+    rtf, swf, text, xml,
 };
 use crate::body::{ObjectContext, Target};
 use std::io;
@@ -24,6 +24,9 @@ pub(super) enum Parser {
     Udf,
     Partition,
     HfsPlus,
+    PartitionMap(&'static str),
+    Xml(xml::Format),
+    Xdp,
     Text,
     None,
 }
@@ -57,6 +60,9 @@ impl FileType {
             }
             InputKind::File => {}
         }
+        if let Some(name) = partition::initial(bytes) {
+            return Ok(Self::generic(bytes, name, Parser::PartitionMap(name)));
+        }
         if let Some(layout) = iso::Layout::recognize(bytes) {
             return Ok(Self::generic(
                 bytes,
@@ -86,6 +92,12 @@ impl FileType {
         }
         let context = ObjectContext::raw(bytes);
         if matches!(context.target(), Target::Generic | Target::Mail) {
+            if super::xdp::recognizes(bytes) {
+                return Ok(Self::generic(bytes, "CL_TYPE_XDP", Parser::Xdp));
+            }
+            if let Some(format) = xml::Format::recognize(bytes) {
+                return Ok(Self::generic(bytes, format.name(), Parser::Xml(format)));
+            }
             match text::raw_target(bytes) {
                 Some(Target::Html) if text::little_endian_html(bytes) => {
                     return Ok(Self::generic(
@@ -163,6 +175,7 @@ pub(super) enum Disk {
     Iso(iso::Layout),
     Udf,
     Dmg,
+    PartitionMap(&'static str),
 }
 
 impl Disk {
@@ -171,6 +184,7 @@ impl Disk {
             Self::Iso(_) => "CL_TYPE_ISO9660",
             Self::Udf => "CL_TYPE_UDF",
             Self::Dmg => "CL_TYPE_DMG",
+            Self::PartitionMap(name) => name,
         }
     }
 
@@ -179,6 +193,7 @@ impl Disk {
             Self::Iso(layout) => iso::extract(bytes, layout, sink),
             Self::Udf => udf::extract(bytes, sink),
             Self::Dmg => super::dmg::extract(bytes, sink),
+            Self::PartitionMap(name) => partition::extract(name, bytes, sink),
         }
     }
 }
@@ -201,6 +216,11 @@ impl Parser {
         match self {
             Self::Archive if options.scan_archive => archive::extract(bytes, sink),
             Self::HfsPlus if options.scan_archive => super::hfs::extract(bytes, sink),
+            Self::PartitionMap(name) if options.scan_archive => {
+                partition::extract(name, bytes, sink)
+            }
+            Self::Xml(format) if options.scan_xml_docs => format.extract(bytes, sink),
+            Self::Xdp if options.scan_pdf => super::xdp::extract(bytes, sink),
             Self::Rtf if options.scan_archive => rtf::extract(bytes, sink),
             Self::Ole2 if options.scan_ole2 => ole::extract(bytes, sink),
             Self::Swf if options.scan_swf => swf::extract(bytes, sink),
@@ -223,6 +243,9 @@ impl Parser {
             | Self::Iso(_)
             | Self::Udf
             | Self::Partition
+            | Self::PartitionMap(_)
+            | Self::Xml(_)
+            | Self::Xdp
             | Self::HfsPlus
             | Self::Mail
             | Self::Tnef

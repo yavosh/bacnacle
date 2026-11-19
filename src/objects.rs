@@ -12,11 +12,14 @@ mod iso;
 mod office;
 mod ole;
 mod onenote;
+mod partition;
 mod pdf;
 mod rtf;
 mod swf;
 mod text;
 mod udf;
+mod xdp;
+mod xml;
 
 /// A handler can recognize a format without proving that it visited every object.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -49,13 +52,18 @@ trait ChildSink {
     ) -> io::Result<bool>;
     fn child_bytes(&mut self, bytes: &[u8], name: Option<&[u8]>) -> io::Result<bool>;
     fn embedded_archive(&mut self, kind: &'static str, bytes: &[u8]) -> io::Result<Handling>;
-    fn partition(&mut self, snapshot: Snapshot) -> io::Result<bool>;
+    fn embedded_xdp(&mut self, bytes: &[u8]) -> io::Result<Handling>;
+    fn partition(&mut self, snapshot: Snapshot) -> io::Result<bool> {
+        snapshot.with_bytes(|bytes| self.partition_bytes(bytes, None))
+    }
+    fn partition_bytes(&mut self, bytes: &[u8], name: Option<&[u8]>) -> io::Result<bool>;
     fn view(&mut self, data: &mut dyn Read, target: Target) -> io::Result<bool>;
 
     fn check(&mut self) -> io::Result<()>;
     fn remaining(&self) -> u64;
     fn max_file_size(&self) -> u64;
     fn max_files(&self) -> usize;
+    fn max_partitions(&self) -> usize;
     fn ole_directory_limit(&mut self, depth: usize, preceding_streams: usize) -> bool;
     fn skip_declared_size(&mut self, size: u64) -> bool;
     fn text_limits(&self) -> (u64, u64, u64);
@@ -67,11 +75,13 @@ pub struct Options {
     pub max_file_size: u64,
     pub max_scan_size: u64,
     pub max_files: usize,
+    pub max_partitions: usize,
     pub max_recursion: usize,
     pub alert_exceeds_max: bool,
     pub scan_archive: bool,
     pub scan_pdf: bool,
     pub scan_ole2: bool,
+    pub scan_xml_docs: bool,
     pub scan_swf: bool,
     pub scan_onenote: bool,
     pub scan_image: bool,
@@ -90,11 +100,13 @@ impl Default for Options {
             max_file_size: 100 << 20,
             max_scan_size: 400 << 20,
             max_files: 10_000,
+            max_partitions: 50,
             max_recursion: 17,
             alert_exceeds_max: false,
             scan_archive: true,
             scan_pdf: true,
             scan_ole2: true,
+            scan_xml_docs: true,
             scan_swf: true,
             scan_onenote: true,
             scan_image: true,
@@ -317,7 +329,8 @@ impl Traversal<'_> {
         }
         if self.stopped.is_none() {
             let recognize = kind == InputKind::File
-                && self.options.scan_archive
+                && (self.options.scan_archive
+                    || self.options.scan_pdf && xdp::can_retype(file_type.name))
                 && (file_type.parser != classify::Parser::Html || !self.options.scan_html);
             if self.after_raw(bytes, &file_type, recognize)? == Handling::Incomplete {
                 self.stopped = Some(Verdict::Incomplete);
@@ -336,14 +349,30 @@ impl Traversal<'_> {
         if recognize && embedded::enabled(file_type.name) {
             let mut count = 0;
             let mut start = 0;
-            let mut disks = [
-                file_type.parser.disk_descriptor(),
-                dmg::recognized(bytes).then(|| (bytes.len() - 512, classify::Disk::Dmg)),
-            ];
+            let mut disks = if self.options.scan_archive {
+                [
+                    file_type.parser.disk_descriptor(),
+                    if matches!(file_type.parser, classify::Parser::PartitionMap(_)) {
+                        None
+                    } else {
+                        partition::from_mbr(bytes)
+                            .map(|name| (510, classify::Disk::PartitionMap(name)))
+                    },
+                    dmg::recognized(bytes).then(|| (bytes.len() - 512, classify::Disk::Dmg)),
+                ]
+            } else {
+                [None; 3]
+            };
             disks.sort_by_key(|disk| disk.map_or(usize::MAX, |(offset, _)| offset));
             for (offset, disk) in disks.into_iter().flatten() {
-                let before =
-                    embedded::extract(bytes, file_type.name, start..offset, &mut count, self)?;
+                let before = embedded::extract(
+                    bytes,
+                    file_type.name,
+                    start..offset,
+                    &mut count,
+                    self.options,
+                    self,
+                )?;
                 if before == Handling::Incomplete || self.stopped.is_some() {
                     return Ok(before);
                 }
@@ -354,8 +383,14 @@ impl Traversal<'_> {
                 }
                 start = offset;
             }
-            let result =
-                embedded::extract(bytes, file_type.name, start..bytes.len(), &mut count, self)?;
+            let result = embedded::extract(
+                bytes,
+                file_type.name,
+                start..bytes.len(),
+                &mut count,
+                self.options,
+                self,
+            )?;
             if result == Handling::Incomplete || self.stopped.is_some() {
                 return Ok(result);
             }
@@ -387,14 +422,25 @@ impl Traversal<'_> {
 }
 
 impl ChildSink for Traversal<'_> {
-    fn partition(&mut self, snapshot: Snapshot) -> io::Result<bool> {
-        snapshot.with_bytes(|bytes| {
-            if self.skip_declared_size(bytes.len() as u64) || !self.can_enter_child() {
-                return Ok(false);
-            }
-            self.visit(bytes, InputKind::Partition, None)?;
-            Ok(self.stopped.is_some())
-        })
+    fn embedded_xdp(&mut self, bytes: &[u8]) -> io::Result<Handling> {
+        let layer = self.parents.last_mut().expect("XDP has an owning object");
+        if !xdp::can_retype(layer.file_type) {
+            return Ok(Handling::Unrecognized);
+        }
+        layer.file_type = "CL_TYPE_XDP";
+        xdp::extract(bytes, self)
+    }
+
+    fn partition_bytes(&mut self, bytes: &[u8], name: Option<&[u8]>) -> io::Result<bool> {
+        if self.skip_declared_size(bytes.len() as u64) || !self.can_enter_child() {
+            return Ok(false);
+        }
+        self.visit(bytes, InputKind::Partition, name)?;
+        Ok(self.stopped.is_some())
+    }
+
+    fn max_partitions(&self) -> usize {
+        self.options.max_partitions
     }
 
     fn embedded_archive(&mut self, kind: &'static str, bytes: &[u8]) -> io::Result<Handling> {
