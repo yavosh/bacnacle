@@ -124,6 +124,8 @@ Certain combinations of literal controls and tag delimiters in quoted attributes
 
 ### Normalized script text
 
+Each loaded generation enables plain-text normalization when it contains an active generic or ASCII body rule.
+A relative ASCII rule also enables hash matching on the normalized view. The direct scanner API enables normalization by default.
 The normalized view can borrow a prefix of the input when its bytes already match.
 Mapped views check the normalized length before file count and recursion. An excluded view needs no temporary file.
 If an admitted view differs, Barnacle writes the unchanged prefix and the remaining normalized bytes into one private spool.

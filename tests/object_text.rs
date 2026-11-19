@@ -399,6 +399,24 @@ fn normalized_views_borrow_input_and_admit_scratch_by_output_size() -> io::Resul
         assert_eq!(result, Verdict::Found("inventory".into()));
     }
     source.make_ascii_uppercase();
+    let mut raw_seen = false;
+    let skipped = Options {
+        scan_normalized_script: false,
+        ..Options::default()
+    };
+    let result = scan(
+        &source,
+        &skipped,
+        &missing,
+        |object, _| {
+            assert!(!object.normalized);
+            raw_seen |= object.bytes == source;
+            Ok(Verdict::Miss)
+        },
+        || Ok(()),
+    )?;
+    assert_eq!(result, Verdict::Miss);
+    assert!(raw_seen);
     let total = (source.len() + original) as u64;
     for (max_scan_size, max_files, max_recursion, expected) in [
         (total - 1, 1, 1, "MaxScanSize"),
@@ -430,4 +448,75 @@ fn normalized_views_borrow_input_and_admit_scratch_by_output_size() -> io::Resul
         );
     }
     Ok(())
+}
+
+fn normalized_rule_eligibility(executable: &Path, stock: bool) -> io::Result<()> {
+    let mut paper = b"Green Office trays. ".repeat(4600);
+    paper.extend(b"Delivery LABEL");
+    let normalized = paper.to_ascii_lowercase();
+    let hdb = format!(
+        "{}:{}:Local.Normalized\n",
+        barnacle::hash_reader(normalized.as_slice())?.md5_hex(),
+        normalized.len()
+    );
+    let root = tempfile::tempdir_in("/tmp")?;
+    let db = root.path().join("db");
+    fs::create_dir(&db)?;
+    fs::write(db.join("paper.hdb"), hdb)?;
+    fs::write(db.join("paper.ign2"), "Local.Ignored\n")?;
+    let socket = root.path().join("socket");
+    let config = root.path().join("config");
+    fs::write(
+        &config,
+        format!(
+            "Foreground yes\nDisableCache yes\nLocalSocket {}\nDatabaseDirectory {}\n",
+            socket.display(),
+            db.display()
+        ),
+    )?;
+    for (rules, winner) in [
+        (None, None),
+        (
+            Some("Local.Generic:0:*:64656c6976657279206c6162656c"),
+            Some("Generic"),
+        ),
+        (
+            Some("Local.Script:7:*:64656c6976657279206c6162656c"),
+            Some("Script"),
+        ),
+        (Some("Local.Mail:4:*:64656c6976657279206c6162656c"), None),
+        (Some("Local.Generic:0:EOF-6:616273656e74"), None),
+        (
+            Some("Local.Ignored:7:EOF-6:616273656e74\nLocal.Future:7:EOF-6:616273656e74:255"),
+            None,
+        ),
+        (
+            Some("Local.Relative:7:EOF-6:616273656e74"),
+            Some("Normalized"),
+        ),
+    ] {
+        if let Some(rules) = rules {
+            fs::write(db.join("paper.ndb"), format!("{rules}\n"))?;
+        }
+        let _daemon = Daemon::start(executable, &config, &socket)?;
+        let reply = unix_request(&socket, &stream_frame(&paper)?)?;
+        let expected = match winner {
+            Some(id) => format!("stream: Local.{id}.UNOFFICIAL FOUND\0"),
+            None if stock => "stream: OK\0".into(),
+            None => "stream: Incomplete scan: unsupported detection coverage. ERROR\0".into(),
+        };
+        assert_eq!(reply, expected, "{rules:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn active_rules_select_normalized_matches() -> io::Result<()> {
+    normalized_rule_eligibility(Path::new(env!("CARGO_BIN_EXE_barnacle")), false)
+}
+
+#[test]
+#[ignore = "requires the pinned Debian clamd"]
+fn stock_active_rules_select_normalized_matches() -> io::Result<()> {
+    normalized_rule_eligibility(Path::new("/usr/sbin/clamd"), true)
 }

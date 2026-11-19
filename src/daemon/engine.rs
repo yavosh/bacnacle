@@ -280,6 +280,7 @@ impl Generation {
             .min()
             .unwrap_or(u64::MAX);
         let mut objects = config.objects.clone();
+        objects.scan_normalized_script = body.needs_normalized_script();
         objects.map_normalized_script = body.needs_normalized_script_map();
         Ok(Self {
             sources: inputs,
@@ -488,6 +489,46 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         format!("{digest}:{}:{name}\n", payload.len())
+    }
+
+    #[test]
+    fn active_generation_selects_normalized_text_views() {
+        let f = Fixture::new();
+        let receipt = b"WAREHOUSE blue FOLDERS. ".repeat(6000);
+        f.write(
+            "receipt.hdb",
+            rule(&receipt.to_ascii_lowercase(), "Receipt"),
+        );
+        let hash_only = Generation::load(&f.config).unwrap();
+        f.write(
+            "receipt.ndb",
+            "Ignored:7:EOF-6:666f6c646572\nFuture:0:*:666f6c646572:255\nMail:4:*:666f6c646572\n",
+        );
+        f.write("receipt.ign2", "Ignored\n");
+        f.write("optional.ndu", "Optional:7:*:666f6c646572\n");
+        let filtered = Generation::load(&f.config).unwrap();
+        f.write("receipt.ndb", "Generic:0:*:77617265686f757365\n");
+        let generic = Generation::load(&f.config).unwrap();
+        f.write("receipt.ndb", "Mapped:7:EOF-6:616273656e74\n");
+        let mapped = Generation::load(&f.config).unwrap();
+
+        for skipped in [hash_only, filtered] {
+            assert!(!skipped.objects.scan_normalized_script);
+            assert!(!skipped.objects.map_normalized_script);
+            assert!(skipped.scan(receipt.as_slice()).unwrap().is_none());
+        }
+        assert!(generic.objects.scan_normalized_script);
+        assert!(!generic.objects.map_normalized_script);
+        assert_eq!(
+            generic.scan(receipt.as_slice()).unwrap().unwrap().name,
+            "Generic.UNOFFICIAL"
+        );
+        assert!(mapped.objects.scan_normalized_script);
+        assert!(mapped.objects.map_normalized_script);
+        assert_eq!(
+            mapped.scan(receipt.as_slice()).unwrap().unwrap().name,
+            "Receipt.UNOFFICIAL"
+        );
     }
 
     #[test]

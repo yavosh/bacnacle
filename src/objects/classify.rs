@@ -324,7 +324,9 @@ impl Parser {
                 overlay: Some(start),
             } if options.scan_pe => super::installer::legacy(&bytes[start..], sink),
             Self::Pdf if options.scan_pdf => pdf::extract(bytes, sink),
-            Self::Text if options.scan_html => text::after_raw(bytes, sink),
+            Self::Text if options.scan_html && options.scan_normalized_script => {
+                text::after_raw(bytes, sink)
+            }
             _ => Ok(Handling::Unrecognized),
         }
     }

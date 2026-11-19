@@ -107,6 +107,7 @@ pub struct Options {
     pub max_html_normalize: u64,
     pub max_html_no_tags: u64,
     pub max_script_normalize: u64,
+    pub scan_normalized_script: bool,
     pub map_normalized_script: bool,
 }
 
@@ -137,6 +138,7 @@ impl Default for Options {
             max_html_normalize: 40 << 20,
             max_html_no_tags: 8 << 20,
             max_script_normalize: 20 << 20,
+            scan_normalized_script: true,
             map_normalized_script: false,
         }
     }

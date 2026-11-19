@@ -133,6 +133,13 @@ impl BodyIndex {
         self.rules.is_empty()
     }
 
+    /// A normalized text view can match generic and ASCII body rules.
+    pub fn needs_normalized_script(&self) -> bool {
+        self.rules
+            .iter()
+            .any(|rule| matches!(rule.target, Target::Generic | Target::Ascii))
+    }
+
     /// The pinned script scanner maps its normalized output when target 7 needs relative offsets.
     pub fn needs_normalized_script_map(&self) -> bool {
         self.rules
