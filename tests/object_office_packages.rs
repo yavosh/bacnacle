@@ -4,16 +4,18 @@ mod daemon;
 
 use std::{fs, io, path::Path};
 
-const PACKAGES: [&[u8]; 3] = [
+const PACKAGES: [&[u8]; 4] = [
     include_bytes!("fixtures/ooxml/report.docx"),
     include_bytes!("fixtures/ooxml/report.pptx"),
     include_bytes!("fixtures/ooxml/report.xlsx"),
+    include_bytes!("fixtures/ooxml/report.odt"),
 ];
-const OUTER: [&str; 3] = ["WordOuter", "SlideOuter", "SheetOuter"];
-const PART: [&str; 3] = ["WordXml", "SlideXml", "SheetXml"];
+const OUTER: [&str; 4] = ["WordOuter", "SlideOuter", "SheetOuter", "OdtOuter"];
+const PART: [&str; 4] = ["WordXml", "SlideXml", "SheetXml", "OdtContent"];
 const PART_RULES: &str = "6f8e0cdd2d9acee8886fe702cf9d6a81:2666:Office.WordXml\n\
 7a96fd2466d74ee0c38efce77a99865e:1698:Office.SlideXml\n\
-1c614885aaa8b0a9b2d1e53a8b3a7faf:599:Office.SheetXml\n";
+1c614885aaa8b0a9b2d1e53a8b3a7faf:599:Office.SheetXml\n\
+db535591f0cb46f6d35d5ad7e514a19a:2968:Office.OdtContent\n";
 const IMAGE: &str = "b8bde3e503a52c3239ab107b1ff268b6:4556:Office.Image\n";
 // Stock clamd's normalized xl/styles.xml. The original XML contains 867 bytes.
 const STYLE: &str = "0a40ed6b0ea24f8929625d19592243fa:879:Office.Styles\n";
@@ -26,13 +28,13 @@ fn compare(exe: &Path) -> io::Result<()> {
     }
     for (label, rules, options, winners) in [
         ("outer", vec![], "", OUTER),
-        ("image before outer", vec![IMAGE], "", ["Image"; 3]),
+        ("image before outer", vec![IMAGE], "", ["Image"; 4]),
         ("XML before image", vec![IMAGE, PART_RULES], "", PART),
         (
             "styles before sheet",
             vec![IMAGE, PART_RULES, STYLE],
             "",
-            ["WordXml", "SlideXml", "Styles"],
+            ["WordXml", "SlideXml", "Styles", "OdtContent"],
         ),
         (
             "HTML disabled",
