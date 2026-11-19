@@ -1,5 +1,5 @@
 use super::{ChildSink, Handling, decoded};
-use crate::objects::{Limit, Snapshot};
+use crate::objects::Snapshot;
 use deflate64::InflaterManaged;
 use flate2::read::DeflateDecoder;
 use std::io::{self, Cursor, Read, Write};
@@ -87,8 +87,7 @@ impl<'a> Entry<'a> {
 
     fn deflate64(&self, sink: &mut dyn ChildSink) -> io::Result<Handling> {
         let denied = sink.child_limit();
-        if denied == Some(Limit::MaxFiles) {
-            sink.can_enter_child();
+        if denied.is_some() && sink.recorded_limit().is_some() {
             return Ok(Handling::Complete);
         }
         let file_limit = sink.max_file_size();
@@ -131,7 +130,7 @@ impl<'a> Entry<'a> {
                     }
                 }
             }
-            // Tiny outputs bypass byte and recursion limits after the file-count check.
+            // Stock skips outputs of at most five bytes before entering the child scanner.
             if size <= 5 || !sink.can_enter_child() {
                 return Ok(Handling::Complete);
             }
@@ -150,7 +149,40 @@ impl<'a> Entry<'a> {
 
     fn scan(&self, reader: impl Read, sink: &mut dyn ChildSink) -> io::Result<Handling> {
         let remaining = sink.remaining();
+        // When a child cannot enter, check its actual expanded size before recording
+        // count or recursion. Stock ignores outputs of at most five bytes.
+        let denied = sink.child_limit().is_some();
+        if denied && sink.recorded_limit().is_some() {
+            return Ok(Handling::Complete);
+        }
+        if denied || remaining < 5 {
+            let probe = if remaining < sink.max_file_size() {
+                remaining.saturating_add(1).max(6)
+            } else {
+                6
+            };
+            let mut stream = reader.take(probe);
+            let mut block = [0; 8192];
+            while stream.limit() > 0 {
+                sink.check()?;
+                match stream.read(&mut block) {
+                    Ok(0) => break,
+                    Ok(_) => (),
+                    Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => return Ok(Handling::Incomplete),
+                }
+            }
+            let size = probe - stream.limit();
+            if size > 5 {
+                if sink.skip_declared_size(size) {
+                    return Ok(Handling::Stopped);
+                }
+                sink.can_enter_child();
+            }
+            return Ok(Handling::Complete);
+        }
         let probe = remaining.saturating_add(1);
+
         let mut stream = reader.take(probe);
         let result = decoded(&mut stream, Some(self.name), false, sink)?;
         // Stock leaves the ZIP member loop when its child scanner exceeds MaxScanSize.
@@ -350,26 +382,31 @@ pub(super) fn extract(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Hand
             directory = next;
             let offset = u32_at(head, 42);
             let sizes = (u32_at(head, 20), u32_at(head, 24));
-            if zip64_end.is_some() {
-                // Stock reads the 32-bit local offset and compressed size. A sentinel
-                // skips that member before it consumes a slot in the scan catalogue.
-                if offset == u32::MAX {
+            if zip64_end.is_some() || (max_files != 0 && count >= max_files) {
+                // Empty compressed spans and ZIP64 sentinels consume no directory slot.
+                if zip64_end.is_some() && offset == u32::MAX {
                     continue;
                 }
                 if let Some(local) = bytes
                     .get(offset as usize..directory_offset)
                     .and_then(|b| b.get(..30))
                     && local.starts_with(LOCAL)
-                    && (if u16_at(local, 6) & 8 == 0 {
+                {
+                    let compressed = if u16_at(local, 6) & 8 == 0 {
                         u32_at(local, 18)
                     } else {
                         sizes.0
-                    }) == u32::MAX
-                {
-                    continue;
+                    };
+                    if compressed == 0 || (zip64_end.is_some() && compressed == u32::MAX) {
+                        continue;
+                    }
                 }
             }
             records.push((offset, sizes));
+        }
+        // Stock records the directory cap before trying the collected members.
+        if max_files != 0 && records.len() == max_files {
+            sink.record_file_limit();
         }
         if visited == count
             && !directory.starts_with(END)

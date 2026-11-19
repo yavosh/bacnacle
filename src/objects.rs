@@ -71,6 +71,8 @@ trait ChildSink {
     fn remaining(&self) -> u64;
     fn max_file_size(&self) -> u64;
     fn max_files(&self) -> usize;
+    fn record_file_limit(&mut self);
+    fn recorded_limit(&self) -> Option<Limit>;
     fn max_partitions(&self) -> usize;
     fn ole_directory_limit(&mut self, depth: usize, preceding_streams: usize) -> bool;
     fn size_limit(&self, size: u64) -> Option<Limit>;
@@ -654,6 +656,14 @@ impl ChildSink for Traversal<'_> {
     }
     fn max_files(&self) -> usize {
         self.options.max_files
+    }
+
+    fn recorded_limit(&self) -> Option<Limit> {
+        self.first_limit
+    }
+
+    fn record_file_limit(&mut self) {
+        self.first_limit.get_or_insert(Limit::MaxFiles);
     }
 
     fn ole_directory_limit(&mut self, depth: usize, preceding_streams: usize) -> bool {

@@ -1,6 +1,8 @@
 //! Compare ZIP64 archives containing two benign members from independent writers.
 #[path = "../examples/compat_oracle/daemon.rs"]
 mod daemon;
+#[path = "common/zip.rs"]
+mod zip;
 use std::{
     fs, io,
     path::{Path, PathBuf},
@@ -156,6 +158,80 @@ fn compare(stock: bool) -> io::Result<()> {
             stock,
         )?;
     }
+    // Directory enumeration can reach MaxFiles before the first member hits a byte limit.
+    let archive = include_bytes!("fixtures/zip64/control.zip");
+    for (count, expected) in [(2, "MaxFiles"), (3, "MaxScanSize")] {
+        let options = format!(
+            "MaxFiles {count}\nMaxScanSize {}\nAlertExceedsMax yes",
+            archive.len()
+        );
+        Server::start(stock, &members, &options)?.check(
+            "directory limit",
+            archive,
+            expected,
+            stock,
+        )?;
+    }
+    let options = format!(
+        "MaxFiles 2\nMaxScanSize {}\nAlertExceedsMax yes",
+        archive.len()
+    );
+    Server::start(stock, &hdb("Outer", archive)?, &options)?.check(
+        "outer hash",
+        archive,
+        "Outer",
+        stock,
+    )?;
+    Server::start(stock, &members, "MaxFiles 2\nAlertExceedsMax yes")?.check(
+        "member hash after directory limit",
+        archive,
+        "Note",
+        stock,
+    )?;
+    for method in [0, 8, 9, 12] {
+        let entries =
+            |bytes: &[u8]| zip::zip_with_method(&[("receipt.txt", bytes)], method, false, false);
+        let unrelated = hdb("Unrelated", b"unrelated stock sheet")?;
+        for (data, restriction, expected) in [
+            (
+                &b""[..],
+                "MaxFiles 1",
+                if method == 0 { "" } else { "MaxFiles" },
+            ),
+            (&b"forms"[..], "MaxRecursion 1", ""),
+            (&b"folder"[..], "MaxRecursion 1", "MaxScanSize"),
+        ] {
+            let sample = entries(data)?;
+            let options = format!(
+                "{restriction}\nMaxScanSize {}\nAlertExceedsMax yes",
+                sample.len()
+            );
+            Server::start(stock, &unrelated, &options)?.check(
+                "small ZIP member",
+                &sample,
+                expected,
+                stock,
+            )?;
+        }
+        let inner = entries(b"Inventory for November")?;
+        let sibling = b"\x00\x01\x02\x03March inventory arrived. All cartons are blue.";
+        let outer = zip::zip(
+            &[("prior", sibling), ("mail.zip", &inner)],
+            true,
+            false,
+            false,
+        )?;
+        let options = format!(
+            "MaxFiles 3\nMaxScanSize {}\nAlertExceedsMax yes",
+            outer.len() + sibling.len() + inner.len()
+        );
+        Server::start(stock, &unrelated, &options)?.check(
+            &format!("nested count and byte limit, ZIP method {method}"),
+            &outer,
+            "MaxScanSize",
+            stock,
+        )?;
+    }
     let rules = members + &hdb("Clipped", &note[..8192])?;
     for (option, result) in [
         ("MaxFileSize 8191".into(), "Image"),
@@ -302,4 +378,48 @@ fn zip64_directory_sentinels() -> io::Result<()> {
 #[ignore = "requires the pinned Debian clamd"]
 fn stock_zip64_directory_sentinels() -> io::Result<()> {
     compare_sentinels(true)
+}
+
+#[test]
+fn depth_rejected_member_counts_without_scratch() -> io::Result<()> {
+    use barnacle::objects::{self, Limit, Options, Verdict};
+    let ledger = b"Office inventory sheet. ".repeat(20_000);
+    let scratch = tempfile::tempdir()?;
+    let missing = scratch.path().join("absent");
+    for method in [0, 8, 12] {
+        let file = zip::zip_with_method(&[("receipt", &ledger)], method, false, false)?;
+        let options = Options {
+            max_recursion: 1,
+            max_scan_size: (file.len() + 256 * 1024) as u64,
+            alert_exceeds_max: true,
+            ..Options::default()
+        };
+        assert_eq!(
+            objects::scan(
+                &file,
+                &options,
+                &missing,
+                |_, _| Ok(Verdict::Miss),
+                || Ok(())
+            )?,
+            Verdict::Found(Limit::MaxScanSize.signature())
+        );
+        let mut polls = 0;
+        let error = objects::scan(
+            &file,
+            &options,
+            &missing,
+            |_, _| Ok(Verdict::Miss),
+            || {
+                polls += 1;
+                if polls == 16 {
+                    return Err(io::Error::other("cancelled while counting"));
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "cancelled while counting");
+    }
+    Ok(())
 }
