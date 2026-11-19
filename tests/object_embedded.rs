@@ -37,6 +37,10 @@ fn parent_cases() -> io::Result<Vec<(&'static str, Vec<u8>)>> {
             carrier(&[&zip::zip(&[("one", CONTEXT)], true, false, false)?]),
         ),
         (
+            "CL_TYPE_ZIP",
+            carrier(&[&zip::zip_with_method(&[("one", CONTEXT)], 9, false, false)?]),
+        ),
+        (
             "CL_TYPE_MSCAB",
             carrier(&[&cabinet::cabinet(CONTEXT, b"cover", 0)?]),
         ),
@@ -171,12 +175,12 @@ fn compare(exe: &Path) -> io::Result<()> {
                     None,
                 ),
                 (
-                    "unresolved earlier Deflate64 ZIP",
+                    "earlier Deflate64 ZIP",
                     carrier(&[
                         &zip::zip_with_method(&[("one", FIRST)], 9, false, false)?,
                         &second,
                     ]),
-                    stock.then_some("First"),
+                    Some("First"),
                 ),
                 (
                     "descriptor skipped before later match",

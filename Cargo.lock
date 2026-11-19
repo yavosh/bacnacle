@@ -39,6 +39,7 @@ dependencies = [
  "aho-corasick",
  "bzip2",
  "cfb",
+ "deflate64",
  "delharc",
  "encoding_rs",
  "flate2",
@@ -200,6 +201,12 @@ checksum = "ce6e4c961d6cd6c9a86db418387425e8bdeaf05b3c8bc1411e6dca4c252f1453"
 dependencies = [
  "hybrid-array",
 ]
+
+[[package]]
+name = "deflate64"
+version = "0.1.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac6b926516df9c60bfa16e107b21086399f8285a44ca9711344b9e553c5146e2"
 
 [[package]]
 name = "delharc"

@@ -3,6 +3,7 @@ use super::{ChildSink, Handling, Limit, Snapshot};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 
+mod destination;
 mod filters;
 mod object_stream;
 use filters::{Filter, Output};
@@ -115,6 +116,7 @@ struct Object<'a> {
     start: usize,
     length: Option<usize>,
     length_ref: Option<Id>,
+    raw_destination: bool,
     encoded: Option<&'a [u8]>,
     filters: Vec<Filter>,
     image: bool,
@@ -166,6 +168,7 @@ fn parse<'a>(data: &'a [u8], sink: &mut dyn ChildSink) -> io::Result<Option<Pdf<
         lengths: HashMap::new(),
         contents: HashSet::new(),
     };
+    let mut requests = Vec::new();
     let mut count = 0usize;
     let mut last = [None, None];
     while let Some(tok) = input.next() {
@@ -189,6 +192,7 @@ fn parse<'a>(data: &'a [u8], sink: &mut dyn ChildSink) -> io::Result<Option<Pdf<
             start: input.pos,
             ..Object::default()
         };
+        let mut has_opening = false;
         let mut copy = input.clone();
         if let Some(n) = copy.next().and_then(number)
             && copy.next() == Some(b"endobj".as_slice())
@@ -200,7 +204,22 @@ fn parse<'a>(data: &'a [u8], sink: &mut dyn ChildSink) -> io::Result<Option<Pdf<
                 return Ok(None);
             };
             match tok {
-                b"endobj" => break,
+                b"endobj" => {
+                    if has_opening {
+                        let body = &data[obj.start..input.pos - 6];
+                        match destination::catalog(body) {
+                            Some(destination::Destination::Inline) if obj.encoded.is_none() => {
+                                obj.raw_destination = true;
+                                obj.encoded = Some(body);
+                            }
+                            Some(value) if obj.encoded.is_none() => {
+                                requests.push((pdf.objects.len(), value))
+                            }
+                            _ => obj.unsupported = true,
+                        }
+                    }
+                    break;
+                }
                 b"stream" => {
                     obj.directory = object_stream::Directory::read(&data[obj.start..input.pos]);
                     let Some(encoded) = read_stream(&mut input) else {
@@ -251,7 +270,11 @@ fn parse<'a>(data: &'a [u8], sink: &mut dyn ChildSink) -> io::Result<Option<Pdf<
                 b"/Image" => obj.image = true,
                 b"/EmbeddedFile" => obj.embedded = true,
                 b"/ObjStm" => obj.object_stream = true,
-                b"/JS" | b"/JavaScript" | b"/OpenAction" | b"/Launch" => obj.unsupported = true,
+                b"/OpenAction" => {
+                    obj.unsupported |= has_opening;
+                    has_opening = true;
+                }
+                b"/JS" | b"/JavaScript" | b"/Launch" => obj.unsupported = true,
                 // The sampled filters use their defaults even with explicit decode parameters.
                 b"/DecodeParms" | b"/DP" => {
                     if !input.skip_value() {
@@ -263,10 +286,13 @@ fn parse<'a>(data: &'a [u8], sink: &mut dyn ChildSink) -> io::Result<Option<Pdf<
                 _ => (),
             }
         }
-        if obj.encoded.is_some() || obj.unsupported {
+        if obj.encoded.is_some() || obj.unsupported || has_opening {
             pdf.objects.push(obj);
         }
         last = [None, None];
+    }
+    if !destination::resolve(data, &mut pdf.objects, &requests, sink)? {
+        return Ok(None);
     }
     pdf.count = count;
     Ok(Some(pdf))
@@ -299,7 +325,10 @@ pub(super) fn extract(data: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handl
                 sink.temporary_directory(),
                 sink.remaining(),
                 pdf.count,
-                pdf.objects.iter().map(|obj| obj.id),
+                pdf.objects
+                    .iter()
+                    .filter(|obj| obj.unsupported || obj.encoded.is_some() && !obj.raw_destination)
+                    .map(|obj| obj.id),
             )
         });
     'objects: for obj in pdf.objects {
@@ -308,6 +337,18 @@ pub(super) fn extract(data: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handl
             return Ok(Handling::Incomplete);
         }
         let Some(bytes) = obj.encoded else { continue };
+        if obj.raw_destination {
+            // Stock checks file count, then dictionary bytes, then recursion.
+            if sink.child_limit() != Some(Limit::MaxFiles)
+                && sink.skip_declared_size(bytes.len() as u64)
+            {
+                continue;
+            }
+            if sink.child_bytes(bytes, None)? {
+                return Ok(Handling::Stopped);
+            }
+            continue;
+        }
         let content = pdf.contents.contains(&obj.id);
         if obj.image && !obj.filters.contains(&Filter::Jpeg) {
             continue;

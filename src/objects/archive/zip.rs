@@ -1,6 +1,8 @@
 use super::{ChildSink, Handling, decoded};
+use crate::objects::{Limit, Snapshot};
+use deflate64::InflaterManaged;
 use flate2::read::DeflateDecoder;
-use std::io::{self, Cursor, Read};
+use std::io::{self, Cursor, Read, Write};
 
 const LOCAL: &[u8; 4] = b"PK\x03\x04";
 const CENTRAL: &[u8; 4] = b"PK\x01\x02";
@@ -74,11 +76,75 @@ impl<'a> Entry<'a> {
                 ZipOutput::new(DeflateDecoder::new(self.compressed), max_file_size),
                 sink,
             ),
+            9 => self.deflate64(sink),
             12 => self.scan(
                 ZipOutput::new(bzip2::read::BzDecoder::new(self.compressed), max_file_size),
                 sink,
             ),
             _ => Ok(Handling::Incomplete),
+        }
+    }
+
+    fn deflate64(&self, sink: &mut dyn ChildSink) -> io::Result<Handling> {
+        let denied = sink.child_limit();
+        if denied == Some(Limit::MaxFiles) {
+            sink.can_enter_child();
+            return Ok(Handling::Complete);
+        }
+        let file_limit = sink.max_file_size();
+        let mut count_before_spilling = sink.remaining() < file_limit;
+        loop {
+            let mut child = denied
+                .is_none()
+                .then(|| Snapshot::new(sink.temporary_directory()));
+            let mut size = 0u64;
+            {
+                let mut decoder = Box::new(InflaterManaged::new());
+                let mut input = self.compressed;
+                let mut block = [0; 8192];
+                loop {
+                    let Some(used) = deflate64_block(&mut decoder, &mut input, &mut block, sink)?
+                    else {
+                        return Ok(Handling::Incomplete);
+                    };
+                    let next = size + used as u64;
+                    if used == 0 || next > file_limit {
+                        break;
+                    }
+                    size = next;
+                    if size > 5 && sink.skip_declared_size(size) {
+                        return Ok(Handling::Stopped);
+                    }
+                    if denied.is_some() && !count_before_spilling && size > 5 {
+                        sink.can_enter_child();
+                        return Ok(Handling::Complete);
+                    }
+                    let end = used < block.len() || decoder.finished();
+                    if count_before_spilling && size > Snapshot::MEMORY_LIMIT as u64 && !end {
+                        child = None;
+                    }
+                    if let Some(child) = &mut child {
+                        child.write_all(&block[..used])?;
+                    }
+                    if end {
+                        break;
+                    }
+                }
+            }
+            // Tiny outputs bypass byte and recursion limits after the file-count check.
+            if size <= 5 || !sink.can_enter_child() {
+                return Ok(Handling::Complete);
+            }
+            if let Some(child) = child {
+                return Ok(if sink.visit_snapshot(child, None, Some(self.name))? {
+                    Handling::Stopped
+                } else {
+                    Handling::Complete
+                });
+            }
+            // An eligible member exceeded the in-memory spool while the scan budget
+            // could still bind. The measured prefix now fits, so retain it on replay.
+            count_before_spilling = false;
         }
     }
 
@@ -94,6 +160,34 @@ impl<'a> Entry<'a> {
             Ok(result)
         }
     }
+}
+
+// Return a full 8 KiB block, a final short block, or None for invalid data.
+fn deflate64_block(
+    decoder: &mut InflaterManaged,
+    input: &mut &[u8],
+    block: &mut [u8; 8192],
+    sink: &mut dyn ChildSink,
+) -> io::Result<Option<usize>> {
+    let mut used = 0;
+    while used < block.len() {
+        sink.check()?;
+        let part = &input[..input.len().min(block.len())];
+        let step = decoder.inflate(part, &mut block[used..]);
+        if step.data_error {
+            return Ok(None);
+        }
+        *input = &input[step.bytes_consumed..];
+        used += step.bytes_written;
+        if decoder.finished() {
+            break;
+        }
+        if step.bytes_consumed == 0 && step.bytes_written == 0 {
+            // Stock scans the bytes produced before a short final input.
+            return Ok(input.is_empty().then_some(used));
+        }
+    }
+    Ok(Some(used))
 }
 
 // The reference writes compressed members in 8192-byte batches. When the final
