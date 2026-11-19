@@ -1,7 +1,7 @@
 //! Scan PDF streams after the raw PDF matcher, in physical indirect-object order.
 use super::{ChildSink, Handling, Limit, Snapshot};
 use std::collections::{HashMap, HashSet};
-use std::io::{self, Read};
+use std::io::{self, Write};
 
 mod filters;
 mod object_stream;
@@ -425,59 +425,82 @@ fn visit_stream(data: &[u8], content: bool, sink: &mut dyn ChildSink) -> io::Res
         return Ok(true);
     }
     if content {
-        let mut text = ContentsText::new(data);
-        if sink.child(&mut text, None, None)? {
-            return Ok(true);
-        }
+        return scan_page_text(data, sink);
     }
     Ok(false)
 }
 
-// The pinned contents pass reads parenthesized strings from text arrays starting a line.
-struct ContentsText<'a> {
-    input: &'a [u8],
-    at_line_start: bool,
-    array: bool,
-    literal: bool,
-    space: bool,
-}
-impl<'a> ContentsText<'a> {
-    fn new(input: &'a [u8]) -> Self {
-        Self {
-            input,
-            at_line_start: true,
-            array: false,
-            literal: false,
-            space: false,
+// The normalized text cannot be longer than its source. When that bound fits,
+// an admitted child needs only one pass. Otherwise count before opening a spool.
+fn scan_page_text(data: &[u8], sink: &mut dyn ChildSink) -> io::Result<bool> {
+    let remaining = sink.remaining();
+    let denied = sink.child_limit().is_some();
+    let may_exceed_size = data.len() as u64 > remaining;
+    if denied || may_exceed_size {
+        let stop_after = if may_exceed_size { remaining.max(5) } else { 5 };
+        let size = page_text(data, sink, None, stop_after)?;
+        if size <= 5 || sink.skip_declared_size(size) || !sink.can_enter_child() {
+            return Ok(false);
         }
     }
+    let mut snapshot = Snapshot::new(sink.temporary_directory());
+    let size = page_text(data, sink, Some(&mut snapshot), u64::MAX)?;
+    if size <= 5 {
+        return Ok(false);
+    }
+    sink.visit_snapshot(snapshot, None, None)
 }
-impl Read for ContentsText<'_> {
-    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        let mut used = 0;
-        while used < out.len() {
-            let Some((&b, rest)) = self.input.split_first() else {
-                break;
-            };
-            self.input = rest;
-            if !self.array {
-                self.array = self.at_line_start && b == b'[';
-                self.at_line_start = b == b'\n';
-            } else if !self.literal {
-                self.literal = b == b'(';
+
+// The pinned contents pass reads parenthesized strings from arrays starting a line.
+fn page_text(
+    data: &[u8],
+    sink: &mut dyn ChildSink,
+    mut snapshot: Option<&mut Snapshot>,
+    stop_after: u64,
+) -> io::Result<u64> {
+    let mut written = 0u64;
+    let mut at_line_start = true;
+    let mut array = false;
+    let mut literal = false;
+    let mut space = false;
+    let mut out = [0; 8192];
+    let mut used = 0;
+    for chunk in data.chunks(out.len()) {
+        sink.check()?;
+        for &b in chunk {
+            if !array {
+                array = at_line_start && b == b'[';
+                at_line_start = b == b'\n';
+            } else if !literal {
+                literal = b == b'(';
             } else if b == b')' {
-                self.literal = false;
+                literal = false;
+            } else if used == out.len() {
+                // Stock consumes this literal byte while flushing the full block.
+                // Whitespace state starts fresh in the next output block.
+                if let Some(file) = &mut snapshot {
+                    file.write_all(&out)?;
+                }
+                written += used as u64;
+                used = 0;
+                space = false;
             } else {
                 let normalized = match b {
-                    9..=13 | b' ' if !self.space => b' ',
+                    9..=13 | b' ' if !space => b' ',
                     0x21..=0x7f => b.to_ascii_lowercase(),
                     _ => continue,
                 };
-                self.space = normalized == b' ';
+                space = normalized == b' ';
                 out[used] = normalized;
                 used += 1;
             }
         }
-        Ok(used)
+        if written + used as u64 > stop_after {
+            return Ok(written + used as u64);
+        }
     }
+    if let Some(file) = snapshot {
+        file.write_all(&out[..used])?;
+    }
+    Ok(written + used as u64)
 }

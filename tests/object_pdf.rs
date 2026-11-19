@@ -3,6 +3,8 @@
 mod base64;
 #[path = "../examples/compat_oracle/daemon.rs"]
 mod daemon;
+#[path = "common/pdf_text.rs"]
+mod pdf_text;
 #[path = "common/pe.rs"]
 mod pe;
 #[path = "common/zip.rs"]
@@ -125,6 +127,19 @@ fn compare(exe: &Path, stock: bool) -> io::Result<()> {
             data.len()
         ));
     }
+    rules.push_str("6bcc4f3e0ad073a5dae0a109c80f328d:16384:Pdf.Blocks\n");
+    rules.push_str("cea783782f854db573e33595bd1a254e:8196:Pdf.BlockSpaces\n");
+    let full = b"abcghiz"
+        .iter()
+        .copied()
+        .cycle()
+        .take(16386)
+        .collect::<Vec<_>>();
+    rules.push_str(&format!(
+        "{}:{}:Pdf.AllLetters\n",
+        hex(&Md5::digest(&full)),
+        full.len()
+    ));
     fs::write(db.join("local.hdb"), rules)?;
     fs::write(
         db.join("local.ndb"),
@@ -280,6 +295,20 @@ fn compare(exe: &Path, stock: bool) -> io::Result<()> {
         ("two filters", combined, Some("Second")),
         ("ASCII85 attachment", a85, Some("Second")),
         ("run length attachment", run_length, Some("Second")),
+        (
+            "physical page crosses two normalized output blocks",
+            document("notes", stream("", &pdf_text::array(16386, b"")), quiet()),
+            Some("Blocks"),
+        ),
+        (
+            "whitespace restarts after flushing a full text block",
+            document(
+                "notes",
+                stream("", &pdf_text::array(8191, b"   X   Y")),
+                quiet(),
+            ),
+            Some("BlockSpaces"),
+        ),
         ("normalized page text", normalized, Some("Text")),
         ("outer vs child", outer, Some("Outer")),
         (
@@ -351,6 +380,42 @@ fn compare(exe: &Path, stock: bool) -> io::Result<()> {
             "{profile}"
         );
     }
+    for (name, content, normalized_len) in [
+        ("array", b"BT\n[(School Summary)] TJ\nET".as_slice(), 14),
+        ("short", b"BT\n[(Short)] TJ\nET", 5),
+        ("single", b"BT\n(Next Page) Tj\nET", 0),
+    ] {
+        let page = pdf(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R >>".to_vec(),
+            stream(
+                "/Filter /ASCIIHexDecode",
+                format!("{}>", hex(content)).as_bytes(),
+            ),
+        ]);
+        for room in [1, 14] {
+            let max = page.len() + content.len() + room;
+            let options = format!("MaxFiles 2\nMaxScanSize {max}\nAlertExceedsMax yes");
+            let (_service, socket) = start(&format!("page-{name}-{room}"), &options)?;
+            let expected = if normalized_len > 5 {
+                if room < normalized_len {
+                    "stream: Heuristics.Limits.Exceeded.MaxScanSize FOUND\0"
+                } else {
+                    "stream: Heuristics.Limits.Exceeded.MaxFiles FOUND\0"
+                }
+            } else if stock {
+                "stream: OK\0"
+            } else {
+                "stream: Incomplete scan: unsupported detection coverage. ERROR\0"
+            };
+            assert_eq!(
+                unix_request(&socket, &stream_frame(&page)?)?,
+                expected,
+                "{name} {room}"
+            );
+        }
+    }
     let (_service, socket) = start("disabled", "ScanPDF no")?;
     assert_eq!(
         unix_request(&socket, &stream_frame(&marked_form)?)?,
@@ -365,6 +430,39 @@ fn compare(exe: &Path, stock: bool) -> io::Result<()> {
             "stream: Incomplete scan: unsupported detection coverage. ERROR\0"
         }
     );
+    Ok(())
+}
+
+#[test]
+fn oversized_page_text_is_counted_before_spilling() -> io::Result<()> {
+    use barnacle::objects::{Limit, Options, Verdict, scan};
+    let temp = tempfile::tempdir()?;
+    let missing = temp.path().join("missing");
+    let source = pdf_text::array(135000, b"");
+    let file = document(
+        "notes",
+        stream("", &source),
+        stream("/Type /XObject /Subtype /Image", b"x"),
+    );
+    let options = Options {
+        scan_html: false,
+        max_scan_size: (file.len() + source.len() + 90000) as u64,
+        alert_exceeds_max: true,
+        ..Options::default()
+    };
+    for max_files in [0, 2] {
+        let result = scan(
+            &file,
+            &Options {
+                max_files,
+                ..options.clone()
+            },
+            &missing,
+            |_, _| Ok(Verdict::Miss),
+            || Ok(()),
+        )?;
+        assert_eq!(result, Verdict::Found(Limit::MaxScanSize.signature()));
+    }
     Ok(())
 }
 

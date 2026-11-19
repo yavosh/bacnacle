@@ -55,6 +55,20 @@ For big-endian pages with a byte order mark, the limits apply to the original by
 When limits compete, stock checks normalized output size before file count or recursion. Barnacle counts excluded views without storing their output.
 The tests cover file count, scan size, recursion, and disabling HTML scans. [Unicode HTML comparisons](../tests/object_unicode_html.rs) · [Memory and throughput measurements](benchmarks/object-unicode-html.md)
 
+### HTML character references and links
+
+Barnacle reproduces the pinned markup and text hashes for ordinary company names, ampersands in prose, and URL query parameters.
+The reference recognized 662 of the 2,125 semicolon-terminated WHATWG names. These include all 252 HTML 4 names.
+Seven names use older numeric assignments. Barnacle stores the measured subset in a read-only 9,268-byte table.
+[Table provenance and notices](../THIRD-PARTY-NOTICES.md) · [HTML 4 character references](https://www.w3.org/TR/html401/sgml/entities.html) · [WHATWG named references](https://html.spec.whatwg.org/entities.json)
+
+The markup view preserves unknown names in lowercase. The text view omits references in prose and retains links from anchors and images.
+URL comparisons cover literal ampersands, escaped separators, mixed-case query values, accented characters, and the 1,024-byte capture limit.
+After a second space run, stock truncates the captured URL and retains subsequent reference spellings in markup.
+Pending multibyte text can resume in the next attribute, even across tags.
+Certain combinations of literal controls and tag delimiters in quoted attributes remain incomplete. Entity coverage outside the WHATWG list remains unverified.
+[HTML character reference comparisons](../tests/object_html_entities.rs)
+
 ### Binary HWP documents
 
 HWP5 stores document streams in an OLE compound file. A `FileHeader` stream starts with the HWP signature and contains compression flags.
@@ -138,6 +152,10 @@ Stock uses early LZW code-width changes for both `/LZWDecode` and `/LZW`, even w
 Both daemons matched the same 2,724 output bytes from a 7,500-byte late-change attachment. qpdf 12.4.2 decoded all 7,500 original bytes.
 The sampled unreferenced stream and grayscale image did not produce a decoded match.
 Both daemons scan a decoded page stream before its normalized text.
+Stock skips normalized page text of five bytes or fewer before testing file count or byte limits.
+For longer text, the normalized size can trigger a scan-size alert before the file-count alert. [Page-text tests](../tests/object_pdf.rs)
+The physical and packed-page comparisons include text spanning multiple 8,192-byte normalized output blocks.
+Barnacle counts the text before using scratch storage when the source could exceed the remaining scan budget.
 
 At 262,143 expanded bytes, a 10,000-byte file limit suppresses the LZW output and records a size alert.
 At 262,144 bytes, stock requests another 256 KiB block. If that request exceeds the limit, both scanners scan the LZW input.
@@ -287,7 +305,11 @@ A bare JPEG followed by another store entry includes its next 17 bytes in the te
 The first image exceeding the byte budget stops picture traversal. Disabling `ScanImage` preserves picture hashes. Disabling `ScanOLE2` skips them.
 The authored formula control contains `2+3` and `SQRT(A1*2)`. Both daemons match its 117-byte report before the PNG.
 Barnacle bounds the report text for common arithmetic, references, ranges, and worksheet functions without evaluating the cells.
-When the report can fit the scan budget, unrecognized tokens, Name and String listings, or a possible full 4,096-byte block return incomplete coverage. [BIFF formula example](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-xls/bccb00ac-67a1-490a-9f0b-5ce59978eb9a)
+Stock exposes another 4,096 report bytes only after formatting one more byte. Barnacle matches the same complete blocks for ordinary worksheet records.
+A 350-term sum produced a 4,213-byte report. An independently authored 120-row numeric ledger ending in SUM produced a 16,501-byte report.
+Both report hashes beat the embedded picture. A matching generic body signature beat the competing report hash.
+Barnacle counts output first when the report might exceed the remaining budget. A rejected report can still leave a smaller picture eligible.
+Unverified text inside a visible block returns incomplete coverage. This includes unsupported records and formula suffixes inside earlier blocks. [BIFF formula example](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-xls/bccb00ac-67a1-490a-9f0b-5ce59978eb9a)
 Delayed picture data, metafiles, multiple Workbook streams, and mixed Office extraction passes remain unverified. [OfficeArt picture records](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-odraw/c67b883b-8136-4e91-a1a3-2981d16e934f)
 
 Both daemons scan top-level PowerPoint `ExOleObjStg` zlib payloads before the root presentation stream and its file hash.

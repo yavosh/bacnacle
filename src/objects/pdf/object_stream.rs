@@ -1,5 +1,7 @@
 //! PDF 1.5 compressed indirect objects. Their offsets are relative to /First.
-use super::{ChildSink, ContentsText, Handling, Id, MAX_OBJECTS, Snapshot, Tokens, number, white};
+use super::{
+    ChildSink, Handling, Id, MAX_OBJECTS, Snapshot, Tokens, number, scan_page_text, white,
+};
 use std::{
     collections::{HashMap, HashSet},
     io::{self, Write},
@@ -220,9 +222,7 @@ impl Packed {
                 if sink.child_bytes(bytes, None)? {
                     return Ok(Handling::Stopped);
                 }
-                if !matches!(item.kind, Deferred::Raw)
-                    && sink.child(&mut ContentsText::new(bytes), None, None)?
-                {
+                if !matches!(item.kind, Deferred::Raw) && scan_page_text(bytes, sink)? {
                     return Ok(Handling::Stopped);
                 }
             }

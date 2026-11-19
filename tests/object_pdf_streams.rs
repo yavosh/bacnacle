@@ -1,6 +1,8 @@
 //! PDF 1.5 object-stream comparisons with the pinned Debian clamd.
 #[path = "../examples/compat_oracle/daemon.rs"]
 mod daemon;
+#[path = "common/pdf_text.rs"]
+mod pdf_text;
 use flate2::{Compression, write::ZlibEncoder};
 use md5::{Digest, Md5};
 use std::{
@@ -271,6 +273,25 @@ fn compare(stock: bool) -> io::Result<()> {
         }
         Ok(())
     };
+    let deferred = with_member(
+        true,
+        true,
+        "5 0 R",
+        [8, 6, 7],
+        &pdf_text::array(70001, b""),
+        true,
+        false,
+    )?;
+    check(
+        "",
+        "0ac8e46820d6cfc7267923402dd7ae3e:69993:PdfStreams.LongArray\n",
+        "",
+        &[(
+            "deferred page crosses eight normalized output blocks",
+            &deferred.file,
+            Some("LongArray"),
+        )],
+    )?;
     check(
         "",
         &both,

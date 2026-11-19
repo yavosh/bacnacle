@@ -72,6 +72,7 @@ trait ChildSink {
     fn max_files(&self) -> usize;
     fn max_partitions(&self) -> usize;
     fn ole_directory_limit(&mut self, depth: usize, preceding_streams: usize) -> bool;
+    fn size_limit(&self, size: u64) -> Option<Limit>;
     fn skip_declared_size(&mut self, size: u64) -> bool;
     fn text_limits(&self) -> (u64, u64, u64);
     fn temporary_directory(&self) -> &Path;
@@ -305,8 +306,7 @@ impl Traversal<'_> {
             self.first_limit.get_or_insert(Limit::MaxFiles);
             return Ok(());
         }
-        if bytes.len() as u64 > self.remaining() {
-            self.record_size_limit(bytes.len() as u64);
+        if self.skip_declared_size(bytes.len() as u64) {
             return Ok(());
         }
         self.files_scanned += 1;
@@ -421,17 +421,6 @@ impl Traversal<'_> {
         }
         file_type.parser.after_raw(bytes, self.options, self)
     }
-
-    fn record_size_limit(&mut self, size: u64) {
-        let reason = if size
-            > unlimited_if_zero(self.options.max_scan_size).saturating_sub(self.bytes_scanned)
-        {
-            Limit::MaxScanSize
-        } else {
-            Limit::MaxFileSize
-        };
-        self.first_limit.get_or_insert(reason);
-    }
 }
 
 impl ChildSink for Traversal<'_> {
@@ -530,7 +519,7 @@ impl ChildSink for Traversal<'_> {
         let snapshot =
             Snapshot::read_bounded(data, self.temporary_directory, limit, &mut *self.check)?;
         if snapshot.is_none() {
-            self.record_size_limit(limit.saturating_add(1));
+            self.skip_declared_size(limit.saturating_add(1));
         }
         Ok(snapshot)
     }
@@ -564,7 +553,7 @@ impl ChildSink for Traversal<'_> {
         self.check()?;
         let limit = self.remaining();
         if bytes.len() as u64 > limit {
-            self.record_size_limit(limit.saturating_add(1));
+            self.skip_declared_size(limit.saturating_add(1));
             return Ok(false);
         }
         self.visit(bytes, InputKind::File, name)?;
@@ -584,8 +573,7 @@ impl ChildSink for Traversal<'_> {
         .ok_or_else(|| io::Error::other("normalized view exceeds its source size"))?;
         snapshot.with_bytes(|bytes| {
             if mapped {
-                if bytes.len() as u64 > self.remaining() {
-                    self.record_size_limit(bytes.len() as u64);
+                if self.skip_declared_size(bytes.len() as u64) {
                     return Ok(false);
                 }
                 if self.options.max_files != 0 && self.files_scanned >= self.options.max_files {
@@ -658,12 +646,21 @@ impl ChildSink for Traversal<'_> {
         self.first_limit.get_or_insert(limit);
         true
     }
-    fn skip_declared_size(&mut self, size: u64) -> bool {
-        if size <= self.remaining() {
-            return false;
+    fn size_limit(&self, size: u64) -> Option<Limit> {
+        if size > unlimited_if_zero(self.options.max_scan_size).saturating_sub(self.bytes_scanned) {
+            Some(Limit::MaxScanSize)
+        } else if size > self.max_file_size() {
+            Some(Limit::MaxFileSize)
+        } else {
+            None
         }
-        self.record_size_limit(size);
-        true
+    }
+    fn skip_declared_size(&mut self, size: u64) -> bool {
+        if let Some(reason) = self.size_limit(size) {
+            self.first_limit.get_or_insert(reason);
+            return true;
+        }
+        false
     }
 
     fn text_limits(&self) -> (u64, u64, u64) {

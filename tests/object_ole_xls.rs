@@ -301,7 +301,7 @@ fn compare(stock: bool) -> io::Result<()> {
     report.check(
         "multi-block formula report cannot match its preamble hash",
         &long,
-        stock.then_some("Dots"),
+        Some("Dots"),
     )?;
     let needle = b"BIFF content extracted"
         .iter()
@@ -526,7 +526,7 @@ fn unsupported_drawings_and_report_layouts_are_incomplete() -> io::Result<()> {
     let tmp = tempfile::tempdir()?;
     let png = picture(0xf01e, 0x6e0, DOTS, true);
     let ordinary = workbook(std::slice::from_ref(&png), &[], 0x3c);
-    let mut long = biff(0x000a, &[]).repeat(128);
+    let mut long = biff(0x7777, &[]).repeat(300);
     long.extend_from_slice(&ordinary);
     let both = compound(&[("Workbook", &ordinary), ("Book", &ordinary)])?;
     let mut delayed_header = vec![0; 36];
@@ -587,5 +587,263 @@ fn blocked_drawings_avoid_scratch_and_io_errors_propagate() -> io::Result<()> {
     )
     .unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    Ok(())
+}
+
+const LEDGER: &[u8] = include_bytes!("fixtures/xls/ledger-summary.xls");
+
+fn authored_drawing() -> io::Result<Vec<u8>> {
+    let mut raw = Vec::new();
+    cfb::CompoundFile::open(Cursor::new(CALC))?
+        .open_stream("Workbook")?
+        .read_to_end(&mut raw)?;
+    let mut records = raw.as_slice();
+    while let Some((header, rest)) = records.split_at_checked(4) {
+        let n = u16::from_le_bytes([header[2], header[3]]) as usize;
+        let (payload, tail) = rest.split_at(n);
+        if header[..2] == [0xeb, 0] {
+            return Ok([biff(0xeb, payload), biff(10, &[])].concat());
+        }
+        records = tail;
+    }
+    Err(io::Error::other("authored fixture has no drawing group"))
+}
+
+fn compare_large_reports(stock: bool) -> io::Result<()> {
+    // The pinned daemon accepted each exact hash with the picture HDB loaded at the same time.
+    let rules = hash("Dots", DOTS)?
+        + &hash("Preamble", REPORT)?
+        + "7471d03533bdbc5afcf0628e340bbb07:4213:Xls.Sum\n6d6770fb32f9b3c0931eb6efcc1b7359:16501:Xls.Ledger\n74d3a2f47bf4f858f6abc8e065e8b55e:4213:Xls.Next\n274ef05da79cc224b17913cadb9c17a4:4213:Xls.Exact\n";
+    let drawing = authored_drawing()?;
+    let stream = |prefix: &[u8]| single(&[prefix, drawing.as_slice()].concat());
+    let scan = Server::start(stock, "", &rules, "", "")?;
+    scan.check(
+        "120-row worksheet with a final SUM and a picture",
+        LEDGER,
+        Some("Ledger"),
+    )?;
+    Server::start(stock, "", &hash("Dots", DOTS)?, "", "")?.check(
+        "picture after ledger report miss",
+        LEDGER,
+        Some("Dots"),
+    )?;
+    for (formats, ends, expected) in [
+        (0, 125, "Preamble"),
+        (11, 113, "Preamble"),
+        (22, 101, "Next"),
+        (75, 171, "Exact"),
+    ] {
+        let doc = stream(
+            &[
+                biff(224, &[0; 20]).repeat(formats),
+                biff(10, &[]).repeat(ends),
+            ]
+            .concat(),
+        )?;
+        scan.check(
+            "4095, 4096, 4097, and 8192 formatted bytes",
+            &doc,
+            Some(expected),
+        )?;
+    }
+    let mut ints = vec![30, 2, 0];
+    for _ in 0..350 {
+        ints.extend([30, 2, 0, 3]);
+    }
+    let mut cell = vec![0; 22];
+    cell[20..22].copy_from_slice(&(ints.len() as u16).to_le_bytes());
+    cell.extend(ints);
+    scan.check(
+        "350-term sum report before PNG",
+        &stream(&biff(6, &cell))?,
+        Some("Sum"),
+    )?;
+
+    let xf = b"00e0     20   XF : Extended Format\n";
+    let data = [REPORT, &xf.repeat(300)[..8192]].concat();
+    let repeated = stream(&biff(224, &[0; 20]).repeat(300))?;
+    let mut small_formula = vec![0; 22];
+    small_formula[20] = 3;
+    small_formula.extend([30, 2, 0]);
+    let uncertain = stream(&[biff(6, &small_formula), biff(224, &[0; 20]).repeat(300)].concat())?;
+    scan.check(
+        "an uncertain formula suffix inside a flushed block",
+        &uncertain,
+        stock.then_some("Dots"),
+    )?;
+    let small_budget = format!(
+        "MaxScanSize {}\nAlertExceedsMax yes",
+        uncertain.len() + DOTS.len()
+    );
+    Server::start(stock, &small_budget, &rules, "", "")?.check(
+        "known oversize report permits the picture",
+        &uncertain,
+        Some("Dots"),
+    )?;
+    let hashes = hash("Format", &data)? + &hash("Dots", DOTS)? + &hash("Outer", &repeated)?;
+    let needle = xf.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let body = format!("Xls.Line:0:*:{needle}\n");
+    Server::start(stock, "", &hashes, &body, "")?.check(
+        "body before format report hash",
+        &repeated,
+        Some("Line"),
+    )?;
+    Server::start(stock, "", &hashes, "", "")?.check(
+        "format report wins against PNG and outer hash",
+        &repeated,
+        Some("Format"),
+    )?;
+    for (files, delta, expected) in [
+        (10, 0, "Format"),
+        (10, -1, "Dots"),
+        (1, 0, "Outer"),
+        (1, -1, "Outer"),
+    ] {
+        let budget = (repeated.len() + data.len())
+            .checked_add_signed(delta)
+            .unwrap();
+        let config = format!("MaxFiles {files}\nMaxScanSize {budget}\nAlertExceedsMax yes");
+        Server::start(stock, &config, &hashes, "", "")?.check(
+            "exact report byte budget",
+            &repeated,
+            Some(expected),
+        )?;
+        if files == 1 {
+            let limit = if delta == 0 {
+                "Heuristics.Limits.Exceeded.MaxFiles"
+            } else {
+                "Heuristics.Limits.Exceeded.MaxScanSize"
+            };
+            Server::start(stock, &config, &rules, "", "")?.check(
+                "report size before count",
+                &repeated,
+                Some(limit),
+            )?;
+        }
+    }
+    for (offset, limit) in [
+        (0, "Heuristics.Limits.Exceeded.MaxRecursion"),
+        (-1, "Heuristics.Limits.Exceeded.MaxScanSize"),
+    ] {
+        let budget = (repeated.len() + data.len())
+            .checked_add_signed(offset)
+            .unwrap();
+        let config = format!("MaxRecursion 1\nMaxScanSize {budget}\nAlertExceedsMax yes");
+        Server::start(stock, &config, &rules, "", "")?.check(
+            "report size before depth",
+            &repeated,
+            Some(limit),
+        )?;
+    }
+    Server::start(
+        stock,
+        "MaxFiles 2\nAlertExceedsMax yes",
+        &hash("Dots", DOTS)?,
+        "",
+        "",
+    )?
+    .check(
+        "large report miss leaves a slot for the picture",
+        &repeated,
+        Some("Dots"),
+    )?;
+    let many = stream(&biff(10, &[]).repeat(4000))?;
+    let file_limit = format!("MaxFileSize {}\nAlertExceedsMax yes", many.len());
+    Server::start(stock, &file_limit, &hash("Other", JPEG)?, "", "")?.check(
+        "report exceeds the per-file ceiling",
+        &many,
+        Some("Heuristics.Limits.Exceeded.MaxFileSize"),
+    )?;
+    Ok(())
+}
+
+#[test]
+fn barnacle_large_biff_reports() -> io::Result<()> {
+    compare_large_reports(false)?;
+    compare_unknown_report_limits(false)
+}
+#[test]
+#[ignore = "requires pinned Debian clamd"]
+fn stock_large_biff_reports() -> io::Result<()> {
+    compare_large_reports(true)?;
+    compare_unknown_report_limits(true)
+}
+
+fn compare_unknown_report_limits(stock: bool) -> io::Result<()> {
+    let mut records = biff(0xe0, &[0; 20]).repeat(1400);
+    for row in 0..128u16 {
+        let mut data = [0; 16];
+        data[..2].copy_from_slice(&row.to_le_bytes());
+        data[4..6].copy_from_slice(&1u16.to_le_bytes());
+        data[6..8].copy_from_slice(&255u16.to_le_bytes());
+        records.extend(biff(0x0208, &data));
+    }
+    records.extend(authored_drawing()?);
+    let doc = single(&records)?;
+    assert_eq!(doc.len(), 42496);
+    let lower = REPORT.len() + 12 * 4096;
+    let upper = REPORT.len() + 14 * 4096;
+    let file_limit = "Heuristics.Limits.Exceeded.MaxFileSize";
+    let scan_limit = "Heuristics.Limits.Exceeded.MaxScanSize";
+    let miss = hash("Other", JPEG)?;
+    let picture = hash("Dots", DOTS)?;
+    let outer = hash("Outer", &doc)?;
+    for (file, scan, reason) in [
+        (doc.len(), 1 << 20, Some(file_limit)),
+        (doc.len(), doc.len() + upper, Some(file_limit)),
+        (doc.len(), doc.len() + lower - 1, Some(scan_limit)),
+        // One endpoint crosses the scan budget. Stock's actual report fits that budget.
+        (
+            doc.len(),
+            doc.len() + upper - 1,
+            stock.then_some(file_limit),
+        ),
+        // The lower endpoint can enter and the upper one exceeds the per-file limit.
+        (lower, 1 << 20, stock.then_some(file_limit)),
+    ] {
+        let opts = format!("MaxFileSize {file}\nMaxScanSize {scan}\nAlertExceedsMax yes");
+        for (name, rules, result) in [
+            ("limit", &miss, reason),
+            ("picture", &picture, reason.map(|_| "Dots")),
+            ("outer", &outer, reason.map(|_| "Outer")),
+        ] {
+            Server::start(stock, &opts, rules, "", "")?.check(
+                &format!("{name} file={file} scan={scan}"),
+                &doc,
+                result,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn large_report_scratch_respects_admission() -> io::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let missing = tmp.path().join("missing");
+    let data = single(&[biff(10, &[]).repeat(4000), authored_drawing()?].concat())?;
+    for (files, budget, expected) in [
+        (1, 200000, "Heuristics.Limits.Exceeded.MaxFiles"),
+        (1, 66000, "Heuristics.Limits.Exceeded.MaxScanSize"),
+        (10, 66000, "Heuristics.Limits.Exceeded.MaxScanSize"),
+    ] {
+        let o = Options {
+            max_files: files,
+            max_scan_size: (data.len() + budget) as u64,
+            alert_exceeds_max: true,
+            ..Default::default()
+        };
+        let v = scan(&data, &o, &missing, |_, _| Ok(Verdict::Miss), || Ok(()))?;
+        assert_eq!(v, Verdict::Found(expected.into()));
+    }
+    let error = scan(
+        &data,
+        &Options::default(),
+        &missing,
+        |_, _| Ok(Verdict::Miss),
+        || Ok(()),
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::NotFound);
     Ok(())
 }

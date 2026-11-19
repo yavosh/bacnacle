@@ -1,4 +1,5 @@
 //! Passive pictures in BIFF8 drawing groups and inline OfficeArt file BLIP store entries.
+mod report;
 use super::{ChildSink, Handling, Input};
 use crate::objects::Snapshot;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -61,6 +62,7 @@ pub(super) fn scan(mut input: Input<'_>, sink: &mut dyn ChildSink) -> io::Result
     let mut previous_group = false;
     let report_can_fit = REPORT_HEADER.len() as u64 <= sink.remaining();
     let mut report_bound = 0u64;
+    let mut large_report = false;
     let mut group_len = 0u64;
     let mut remaining = input.len();
     let mut buf = [0; MAX_RECORD];
@@ -84,13 +86,18 @@ pub(super) fn scan(mut input: Input<'_>, sink: &mut dyn ChildSink) -> io::Result
                 Some(bound) => bound,
                 // Bound variable report text when only its admission can affect the verdict.
                 // A formula token can print a decimal double. Its 22-byte header is fixed.
-                None if group.is_none() && opcode == 0x0006 => 128 + 1024 * size.saturating_sub(22),
-                None if group.is_none() => 128 + size * 4, // Name and String
-                None => return Ok(Handling::Incomplete),
+                None => {
+                    large_report = true;
+                    if opcode == 0x0006 {
+                        128 + 1024 * size.saturating_sub(22)
+                    } else {
+                        128 + size * 4
+                    }
+                }
             };
             report_bound = report_bound.saturating_add(bound as u64);
             if group.is_some() && report_bound >= 4096 {
-                return Ok(Handling::Incomplete);
+                large_report = true;
             }
         }
         if opcode != CONTINUE {
@@ -115,12 +122,19 @@ pub(super) fn scan(mut input: Input<'_>, sink: &mut dyn ChildSink) -> io::Result
         }
         let maximum = preamble.saturating_add(report_bound / 4096 * 4096);
         if maximum > sink.remaining() {
-            return Ok(Handling::Incomplete);
+            return report::scan(&mut input, sink, false);
         }
         sink.can_enter_child();
         return Ok(Handling::Complete);
     };
-    if !sink.skip_declared_size(REPORT_HEADER.len() as u64)
+    if large_report {
+        let maximum = (REPORT_HEADER.len() as u64).saturating_add(report_bound / 4096 * 4096);
+        let retain = maximum <= sink.remaining();
+        let result = report::scan(&mut input, sink, retain)?;
+        if result != Handling::Complete {
+            return Ok(result);
+        }
+    } else if !sink.skip_declared_size(REPORT_HEADER.len() as u64)
         && sink.match_generic_view(REPORT_HEADER)?
     {
         return Ok(Handling::Stopped);

@@ -1,4 +1,5 @@
 mod data;
+mod entities;
 mod script;
 use super::{ChildSink, Handling, Target};
 use std::io::{self, BufWriter, Seek, Write};
@@ -82,34 +83,49 @@ impl View {
     }
 }
 
-fn entity(bytes: &[u8]) -> Option<(u16, usize)> {
-    let end = bytes.iter().take(16).position(|&b| b == b';')?;
-    let name = &bytes[1..end];
-    let b = match name {
-        b"amp" => u16::from(b'&'),
-        b"lt" => u16::from(b'<'),
-        b"gt" => u16::from(b'>'),
-        b"quot" => u16::from(b'"'),
-        b"apos" => u16::from(b'\''),
-        b"nbsp" => 0xa0,
-        b"copy" => 0xa9,
-        b"reg" => 0xae,
-        b"pound" => 0xa3,
-        b"euro" => 0x20ac,
-        b"lambda" => 0x03bb,
-        b"ndash" => 0x2013,
-        b"mdash" => 0x2014,
-        b"hellip" => 0x2026,
-        _ => {
-            let n = name.strip_prefix(b"#")?;
-            let (n, base) = n
-                .strip_prefix(b"x")
-                .or_else(|| n.strip_prefix(b"X"))
-                .map_or((n, 10), |n| (n, 16));
-            u16::from_str_radix(std::str::from_utf8(n).ok()?, base).ok()?
+// The reference retains the first 1024 URL bytes, including attribute quotes.
+struct Url {
+    bytes: [u8; 1024],
+    len: usize,
+}
+
+impl Url {
+    fn new(quoted: bool) -> Self {
+        let mut url = Self {
+            bytes: [0; 1024],
+            len: 0,
+        };
+        if quoted {
+            url.push(b"\"");
         }
-    };
-    Some((b, end + 1))
+        url
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        let n = bytes.len().min(self.bytes.len() - self.len);
+        self.bytes[self.len..self.len + n].copy_from_slice(&bytes[..n]);
+        self.len += n;
+    }
+
+    fn submit(mut self, quoted: bool, text: &mut View) -> io::Result<()> {
+        if quoted {
+            self.push(b"\"");
+        }
+        let end = self.bytes[..self.len]
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(self.len);
+        let value = if quoted {
+            self.bytes.get(1..end.saturating_sub(1)).unwrap_or_default()
+        } else {
+            &self.bytes[..end]
+        };
+        if !value.is_empty() {
+            text.write(value)?;
+            text.write(b" ")?;
+        }
+        Ok(())
+    }
 }
 
 fn ws(bytes: &[u8]) -> &[u8] {
@@ -120,12 +136,21 @@ fn name_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b':' | b'.')
 }
 
+// Pending high bytes belong to the document's attribute-value parser. They can
+// resume in another tag, independently of intervening prose.
+#[derive(Default)]
+struct AttributeBytes {
+    pending: [u8; 3],
+    len: usize,
+}
+
 // Keep each quoted attribute within its tag and release it as soon as the tag ends.
 fn tag(
     input: &[u8],
     full: &mut View,
     text: &mut View,
     urls: &mut data::DataUrls,
+    attr_bytes: &mut AttributeBytes,
 ) -> io::Result<Option<(usize, bool, bool)>> {
     let mut bytes = ws(&input[1..]);
     let close = bytes.starts_with(b"/");
@@ -195,41 +220,95 @@ fn tag(
         let url = (name.eq_ignore_ascii_case(b"a") && attr.eq_ignore_ascii_case(b"href"))
             || (name.eq_ignore_ascii_case(b"img") && attr.eq_ignore_ascii_case(b"src"));
         if is_data {
+            if attr_bytes.len != 0 {
+                return Ok(None);
+            }
             urls.push(bytes.len() + usize::from(quoted), val.len())?;
             full.write(if quoted { b"=\"data\"" } else { b"=data" })?;
             continue;
         }
         full.write(if quoted { b"=\"" } else { b"=" })?;
-        let has_url = url && !val.is_empty();
+        let mut url = url.then(|| Url::new(quoted));
+        // Attribute values retain up to three high bytes until another ordinary
+        // byte arrives. A reference can emit its spelling ahead of this group.
+        let mut spaces = 0u8;
         while let Some((&b, rest)) = val.split_first() {
-            let c = if b == b'&' {
-                let Some((c, n)) = entity(val) else {
+            if b == b'&' {
+                let Some((reference, used)) = entities::parse(val) else {
                     return Ok(None);
                 };
-                val = &val[n..];
-                let Ok(c) = u8::try_from(c) else {
-                    return Ok(None);
-                };
-                c
-            } else {
+                reference.write(full, url.as_mut())?;
+                val = &val[used..];
+                continue;
+            }
+            if !b.is_ascii() && attr_bytes.len < attr_bytes.pending.len() {
+                attr_bytes.pending[attr_bytes.len] = b;
+                attr_bytes.len += 1;
                 val = rest;
-                b
-            };
-            if c.is_ascii_control() {
+                continue;
+            }
+            if b == b' ' {
+                full.write(b" ")?;
+                if let Some(url) = &mut url {
+                    url.push(&[if spaces > 0 { 0 } else { b' ' }]);
+                }
+                spaces = spaces.saturating_add(1);
+                val = &rest[rest.iter().take_while(|&&c| c == b' ').count()..];
+                if spaces == 2 {
+                    // The URL ends at this run. Stock reads the remaining bytes as
+                    // ordinary tag text, including ampersands and multibyte bytes.
+                    while let Some((&b, rest)) = val.split_first() {
+                        if b.is_ascii_control() || matches!(b, b'<' | b'>' | b'\'' | b'"') {
+                            return Ok(None);
+                        }
+                        full.write(&[b.to_ascii_lowercase()])?;
+                        val = if b == b' ' {
+                            &rest[rest.iter().take_while(|&&c| c == b' ').count()..]
+                        } else {
+                            rest
+                        };
+                    }
+                }
+                continue;
+            }
+            if attr_bytes.len != 0 {
+                if matches!(b, b'<' | b'>' | b'\'' | b'"') {
+                    return Ok(None);
+                }
+                let group = &attr_bytes.pending[..attr_bytes.len];
+                let bytes = if is_dot(group) { b"." } else { group };
+                full.write(bytes)?;
+                if let Some(url) = &mut url {
+                    url.push(bytes);
+                }
+                attr_bytes.len = 0;
+                if !b.is_ascii() {
+                    continue;
+                }
+            }
+            if b.is_ascii_control() {
                 return Ok(None);
             }
-            full.write(&[c.to_ascii_lowercase()])?;
-            if url {
-                text.write(&[c])?;
+            full.write(&[b.to_ascii_lowercase()])?;
+            if let Some(url) = &mut url {
+                url.push(&[b]);
             }
+            val = rest;
         }
         if quoted {
-            full.write(b"\"")?;
+            full.write(&[if spaces >= 2 { first } else { b'"' }])?;
         }
-        if has_url {
-            text.write(b" ")?;
+        if let Some(url) = url {
+            url.submit(quoted, text)?;
         }
     }
+}
+
+fn is_dot(group: &[u8]) -> bool {
+    matches!(
+        group,
+        [0xe3, 0x80, 0x82] | [0xef, 0xbc, 0x8e] | [0xef, 0xb9, 0x92]
+    )
 }
 
 pub(super) fn extract(
@@ -248,6 +327,7 @@ pub(super) fn extract(
     let mut script = false;
     let mut javascript = View::new(sink);
     let mut urls = data::DataUrls::new(bytes.len(), sink);
+    let mut attr_bytes = AttributeBytes::default();
     let mut script_start = None;
     let mut unknown_script = false;
     let mut pos = 0;
@@ -295,7 +375,8 @@ pub(super) fn extract(
                 pos += end + terminator.len();
                 text.separate()?;
             } else {
-                let Some((used, is_script, close)) = tag(tail, &mut full, &mut text, &mut urls)?
+                let Some((used, is_script, close)) =
+                    tag(tail, &mut full, &mut text, &mut urls, &mut attr_bytes)?
                 else {
                     return Ok(Handling::Incomplete);
                 };
@@ -323,10 +404,7 @@ pub(super) fn extract(
             let group = &tail[..n];
             // The HTML text extractor groups at most three high bytes. Its text
             // view ends each group with the preceding byte, or zero for a singleton.
-            if matches!(
-                group,
-                [0xe3, 0x80, 0x82] | [0xef, 0xbc, 0x8e] | [0xef, 0xb9, 0x92]
-            ) {
+            if is_dot(group) {
                 full.write(b".")?;
                 text.write(b".")?;
             } else {
@@ -345,14 +423,13 @@ pub(super) fn extract(
         }
         skip_space = false;
         if b == b'&' {
-            let Some((c, n)) = entity(tail) else {
+            let Some((reference, n)) = entities::parse(tail) else {
                 return Ok(Handling::Incomplete);
             };
-            if let Ok(byte) = u8::try_from(c) {
-                full.write(&[byte.to_ascii_lowercase()])?;
-            } else {
-                full.write(format!("&#x{c:04x};").as_bytes())?;
+            if script && matches!(reference, entities::Reference::Literal(_)) {
+                return Ok(Handling::Incomplete);
             }
+            reference.write(&mut full, None)?;
             if !script {
                 text.separate()?;
             }
