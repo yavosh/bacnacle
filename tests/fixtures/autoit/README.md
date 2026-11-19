@@ -37,3 +37,13 @@ FileInstall("notice.txt", @TempDir & "\notice.txt")
 
 The Rust tests submit the A3X bytes directly and within inert PE and ZIP containers. They check the rendered script and the exact document bytes.
 [AutoIt compiler documentation](https://www.autoitscript.com/autoit3/docs/intro/compiler.htm) · [Rust comparisons](../../object_autoit.rs)
+
+## Legacy EA05 archives
+
+`notice-ea05.a3x` contains the same 50-byte notice under one stored EA05 record with a zero-salt header.
+The file's SHA-256 is `0a266ba9110ca3ba0869e27f72801f2cccae17d1eb4755ae27777b5972257111`.
+
+`ledger-ea05.a3x` packs the 50-byte notice and 151,552-byte ledger, in that order, with the `Inventory label!` salt.
+The file's SHA-256 is `f787f1057a636dd7247656afcd21542ab6109cd99880ef7aa11b812231128e5e`.
+The two Rust fixture generators used AutoIt RS 0.1.2 for the archive keystream.
+[AutoIt RS 0.1.2](https://crates.io/crates/autoit-rs/0.1.2)

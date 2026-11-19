@@ -11,9 +11,13 @@ use daemon::{Daemon, stream_frame, unix_request};
 use std::{fmt::Write, fs, io, path::Path};
 
 const GUIDE: &[u8] = include_bytes!("fixtures/autoit/guide.a3x");
-const GUIDE_HEADER_LEN: usize = 40;
+const HEADER_LEN: usize = 40;
 const GUIDE_LEDGER_OFFSET: usize = 835;
 const QUANTITIES: &[u8] = include_bytes!("fixtures/autoit/quantities.a3x");
+const LEGACY_NOTICE: &[u8] = include_bytes!("fixtures/autoit/notice-ea05.a3x");
+const LEGACY_NOTICE_PAYLOAD_OFFSET: usize = 111;
+const LEGACY_PACKED: &[u8] = include_bytes!("fixtures/autoit/ledger-ea05.a3x");
+const LEGACY_LEDGER_OFFSET: usize = 174;
 const NOTICE: &[u8] = b"Inventory terminal reference sheet, revision six.\n";
 const QUANTITY_SCRIPT: &[u8] = concat!(
     "LOCAL $CARTONS = 0x0000002a \n",
@@ -223,6 +227,168 @@ fn compare(executable: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn compare_legacy(executable: &Path) -> io::Result<()> {
+    let notice = rule("Notice", NOTICE)?;
+    let outer = rule("Container", LEGACY_NOTICE)?;
+    let both = notice.clone() + &outer;
+    let short = format!("MaxScanSize {}", LEGACY_NOTICE.len() + NOTICE.len() - 1);
+    let exact = format!("MaxScanSize {}", LEGACY_NOTICE.len() + NOTICE.len());
+    for (rules, options, expected) in [
+        (&both, "", "AutoItFixture.Notice.UNOFFICIAL FOUND"),
+        (&both, "ScanPE no", "AutoItFixture.Notice.UNOFFICIAL FOUND"),
+        (
+            &both,
+            "ScanArchive no",
+            "AutoItFixture.Container.UNOFFICIAL FOUND",
+        ),
+        (
+            &notice,
+            "MaxFiles 1",
+            "Heuristics.Limits.Exceeded.MaxFiles FOUND",
+        ),
+        (
+            &both,
+            "MaxFiles 1",
+            "AutoItFixture.Container.UNOFFICIAL FOUND",
+        ),
+        (&both, "MaxFiles 2", "AutoItFixture.Notice.UNOFFICIAL FOUND"),
+        (
+            &notice,
+            "MaxRecursion 1",
+            "Heuristics.Limits.Exceeded.MaxRecursion FOUND",
+        ),
+        (
+            &both,
+            "MaxRecursion 1",
+            "AutoItFixture.Container.UNOFFICIAL FOUND",
+        ),
+        (
+            &both,
+            "MaxRecursion 2",
+            "AutoItFixture.Notice.UNOFFICIAL FOUND",
+        ),
+        (
+            &notice,
+            short.as_str(),
+            "Heuristics.Limits.Exceeded.MaxScanSize FOUND",
+        ),
+        (
+            &both,
+            short.as_str(),
+            "AutoItFixture.Container.UNOFFICIAL FOUND",
+        ),
+        (
+            &both,
+            exact.as_str(),
+            "AutoItFixture.Notice.UNOFFICIAL FOUND",
+        ),
+        (&outer, "", "AutoItFixture.Container.UNOFFICIAL FOUND"),
+    ] {
+        check(executable, LEGACY_NOTICE, rules, options, expected)?;
+    }
+    for end in [32, 75] {
+        let interrupted = &LEGACY_NOTICE[..end];
+        check(
+            executable,
+            interrupted,
+            &rule("Container", interrupted)?,
+            "",
+            "AutoItFixture.Container.UNOFFICIAL FOUND",
+        )?;
+    }
+    let short_timestamps = &LEGACY_NOTICE[..LEGACY_NOTICE_PAYLOAD_OFFSET - 8];
+    check(
+        executable,
+        short_timestamps,
+        &notice,
+        &format!("MaxScanSize {}", short_timestamps.len() + NOTICE.len() - 1),
+        "Heuristics.Limits.Exceeded.MaxScanSize FOUND",
+    )?;
+    let ledger_bytes = ledger();
+    let ledger = rule("Ledger", &ledger_bytes)?;
+    let both = notice.clone() + &ledger + &rule("Container", LEGACY_PACKED)?;
+    let exact_ledger = LEGACY_PACKED.len() + NOTICE.len() + ledger_bytes.len();
+    let truncated = &LEGACY_PACKED[..LEGACY_PACKED.len() - 1024];
+    let truncated_outer = rule("Container", truncated)?;
+    for (bytes, rules, options, expected) in [
+        (
+            LEGACY_PACKED,
+            &both,
+            String::new(),
+            "AutoItFixture.Notice.UNOFFICIAL FOUND",
+        ),
+        (
+            LEGACY_PACKED,
+            &ledger,
+            "MaxFiles 3".into(),
+            "AutoItFixture.Ledger.UNOFFICIAL FOUND",
+        ),
+        (
+            LEGACY_PACKED,
+            &ledger,
+            format!("MaxScanSize {exact_ledger}"),
+            "AutoItFixture.Ledger.UNOFFICIAL FOUND",
+        ),
+        (
+            LEGACY_PACKED,
+            &ledger,
+            format!("MaxScanSize {}", exact_ledger - 1),
+            "Heuristics.Limits.Exceeded.MaxScanSize FOUND",
+        ),
+        (
+            truncated,
+            &notice,
+            String::new(),
+            "AutoItFixture.Notice.UNOFFICIAL FOUND",
+        ),
+        (
+            truncated,
+            &truncated_outer,
+            String::new(),
+            "AutoItFixture.Container.UNOFFICIAL FOUND",
+        ),
+    ] {
+        check(executable, bytes, rules, &options, expected)?;
+    }
+    let mut pe = pe::benign_pe();
+    pe.extend_from_slice(LEGACY_PACKED);
+    let pe_hash = rule("Executable", &pe)?;
+    check(
+        executable,
+        &pe,
+        &(pe_hash + &notice),
+        "",
+        "AutoItFixture.Executable.UNOFFICIAL FOUND",
+    )?;
+    check(
+        executable,
+        &pe,
+        &notice,
+        "ScanPE no",
+        "AutoItFixture.Notice.UNOFFICIAL FOUND",
+    )?;
+    let archive = zip::zip(&[("guide.a3x", LEGACY_PACKED)], true, false, false)?;
+    check(
+        executable,
+        &archive,
+        &(rule("Zip", &archive)? + &notice),
+        "",
+        "AutoItFixture.Notice.UNOFFICIAL FOUND",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn legacy_resources() -> io::Result<()> {
+    compare_legacy(Path::new(env!("CARGO_BIN_EXE_barnacle")))
+}
+
+#[test]
+#[ignore = "requires the pinned Debian clamd"]
+fn stock_legacy_resources() -> io::Result<()> {
+    compare_legacy(Path::new("/usr/sbin/clamd"))
+}
+
 #[test]
 fn autoit_resources() -> io::Result<()> {
     compare(Path::new(env!("CARGO_BIN_EXE_barnacle")))
@@ -236,30 +402,35 @@ fn stock_autoit_resources() -> io::Result<()> {
 
 #[test]
 fn recursion_denied_resources_do_not_need_scratch() -> io::Result<()> {
-    // Keep the vendor header and move the compressed ledger to the first record.
-    let ledger_first = [&GUIDE[..GUIDE_HEADER_LEN], &GUIDE[GUIDE_LEDGER_OFFSET..]].concat();
+    // Keep the archive header and move the compressed ledger to the first record.
     let scratch = tempfile::tempdir()?;
-    let result = objects::scan(
-        &ledger_first,
-        &Options {
-            max_recursion: 1,
-            alert_exceeds_max: true,
-            ..Options::default()
-        },
-        &scratch.path().join("absent"),
-        |_, _| Ok(Verdict::Miss),
-        || Ok(()),
-    )?;
-    assert_eq!(
-        result,
-        Verdict::Found("Heuristics.Limits.Exceeded.MaxRecursion".into())
-    );
+    for (input, offset) in [
+        (GUIDE, GUIDE_LEDGER_OFFSET),
+        (LEGACY_PACKED, LEGACY_LEDGER_OFFSET),
+    ] {
+        let ledger_first = [&input[..HEADER_LEN], &input[offset..]].concat();
+        let result = objects::scan(
+            &ledger_first,
+            &Options {
+                max_recursion: 1,
+                alert_exceeds_max: true,
+                ..Options::default()
+            },
+            &scratch.path().join("absent"),
+            |_, _| Ok(Verdict::Miss),
+            || Ok(()),
+        )?;
+        assert_eq!(
+            result,
+            Verdict::Found("Heuristics.Limits.Exceeded.MaxRecursion".into())
+        );
+    }
     Ok(())
 }
 
 #[test]
 fn resource_copy_propagates_interrupted_scan() -> io::Result<()> {
-    let ledger_first = [&GUIDE[..GUIDE_HEADER_LEN], &GUIDE[GUIDE_LEDGER_OFFSET..]].concat();
+    let ledger_first = [&GUIDE[..HEADER_LEN], &GUIDE[GUIDE_LEDGER_OFFSET..]].concat();
     let scratch = tempfile::tempdir()?;
     let mut checks = 0;
     let error = objects::scan(

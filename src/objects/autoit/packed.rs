@@ -51,10 +51,11 @@ pub(super) struct Decoder<'a> {
     pending: usize,
     distance: usize,
     failed: bool,
+    literal_flag: usize,
 }
 
 impl<'a> Decoder<'a> {
-    pub fn new(input: &'a [u8], key: Key, size: usize) -> Self {
+    pub fn new(input: &'a [u8], key: Key, size: usize, literal_one: bool) -> Self {
         Self {
             bits: Bits {
                 // The packed stream is read in complete 16-bit words.
@@ -70,6 +71,7 @@ impl<'a> Decoder<'a> {
             pending: 0,
             distance: 0,
             failed: false,
+            literal_flag: usize::from(literal_one),
         }
     }
 
@@ -86,8 +88,10 @@ impl<'a> Decoder<'a> {
             let mut literal = None;
             if self.pending == 0 {
                 match self.bits.read(1) {
-                    Some(1) => literal = self.bits.read(8).map(|v| v as u8),
-                    Some(0) => {
+                    Some(flag) if flag == self.literal_flag => {
+                        literal = self.bits.read(8).map(|v| v as u8)
+                    }
+                    Some(_) => {
                         if let Some(distance) = self.bits.read(15)
                             && distance > 0
                             && distance <= self.written

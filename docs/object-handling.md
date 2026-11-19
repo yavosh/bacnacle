@@ -12,7 +12,7 @@ The raw engine inventory lists individual submodules, including disabled entries
 | --- | --- | --- |
 | Archives and compressed streams | ZIP, gzip, bzip2, XZ, TAR, CPIO, 7z, RAR, ARJ, CAB, SZDD, CHM, BinHex, EGG, LHA, ALZ and SIS | Rust fixtures cover all listed families, including stored and compressed legacy SIS members. The RAR comparison checks the reference installation without UnRAR. [Archive comparisons](../tests/object_archives.rs) |
 | Disk images and partitions | ISO 9660, UDF, DMG, XAR, HFS+, MBR, GPT and APM | Tests cover optical images, XAR, DMG, three partition maps, and files inside HFS+ and HFSX. [ISO comparisons](../tests/object_iso.rs) · [DMG comparisons](../tests/object_dmg.rs) · [Partition comparisons](../tests/object_partition.rs) |
-| Installers and embedded files | NSIS, AutoIt, InstallShield and embedded file recognition | Tests exercise NSIS, AutoIt EA06, InstallShield, and embedded PE resources. [AutoIt comparisons](../tests/object_autoit.rs) · [Installer comparisons](../tests/object_installers.rs) · [Embedded comparisons](../tests/object_embedded.rs) |
+| Installers and embedded files | NSIS, AutoIt, InstallShield and embedded file recognition | Tests exercise NSIS, AutoIt EA05 and EA06, InstallShield, and embedded PE resources. [AutoIt comparisons](../tests/object_autoit.rs) · [Installer comparisons](../tests/object_installers.rs) · [Embedded comparisons](../tests/object_embedded.rs) |
 | Documents | OLE2, OOXML, Word/Excel XML, HWP, OneNote, PDF, RTF and SWF | Tests cover ordinary PDF, Office, RTF and Flash documents, including competing child detections and scan limits. [PDF comparisons](../tests/object_pdf.rs) · [OLE comparisons](../tests/object_ole.rs) |
 | Text and mail | HTML, UTF-16 HTML, script normalization, JavaScript, script encoding, mbox/MIME, TNEF and uuencoding | Rust fixtures exercise ordinary scripts, HTML, MIME, TNEF, uuencoded files, and data URLs. [Text comparisons](../tests/object_text.rs) |
 | Executables and media | PE, ELF, Mach-O, universal Mach-O, Java, RIFF, GIF, PNG, JPEG and TIFF | Tests cover Mach-O slices, ELF sections, Java classes, WAVE audio, and five image formats. Image heuristics and executable unpacking remain open. [Executable comparisons](../tests/object_macho.rs) · [Media comparisons](../tests/object_images.rs) |
@@ -45,7 +45,7 @@ The standalone script requires 311 scan bytes for its token stream. Its rendered
 A 50-byte remainder can exclude the script and still admit the notice.
 The reference checks the whole embedded region against the remaining budget before visiting its resources.
 Barnacle validates resources blocked by the recursion limit without retaining their decoded bytes.
-Legacy EA05 records and unsupported script tokens return incomplete coverage.
+Unsupported EA06 script tokens return incomplete coverage.
 The exact child bytes, competing signatures, raw hash, parent context, and scan limits have paired Rust checks.
 [Authored fixture](../tests/fixtures/autoit/README.md) · [Rust comparisons](../tests/object_autoit.rs)
 
@@ -63,6 +63,24 @@ Use `guide.a3x` and select one rule per run. The notice rule is `af677c6a14892c9
 The ledger rule is `b9c7aad25d0ecb2818a7adc4452c66ab:151552:Guide.Ledger`.
 The Barnacle release executable had SHA-256 `9e1189b571503ce2c74b40bd1800836edf3570cb1b95be909b8c2df59159e5ea`.
 [Raw AutoIt measurements](benchmarks/object-autoit.csv)
+
+EA05 supplies stored or compressed resources in record order. Its script bytes are already plain text after extraction.
+Stock checks the stored size and then the expanded size for compressed resources. Only the scanned bytes consume the cumulative budget.
+If a file, recursion, or size limit blocks an EA05 resource, a matching outer hash can still win.
+When a legacy record header or stored-length read ends early, stock can still match the outer file.
+Stock applies the EA05 stored-length limit before reading the record timestamps.
+[Legacy fixtures](../tests/fixtures/autoit/README.md#legacy-ea05-archives) · [Rust comparisons](../tests/object_autoit.rs)
+
+The EA05 benchmark used `ledger-ea05.a3x` with the same rules and container settings as EA06.
+All 6,156 replies matched the expected signature. The table reports medians from three fresh containers per daemon and rule.
+
+| Signature | Barnacle scans/s | Stock scans/s | Barnacle p95 ms | Stock p95 ms | Barnacle peak MiB | Stock peak MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Notice | 19,840 | 10,503 | 0.31 | 0.73 | 4.08 | 5.16 |
+| Ledger | 1,761 | 1,641 | 3.98 | 5.40 | 4.12 | 6.16 |
+
+The Barnacle release executable had SHA-256 `9b791be736df5d77edf3e7983730cf9986e4d44c997c3514758c33c188e70ff5`.
+[Raw EA05 measurements](benchmarks/object-autoit-ea05.csv)
 
 ### ZIP Deflate64 members
 
