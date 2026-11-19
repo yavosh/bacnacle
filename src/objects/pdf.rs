@@ -1,5 +1,5 @@
 //! Scan PDF streams after the raw PDF matcher, in physical indirect-object order.
-use super::{ChildSink, Handling, Limit, Snapshot};
+use super::{ChildSink, Handling, Limit, ObjectBytes, Snapshot};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 
@@ -424,21 +424,24 @@ pub(super) fn extract(data: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handl
         return Ok(Handling::Incomplete);
     };
     sink.check()?;
-    let mut packed = pdf
+    let directories = pdf
         .objects
         .iter()
-        .any(|obj| obj.directory.is_some())
-        .then(|| {
-            object_stream::Packed::new(
-                sink.temporary_directory(),
-                sink.remaining(),
-                pdf.count,
-                pdf.objects
-                    .iter()
-                    .filter(|obj| obj.unsupported || obj.encoded.is_some() && !obj.raw_destination)
-                    .map(|obj| obj.id),
-            )
-        });
+        .filter(|obj| obj.directory.is_some())
+        .take(2)
+        .count();
+    let mut retained = None;
+    let mut packed = (directories != 0).then(|| {
+        object_stream::Packed::new(
+            sink.temporary_directory(),
+            sink.remaining(),
+            pdf.count,
+            pdf.objects
+                .iter()
+                .filter(|obj| obj.unsupported || obj.encoded.is_some() && !obj.raw_destination)
+                .map(|obj| obj.id),
+        )
+    });
     'objects: for obj in pdf.objects {
         sink.check()?;
         if obj.unsupported {
@@ -539,24 +542,35 @@ pub(super) fn extract(data: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handl
                 }
             }
         }
-        let mut visit = |data: &[u8]| -> io::Result<bool> {
+        let source = match decoded {
+            Some(s) => s.into_bytes()?,
+            None => ObjectBytes::Borrowed(bytes),
+        };
+        let data = source.as_ref();
+        let (retain, skipped) =
             if let (Some(directory), Some(packed)) = (directory, packed.as_mut()) {
-                packed.inspect(directory, data, &mut pdf.lengths, &mut pdf.contents, sink)?;
-                if sink.skip_declared_size(data.len() as u64) {
-                    return Ok(false);
-                }
-            }
-            visit_stream(data, content, sink)
-        };
-        let stopped = match decoded {
-            Some(s) => s.with_bytes(visit)?,
-            None => visit(bytes)?,
-        };
-        if stopped {
+                let retain = packed.inspect(
+                    directory,
+                    directories == 1,
+                    &source,
+                    &mut pdf.lengths,
+                    &mut pdf.contents,
+                    sink,
+                )?;
+                (retain, sink.skip_declared_size(data.len() as u64))
+            } else {
+                (false, false)
+            };
+        if !skipped && visit_stream(data, content, sink)? {
             return Ok(Handling::Stopped);
         }
+        if retain {
+            retained = Some(source);
+        }
     }
-    packed.map_or(Ok(Handling::Complete), |packed| packed.finish(sink))
+    packed.map_or(Ok(Handling::Complete), |packed| {
+        packed.finish(retained.as_ref().map(AsRef::as_ref), sink)
+    })
 }
 
 fn record_child_limit(size: u64, sink: &mut dyn ChildSink) {

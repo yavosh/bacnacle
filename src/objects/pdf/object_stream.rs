@@ -1,7 +1,7 @@
 //! PDF 1.5 compressed indirect objects. Their offsets are relative to /First.
 use super::{
-    ChildSink, Handling, Id, MAX_OBJECTS, Snapshot, Tokens, destination, number, scan_page_text,
-    white,
+    ChildSink, Handling, Id, MAX_OBJECTS, ObjectBytes, Snapshot, Tokens, destination, number,
+    scan_page_text, white,
 };
 use aho_corasick::AhoCorasick;
 use std::{
@@ -15,6 +15,13 @@ use std::{
 pub(super) struct Directory {
     first: usize,
     members: usize,
+}
+
+#[derive(Clone, Copy)]
+struct Opening {
+    owner: usize,
+    child: usize,
+    size: usize,
 }
 
 impl Directory {
@@ -64,7 +71,7 @@ impl Directory {
         body: &[u8],
         available: usize,
         sink: &mut dyn ChildSink,
-    ) -> io::Result<Option<(usize, usize)>> {
+    ) -> io::Result<Option<Opening>> {
         const NAME: &[u8] = b"/OpenAction";
         static SEARCH: LazyLock<AhoCorasick> =
             LazyLock::new(|| AhoCorasick::new([NAME]).expect("static PDF name"));
@@ -90,16 +97,24 @@ impl Directory {
         while let Some(entry) = entries.next(sink)? {
             sink.check()?;
             if let Some(dest) = destination::catalog(entry.bytes, &mut || sink.check())?
-                && catalog.replace((entry.ordinal, dest)).is_some()
+                && catalog
+                    .replace((entry.ordinal, entry.bytes.len(), dest))
+                    .is_some()
             {
                 return Ok(None);
             }
         }
-        let Some((owner, dest)) = catalog else {
+        let Some((owner, owner_size, dest)) = catalog else {
             return Ok(None);
         };
         let id = match dest {
-            destination::Destination::Inline => return Ok(Some((owner, owner))),
+            destination::Destination::Inline => {
+                return Ok(Some(Opening {
+                    owner,
+                    child: owner,
+                    size: owner_size,
+                }));
+            }
             destination::Destination::Page((id, 0))
             | destination::Destination::Indirect((id, 0)) => id,
             _ => return Ok(None),
@@ -117,11 +132,16 @@ impl Directory {
                 }
                 _ => destination::passive_body(entry.bytes, &mut || sink.check())?,
             };
-            if !valid || selected.replace(entry.ordinal.min(owner)).is_some() {
+            let (child, size) = if entry.ordinal < owner {
+                (entry.ordinal, entry.bytes.len())
+            } else {
+                (owner, owner_size)
+            };
+            if !valid || selected.replace(Opening { owner, child, size }).is_some() {
                 return Ok(None);
             }
         }
-        Ok(selected.map(|child| (owner, child)))
+        Ok(selected)
     }
 }
 
@@ -226,16 +246,27 @@ impl Packed {
     pub(super) fn inspect(
         &mut self,
         directory: Directory,
-        data: &[u8],
+        sole_directory: bool,
+        source: &ObjectBytes<'_>,
         lengths: &mut HashMap<Id, usize>,
         contents: &mut HashSet<Id>,
         sink: &mut dyn ChildSink,
-    ) -> io::Result<()> {
+    ) -> io::Result<bool> {
+        let data = source.as_ref();
         let Some((index, body)) = data.split_at_checked(directory.first) else {
-            return Ok(());
+            return Ok(false);
         };
         let available = MAX_OBJECTS - self.count;
         let opening = directory.opening(index, body, available, sink)?;
+        // The PDF already owns stored carriers. Keep a decoded carrier only
+        // when its extra bytes fit in one memory spool and the storage budget.
+        let retain = sole_directory
+            && (matches!(source, ObjectBytes::Borrowed(_))
+                || (data.len() as u64 <= self.spool_limit
+                    && opening.is_some_and(|open| {
+                        open.size > Snapshot::MEMORY_LIMIT
+                            && data.len() - open.size <= Snapshot::MEMORY_LIMIT
+                    })));
         let mut entries = directory.entries(index, body);
         while let Some(Entry {
             ordinal: n,
@@ -246,10 +277,11 @@ impl Packed {
         {
             sink.check()?;
             if n >= available {
-                self.defer(&[], Deferred::Unsupported, sink)?;
+                self.defer(&[], Deferred::Unsupported, None, sink)?;
                 break;
             }
-            let selected = opening.is_some_and(|(_, child)| child == n);
+            let selected = opening.is_some_and(|open| open.child == n);
+            let source_offset = retain.then_some(directory.first + start);
             self.count += 1;
             let mut input = Tokens {
                 data: bytes,
@@ -266,6 +298,7 @@ impl Packed {
                     } else {
                         Deferred::Array { contents: false }
                     },
+                    source_offset,
                     sink,
                 )?;
                 self.arrays.insert((id, 0), entry);
@@ -315,7 +348,7 @@ impl Packed {
                         dump.get_or_insert(Deferred::Raw);
                     }
                     b"/OpenAction"
-                        if !seen_opening && opening.is_some_and(|(owner, _)| owner == n) =>
+                        if !seen_opening && opening.is_some_and(|open| open.owner == n) =>
                     {
                         seen_opening = true
                     }
@@ -327,23 +360,36 @@ impl Packed {
                 }
             }
             if let Some(kind) = dump {
-                self.defer(bytes, kind, sink)?;
+                self.defer(bytes, kind, source_offset, sink)?;
             }
         }
-        Ok(())
+        Ok(retain)
     }
 
-    fn defer(&mut self, bytes: &[u8], kind: Deferred, sink: &mut dyn ChildSink) -> io::Result<()> {
+    fn defer(
+        &mut self,
+        bytes: &[u8],
+        kind: Deferred,
+        source: Option<usize>,
+        sink: &mut dyn ChildSink,
+    ) -> io::Result<()> {
         let end = self
             .length
             .checked_add(bytes.len())
             .ok_or_else(|| io::Error::other("PDF object size overflow"))?;
         let offset = if end as u64 <= self.spool_limit && !matches!(kind, Deferred::Unsupported) {
-            for chunk in bytes.chunks(super::TOKEN_BLOCK) {
-                sink.check()?;
-                self.file.write_all(chunk)?;
-            }
-            Some(std::mem::replace(&mut self.length, end))
+            let start = match source {
+                Some(start) => start,
+                None => {
+                    for chunk in bytes.chunks(super::TOKEN_BLOCK) {
+                        sink.check()?;
+                        self.file.write_all(chunk)?;
+                    }
+                    self.length
+                }
+            };
+            self.length = end;
+            Some(start)
         } else {
             None
         };
@@ -355,11 +401,15 @@ impl Packed {
         Ok(())
     }
 
-    pub(super) fn finish(self, sink: &mut dyn ChildSink) -> io::Result<Handling> {
+    pub(super) fn finish(
+        self,
+        retained: Option<&[u8]>,
+        sink: &mut dyn ChildSink,
+    ) -> io::Result<Handling> {
         if self.deferred.is_empty() {
             return Ok(Handling::Complete);
         }
-        self.file.with_bytes(|data| {
+        let visit = |data: &[u8]| {
             for item in self.deferred {
                 sink.check()?;
                 match item.kind {
@@ -382,6 +432,10 @@ impl Packed {
                 }
             }
             Ok(Handling::Complete)
-        })
+        };
+        match retained {
+            Some(bytes) => visit(bytes),
+            None => self.file.with_bytes(visit),
+        }
     }
 }

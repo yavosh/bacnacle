@@ -243,6 +243,9 @@ Both daemons match the decoded object stream before later physical streams.
 Clamd reads the packed directory for the compact spelling `/Type/ObjStm`.
 A packed page can mark a later physical stream for text extraction.
 Packed dictionaries selected for scanning follow all physical streams, including the cross-reference stream.
+For one stored carrier, deferred members borrow the original PDF bytes.
+A single decoded carrier can supply its large opening dictionary directly when it fits the remaining storage budget.
+Barnacle retains at most 64 KiB of other carrier data on that path. Sparse and multi-carrier inputs use the deferred spool.
 A packed catalog with a local opening destination exposes the earlier of the catalog and the referenced member.
 An inline GoTo exposes the catalog. Barnacle resolves one opening catalog per carrier. It checks cancellation while reading borrowed dictionary bytes.
 The paired tests include a 1 MiB catalog, a large backward page reference, and the exact remaining scan budget.

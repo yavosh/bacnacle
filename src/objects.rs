@@ -184,8 +184,26 @@ fn unlimited_if_zero(n: u64) -> u64 {
     if n == 0 { u64::MAX } else { n }
 }
 
-/// Keep small objects in memory. Map larger private snapshots only while visiting them.
+/// Keep small objects in memory and back larger snapshots with private files.
 pub struct Snapshot(tempfile::SpooledTempFile);
+
+// A decoded stream can outlive the callback that first inspects it. The owned
+// variants have no writers. Borrowed bytes keep their source lifetime.
+enum ObjectBytes<'a> {
+    Borrowed(&'a [u8]),
+    Memory(Vec<u8>),
+    Mapped(memmap2::Mmap),
+}
+
+impl AsRef<[u8]> for ObjectBytes<'_> {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(bytes) => bytes,
+            Self::Memory(bytes) => bytes,
+            Self::Mapped(bytes) => bytes,
+        }
+    }
+}
 
 impl Write for Snapshot {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
@@ -229,16 +247,20 @@ impl Snapshot {
             spool.write_all(&buf[..n])?;
         }
     }
-    pub fn with_bytes<T>(self, visit: impl FnOnce(&[u8]) -> io::Result<T>) -> io::Result<T> {
+    fn into_bytes(self) -> io::Result<ObjectBytes<'static>> {
         match self.0.into_inner() {
-            tempfile::SpooledData::InMemory(data) => visit(data.get_ref()),
+            tempfile::SpooledData::InMemory(data) => Ok(ObjectBytes::Memory(data.into_inner())),
             tempfile::SpooledData::OnDisk(file) => {
-                // SAFETY: the spool owns this unlinked file. Writers have finished and
-                // the immutable mapping and file both outlive the callback.
+                // SAFETY: the spool owns this unlinked file and has finished writing.
+                // The read-only mapping keeps the contents alive after the handle closes.
                 let bytes = unsafe { memmap2::Mmap::map(&file)? };
-                visit(&bytes)
+                Ok(ObjectBytes::Mapped(bytes))
             }
         }
+    }
+
+    pub fn with_bytes<T>(self, visit: impl FnOnce(&[u8]) -> io::Result<T>) -> io::Result<T> {
+        visit(self.into_bytes()?.as_ref())
     }
 }
 

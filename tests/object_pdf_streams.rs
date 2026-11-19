@@ -174,18 +174,28 @@ fn pack(
     })
 }
 
-fn two_carriers(array_first: bool) -> io::Result<Vec<u8>> {
-    let page = format!("3 0 {PAGE_DICT}4 0 R >>\n");
+fn two_carriers(array_first: bool, catalog: Option<&[u8]>) -> io::Result<Vec<u8>> {
+    let page = format!("{PAGE_DICT}4 0 R >>\n");
+    let header = if catalog.is_some() {
+        format!("3 0 1 {} ", page.len())
+    } else {
+        "3 0 ".into()
+    };
+    let first = [
+        header.as_bytes(),
+        page.as_bytes(),
+        catalog.unwrap_or_default(),
+    ]
+    .concat();
+    let info = format!(
+        "/Type/ObjStm /First {} /N {} /Filter /FlateDecode",
+        header.len(),
+        1 + usize::from(catalog.is_some())
+    );
     let mut objects = [
         (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
         (2, b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>".to_vec()),
-        (
-            5,
-            stream(
-                "/Type/ObjStm /First 4 /N 1 /Filter /FlateDecode",
-                &zlib(page.as_bytes())?,
-            ),
-        ),
+        (5, stream(&info, &zlib(&first)?)),
         (
             7,
             stream(
@@ -206,6 +216,12 @@ fn two_carriers(array_first: bool) -> io::Result<Vec<u8>> {
         xref[id][1..5].copy_from_slice(&parent.to_be_bytes());
     }
     for (id, body) in objects {
+        if id == 1 && catalog.is_some() {
+            xref[id][0] = 2;
+            xref[id][1..5].copy_from_slice(&5u32.to_be_bytes());
+            xref[id][5..].copy_from_slice(&1u16.to_be_bytes());
+            continue;
+        }
         xref[id][0] = 1;
         xref[id][1..5].copy_from_slice(&(file.len() as u32).to_be_bytes());
         writeln!(file, "{id} 0 obj")?;
@@ -222,6 +238,42 @@ fn two_carriers(array_first: bool) -> io::Result<Vec<u8>> {
     ));
     write!(file, "\nendobj\nstartxref\n{start}\n%%EOF\n")?;
     Ok(file)
+}
+
+const DEFERRED_PAGE: &[u8] =
+    b"<< /Type /Page /Parent 2 0 R /Resources << >> /MediaBox [0 0 100 100] /Contents [] >>\n";
+fn catalog_with_deferred_page(
+    compressed: bool,
+    page_first: bool,
+    padding: usize,
+) -> io::Result<(Sample, Vec<u8>)> {
+    let mut catalog =
+        b"<< /Type /Catalog /Pages 2 0 R /OpenAction << /S /GoTo /D (Receipt) >> /Note (".to_vec();
+    catalog.extend_from_slice(&b"Receiving inspected the inventory. ".repeat(4096));
+    catalog.extend_from_slice(b") >>\n");
+    let mut note = b"<< /Title (Receipt".to_vec();
+    note.resize(note.len() + padding, b' ');
+    note.extend_from_slice(b") >>\n");
+    let order = if page_first {
+        [5, 3, 2, 1, 4]
+    } else {
+        [5, 1, 2, 3, 4]
+    };
+    let sample = pack(
+        true,
+        compressed,
+        [8, 6, 7],
+        false,
+        [
+            &catalog,
+            b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>\n",
+            DEFERRED_PAGE,
+            b"<< /Type /Filespec /F (notes.txt) /EF << /F 7 0 R >> >>\n",
+            &note,
+        ],
+        order,
+    )?;
+    Ok((sample, catalog))
 }
 
 fn hash(bytes: &[u8], name: &str) -> String {
@@ -493,6 +545,62 @@ fn compare(stock: bool) -> io::Result<()> {
             .collect::<Vec<_>>(),
     )?;
 
+    let mut ordered = Vec::new();
+    for compressed in [false, true] {
+        for padding in [0, 96 * 1024] {
+            for page_first in [false, true] {
+                let (sample, catalog) =
+                    catalog_with_deferred_page(compressed, page_first, padding)?;
+                ordered.push((
+                    sample,
+                    catalog,
+                    if page_first {
+                        "DeferredPage"
+                    } else {
+                        "DeferredCatalog"
+                    },
+                ));
+            }
+        }
+    }
+    let deferred_rules =
+        hash(DEFERRED_PAGE, "DeferredPage") + &hash(&ordered[0].1, "DeferredCatalog");
+    let cases: Vec<_> = ordered
+        .iter()
+        .map(|(doc, _, name)| ("deferred member order", doc.file.as_slice(), Some(*name)))
+        .collect();
+    check("", &deferred_rules, "", &cases)?;
+    let only: Vec<_> = ordered
+        .iter()
+        .map(|(doc, _, _)| {
+            (
+                "later deferred page",
+                doc.file.as_slice(),
+                Some("DeferredPage"),
+            )
+        })
+        .collect();
+    check("", &hash(DEFERRED_PAGE, "DeferredPage"), "", &only)?;
+
+    let array_first = two_carriers(true, Some(&ordered[0].1))?;
+    let catalog_first = two_carriers(false, Some(&ordered[0].1))?;
+    check(
+        "",
+        &(hash(&ordered[0].1, "DeferredCatalog") + &hash(b"[6 0 R]\n", "EarlierArray")),
+        "",
+        &[
+            (
+                "other carrier before catalog",
+                &array_first,
+                Some("EarlierArray"),
+            ),
+            (
+                "catalog before other carrier",
+                &catalog_first,
+                Some("DeferredCatalog"),
+            ),
+        ],
+    )?;
     let deferred = with_member(
         true,
         true,
@@ -607,12 +715,12 @@ fn compare(stock: bool) -> io::Result<()> {
         &[
             (
                 "array in a previous carrier",
-                &two_carriers(true)?,
+                &two_carriers(true, None)?,
                 Some("Array"),
             ),
             (
                 "array in a later carrier",
-                &two_carriers(false)?,
+                &two_carriers(false, None)?,
                 Some("ForwardPage"),
             ),
         ],
@@ -821,5 +929,81 @@ fn packed_directory_and_deferred_page_have_pdf_parent() -> io::Result<()> {
             doc.page_dict
         ]
     );
+    Ok(())
+}
+
+#[test]
+fn retained_catalog_lifetime_and_cleanup() -> io::Result<()> {
+    use barnacle::objects::{Options, Verdict, scan};
+    use std::cell::Cell;
+    let root = tempfile::tempdir_in("/tmp")?;
+    let missing = root.path().join("absent");
+    let opts = Options {
+        scan_html: false,
+        ..Options::default()
+    };
+    for compressed in [false, true] {
+        let scratch = if compressed { root.path() } else { &missing };
+        let (doc, catalog) = catalog_with_deferred_page(compressed, false, 0)?;
+        let offset = doc
+            .directory
+            .windows(16)
+            .position(|s| s == &catalog[..16])
+            .unwrap();
+        for winner in ["receipt", "catalog", "cancel", "miss"] {
+            let mut source = None;
+            let mut visited = false;
+            let cancel = Cell::new(false);
+            let res = scan(
+                &doc.file,
+                &opts,
+                scratch,
+                |obj, _| {
+                    if obj.normalized {
+                        return Ok(Verdict::Miss);
+                    }
+                    if obj.bytes == doc.directory {
+                        source = Some(obj.bytes.as_ptr() as usize);
+                    } else if obj.bytes == ATTACHMENT {
+                        if winner == "receipt" {
+                            return Ok(Verdict::Found("receipt".into()));
+                        }
+                        cancel.set(winner == "cancel");
+                    } else if obj.bytes == catalog {
+                        visited = true;
+                        assert_eq!(obj.bytes.as_ptr() as usize, source.unwrap() + offset);
+                        if !compressed {
+                            assert!(doc.file.as_ptr_range().contains(&obj.bytes.as_ptr()));
+                        }
+                        if winner == "catalog" {
+                            return Ok(Verdict::Found("catalog".into()));
+                        }
+                    }
+                    Ok(Verdict::Miss)
+                },
+                || {
+                    if cancel.get() {
+                        Err(io::Error::other("physical scan interrupted"))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            match winner {
+                "cancel" => assert_eq!(res.unwrap_err().to_string(), "physical scan interrupted"),
+                "miss" => {
+                    assert!(matches!(res?, Verdict::Miss | Verdict::Incomplete));
+                    assert!(visited);
+                }
+                _ => assert_eq!(res?, Verdict::Found(winner.into())),
+            }
+            assert_eq!(visited, matches!(winner, "catalog" | "miss"));
+            assert!(fs::read_dir(root.path())?.next().is_none());
+            #[cfg(target_os = "linux")]
+            assert!(
+                !fs::read_to_string("/proc/self/maps")?.contains(root.path().to_str().unwrap())
+            );
+        }
+    }
     Ok(())
 }
