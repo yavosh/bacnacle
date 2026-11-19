@@ -98,12 +98,18 @@ fn compare(executable: &Path, stock: bool) -> io::Result<()> {
         .collect();
     let attachment = tnef(true);
     let untitled_attachment = tnef(false);
+    let long_title = "monthly-summary\r\n  office-note ".repeat(800);
+    let inline_note =
+        format!("<html><img title='{long_title}' src='data:text/plain,First%20Letter'/></html>");
     let cases: &[(&[u8], Option<&str>)] = &[
+        (inline_note.as_bytes(), Some("FirstLetter")),
         (&attachment, Some("FirstLetter")),
         (&untitled_attachment, Some("FirstLetter")),
         (b"From: report@example.invalid\nSubject: attachment\nContent-Type: application/ms-tnef; name=winmail.dat\nContent-Transfer-Encoding: base64\n\neJ8+IgMAAhCAAQALAAAAcmVwb3J0LnR4dAAqBAIPgAYABgAAAEZpcnN0ICgCAg+ABgAHAAAATGV0dGVyCnoC\n", Some("FirstLetter")),
         (b"begin 644 note.txt\n-1FER<W0@3&5T=&5R\"@``\n`\nend\n", Some("FirstLetter")),
         (b"<html><img src=\"data:application/octet-stream;base64,QmFybmFjbGUgTWFpbCBGaXh0dXJlCg==\"></html>", Some("MailBody")),
+        (b"<html><img src='data:text/plain,First%20Letter'/><p>Office</p></html>", Some("FirstLetter")),
+        (b"<html><img src=data:text/plain,First%20Letter/><p>Office</p></html>", Some("FirstLetter")),
         (b"<html><a href=\"data:text/plain,First%20Letter\">word</a></html>", Some("FirstLetter")),
         (b"<html><p>HTML LaBeL</p><img src=\"data:text/plain,First%20Letter\"></html>", Some("Markup")),
         (b"ordinary LOUD MARK document", Some("Raw")),

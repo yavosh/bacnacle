@@ -1,6 +1,7 @@
 mod data;
 mod entities;
 mod script;
+mod value;
 use super::{ChildSink, Handling, Target};
 use std::io::{self, BufWriter, Seek, Write};
 use tempfile::SpooledTempFile;
@@ -136,6 +137,10 @@ fn name_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b':' | b'.')
 }
 
+fn attribute_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t'..=b'\x0c')
+}
+
 // Pending high bytes belong to the document's attribute-value parser. They can
 // resume in another tag, independently of intervening prose.
 #[derive(Default)]
@@ -145,12 +150,14 @@ struct AttributeBytes {
 }
 
 // Keep each quoted attribute within its tag and release it as soon as the tag ends.
-fn tag(
-    input: &[u8],
+fn tag<'a>(
+    input: &'a [u8],
     full: &mut View,
     text: &mut View,
     urls: &mut data::DataUrls,
     attr_bytes: &mut AttributeBytes,
+    chunks: &mut value::Blocks<'a>,
+    sink: &mut dyn ChildSink,
 ) -> io::Result<Option<(usize, bool, bool)>> {
     let mut bytes = ws(&input[1..]);
     let close = bytes.starts_with(b"/");
@@ -173,7 +180,14 @@ fn tag(
     bytes = &bytes[len..];
     text.separate()?;
     let mut attach_terminator = false;
+    let mut after_data = false;
+    let mut past_delimiter = false;
+    let mut tag_check = bytes.len().saturating_sub(8192);
     loop {
+        if bytes.len() <= tag_check {
+            sink.check()?;
+            tag_check = bytes.len().saturating_sub(8192);
+        }
         let untrimmed = bytes;
         bytes = ws(bytes);
         if let Some(rest) = bytes.strip_prefix(b">") {
@@ -183,18 +197,27 @@ fn tag(
         if let [end, b'>', rest @ ..] = bytes
             && (*end == b'/' || (*end == b'?' && name.starts_with(b"?")))
         {
-            if !attach_terminator || untrimmed.len() != bytes.len() {
+            if !after_data && (!attach_terminator || untrimmed.len() != bytes.len()) {
                 full.write(b" ")?;
             }
             full.write(&[*end, b'>'])?;
             return Ok(Some((input.len() - rest.len(), false, close)));
         }
-        let len = bytes.iter().take_while(|b| name_byte(**b)).count();
-        if close || len == 0 || input.len() - bytes.len() > 8192 {
+        let len = bytes
+            .iter()
+            .take(8193)
+            .take_while(|&&b| name_byte(b) || (past_delimiter && matches!(b, b'<' | b'/')))
+            .count();
+        if close || len == 0 || len > 8192 {
             return Ok(None);
         }
         let attr = &bytes[..len];
-        full.write(b" ")?;
+        // Stock continues the previous attribute name after an inline data URL.
+        let joined = after_data;
+        after_data = false;
+        if !joined {
+            full.write(b" ")?;
+        }
         for &b in attr {
             full.write(&[b.to_ascii_lowercase()])?;
         }
@@ -212,73 +235,96 @@ fn tag(
         if quoted {
             bytes = &bytes[1..];
         }
-        let is_data = bytes
-            .get(..5)
-            .is_some_and(|b| b.eq_ignore_ascii_case(b"data:"));
-        let max = if is_data { bytes.len() } else { 8193 };
-        let end = bytes.iter().take(max).position(|&b| {
+        let is_data = bytes.starts_with(b"data:");
+        let delimiter = |b| {
             if quoted {
                 b == first
             } else {
-                b.is_ascii_whitespace() || b == b'>'
+                attribute_space(b) || b == b'>'
             }
-        });
+        };
+        // Data URL locations refer to the unchanged source. Its payload is binary.
+        let mut value = chunks.value(bytes, sink)?;
+        let end = if is_data {
+            let mut end = None;
+            for (i, block) in bytes.chunks(8192).enumerate() {
+                if i != 0 {
+                    sink.check()?;
+                }
+                if let Some(n) = block.iter().position(|&b| delimiter(b)) {
+                    end = Some(i * 8192 + n);
+                    break;
+                }
+            }
+            end
+        } else {
+            value.length(delimiter, sink)?
+        };
         let Some(end) = end else { return Ok(None) };
-        let mut val = &bytes[..end];
+        value.limit(end);
         bytes = &bytes[end + usize::from(quoted)..];
-        let url = (name.eq_ignore_ascii_case(b"a") && attr.eq_ignore_ascii_case(b"href"))
-            || (name.eq_ignore_ascii_case(b"img") && attr.eq_ignore_ascii_case(b"src"));
+        let url = !joined
+            && ((name.eq_ignore_ascii_case(b"a") && attr.eq_ignore_ascii_case(b"href"))
+                || (name.eq_ignore_ascii_case(b"img") && attr.eq_ignore_ascii_case(b"src")));
         if is_data {
             if attr_bytes.len != 0 {
                 return Ok(None);
             }
-            attach_terminator = false;
-            urls.push(bytes.len() + usize::from(quoted), val.len())?;
+            after_data = true;
+            urls.push(bytes.len() + usize::from(quoted), end)?;
             full.write(if quoted { b"=\"data\"" } else { b"=data" })?;
+            if !quoted {
+                // An unquoted data URL also consumes its delimiter.
+                past_delimiter |= bytes[0] == b'>';
+                bytes = &bytes[1..];
+            }
             continue;
         }
         full.write(if quoted { b"=\"" } else { b"=" })?;
         let mut url = url.then(|| Url::new(quoted));
+        if value.split_data(sink)? {
+            // The data handler needs the scheme's original byte offsets.
+            return Ok(None);
+        }
         // Attribute values retain up to three high bytes until another ordinary
         // byte arrives. A reference can emit its spelling ahead of this group.
         let mut spaces = 0u8;
-        while let Some((&b, rest)) = val.split_first() {
-            if b == b'&' {
-                let Some((reference, used)) = entities::parse(val) else {
+        let mut whitespace = false;
+        while let Some(b) = value.next(sink)? {
+            if attribute_space(b) {
+                if whitespace {
+                    continue;
+                }
+                whitespace = true;
+                let markup = if spaces == 0 && b != b'\n' { b } else { b' ' };
+                full.write(&[markup])?;
+                if spaces < 2
+                    && let Some(url) = &mut url
+                {
+                    url.push(&[if spaces == 0 { b' ' } else { 0 }]);
+                }
+                spaces = (spaces + 1).min(2);
+                continue;
+            }
+            whitespace = false;
+            // After the second run the URL ends. Stock copies subsequent text,
+            // including character reference spellings, into the markup.
+            if spaces == 2 {
+                if b.is_ascii_control() || matches!(b, b'<' | b'>' | b'\'' | b'"') {
                     return Ok(None);
-                };
-                reference.write(full, url.as_mut())?;
-                val = &val[used..];
+                }
+                full.write(&[b.to_ascii_lowercase()])?;
+                continue;
+            }
+            if b == b'&' {
+                if !value.reference(full, url.as_mut(), sink)? {
+                    return Ok(None);
+                }
                 continue;
             }
             if !b.is_ascii() && attr_bytes.len < attr_bytes.pending.len() {
                 attr_bytes.pending[attr_bytes.len] = b;
                 attr_bytes.len += 1;
-                val = rest;
-                continue;
-            }
-            if b == b' ' {
-                full.write(b" ")?;
-                if let Some(url) = &mut url {
-                    url.push(&[if spaces > 0 { 0 } else { b' ' }]);
-                }
-                spaces = spaces.saturating_add(1);
-                val = &rest[rest.iter().take_while(|&&c| c == b' ').count()..];
-                if spaces == 2 {
-                    // The URL ends at this run. Stock reads the remaining bytes as
-                    // ordinary tag text, including ampersands and multibyte bytes.
-                    while let Some((&b, rest)) = val.split_first() {
-                        if b.is_ascii_control() || matches!(b, b'<' | b'>' | b'\'' | b'"') {
-                            return Ok(None);
-                        }
-                        full.write(&[b.to_ascii_lowercase()])?;
-                        val = if b == b' ' {
-                            &rest[rest.iter().take_while(|&&c| c == b' ').count()..]
-                        } else {
-                            rest
-                        };
-                    }
-                }
                 continue;
             }
             if attr_bytes.len != 0 {
@@ -293,6 +339,7 @@ fn tag(
                 }
                 attr_bytes.len = 0;
                 if !b.is_ascii() {
+                    value.repeat_byte();
                     continue;
                 }
             }
@@ -303,15 +350,19 @@ fn tag(
             if let Some(url) = &mut url {
                 url.push(&[b]);
             }
-            val = rest;
         }
-        // A literal space in a quoted value makes a directly following terminator
+        *chunks = value.blocks;
+        // Literal whitespace in a quoted value makes a directly following terminator
         // part of the same token. An entity that decodes to a space does not.
         attach_terminator = spaces > 0;
         if quoted {
             full.write(&[if spaces >= 2 { first } else { b'"' }])?;
         }
-        if let Some(url) = url {
+        if let Some(mut url) = url {
+            if spaces == 1 && bytes.starts_with(b"/>") {
+                // The slash follows the closing quote in the URL token.
+                url.push(b"\"");
+            }
             url.submit(quoted, text)?;
         }
     }
@@ -328,6 +379,7 @@ pub(super) fn extract(
     bytes: &[u8],
     sink: &mut dyn ChildSink,
     input_size: usize,
+    trim_blocks: bool,
 ) -> io::Result<Handling> {
     let (max_html, max_notags, _) = sink.text_limits();
     if input_size as u64 > max_html {
@@ -341,6 +393,7 @@ pub(super) fn extract(
     let mut javascript = View::new(sink);
     let mut urls = data::DataUrls::new(bytes.len(), sink);
     let mut attr_bytes = AttributeBytes::default();
+    let mut chunks = value::Blocks::new(bytes, trim_blocks);
     let mut script_start = None;
     let mut unknown_script = false;
     let mut pos = 0;
@@ -388,8 +441,15 @@ pub(super) fn extract(
                 pos += end + terminator.len();
                 text.separate()?;
             } else {
-                let Some((used, is_script, close)) =
-                    tag(tail, &mut full, &mut text, &mut urls, &mut attr_bytes)?
+                let Some((used, is_script, close)) = tag(
+                    tail,
+                    &mut full,
+                    &mut text,
+                    &mut urls,
+                    &mut attr_bytes,
+                    &mut chunks,
+                    sink,
+                )?
                 else {
                     return Ok(Handling::Incomplete);
                 };

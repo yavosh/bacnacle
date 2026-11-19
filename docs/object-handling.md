@@ -104,6 +104,9 @@ The markup view preserves unknown names in lowercase. The text view omits refere
 URL comparisons cover literal ampersands, escaped separators, mixed-case query values, accented characters, and the 1,024-byte capture limit.
 After a second space run, stock truncates the captured URL and retains subsequent reference spellings in markup.
 Pending multibyte text can resume in the next attribute, even across tags.
+
+Long attribute values span 8,191-byte input blocks. Tests compare both normalized views when whitespace or a reference crosses a block boundary.
+Barnacle reads these values from the input and keeps the 1,024-byte URL capture limit.
 Certain combinations of literal controls and tag delimiters in quoted attributes remain incomplete. Entity coverage outside the WHATWG list remains unverified.
 [HTML character reference comparisons](../tests/object_html_entities.rs)
 
@@ -171,9 +174,10 @@ It returns incomplete coverage for unsupported declarations or elements with mor
 Stock's XML reader pushes 512-byte input blocks. The final block can contain a conversion error after a matching attachment.
 Both scanners preserved the same result across 4,980 such Windows-1252, ASCII, and CP932 controls.
 A further 6,640 controls placed UTF-8 errors, undefined entities, invalid references, and control characters around block boundaries.
-Barnacle withheld 514 attachment matches from stock and produced no extra matches across the 11,620 controls.
-In one reproducible Workbook, the attachment starts at byte 430 and an invalid character reference starts at byte 515.
-Stock detects that attachment. Barnacle returns incomplete coverage. Stock can also detect the raw document hash after a metadata error.
+Barnacle withheld 254 stock attachment matches and produced no extra matches across the 11,620 controls.
+In a Windows-1252 Workbook, the attachment starts at byte 430 and an invalid character reference starts at byte 515.
+Both daemons detect the attachment before the whole-document signature. The ampersand ends one input block, and the reference continues in the next.
+Stock can also detect the raw document hash after an earlier metadata error.
 Barnacle returns incomplete coverage when the earlier matching stage remains uncertain. [Rust controls](../tests/object_xml.rs) · [Pinned libxml2 reader](https://github.com/GNOME/libxml2/blob/v2.9.14/xmlreader.c)
 
 Barnacle reuses ASCII-compatible input when its bytes need no conversion.

@@ -743,14 +743,20 @@ fn malformed_legacy_xml(stock: bool) -> io::Result<()> {
             cases.push((doc, expected));
         }
     }
-    let near_edge = read_ahead_sample("Windows-1252", 430, 515, b"&#0;", 0);
+    // These references begin in the last byte of a parser input block.
+    // The earlier attachment competes with the whole-document rule below.
+    for (start, error_at, tail) in [(430, 515, 0), (900, 1027, 600)] {
+        for reference in [b"&#0;".as_slice(), b"&nbsp;"] {
+            let doc = read_ahead_sample("Windows-1252", start, error_at, reference, tail);
+            cases.push((doc, Some("First")));
+        }
+    }
     let invalid_before_child = legacy_doc(
         EXCEL,
         "Windows-1252",
         format!("<Note>&nbsp;</Note>{child}").as_bytes(),
     );
-    let mut rules =
-        hash(FIRST, "First") + &hash(&near_edge, "Outer") + &hash(&invalid_before_child, "Outer");
+    let mut rules = hash(FIRST, "First") + &hash(&invalid_before_child, "Outer");
     for (doc, expected) in &cases {
         if expected.is_some() {
             rules.push_str(&hash(doc, "Outer"));
@@ -760,11 +766,6 @@ fn malformed_legacy_xml(stock: bool) -> io::Result<()> {
     for (index, (doc, expected)) in cases.iter().enumerate() {
         server.check(&format!("malformed XML read-ahead {index}"), doc, *expected)?;
     }
-    server.check(
-        "closely spaced attachment and invalid character reference",
-        &near_edge,
-        stock.then_some("First"),
-    )?;
     server.check(
         "raw hash after unsupported XML metadata",
         &invalid_before_child,

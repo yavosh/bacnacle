@@ -1,6 +1,8 @@
 //! Exact hashes of both HTML views, observed with Debian clamd 1.4.3.
 #[path = "../examples/compat_oracle/daemon.rs"]
 mod daemon;
+#[path = "common/zip.rs"]
+mod zip;
 use std::{fs, io, path::Path};
 
 struct Case {
@@ -21,6 +23,48 @@ fn digest(bytes: &[u8]) -> io::Result<String> {
 fn cases() -> io::Result<Vec<Case>> {
     let mut cases = Vec::new();
     for (id, page, markup, text) in [
+        (
+            "multiline-image-url",
+            "<html><img src='Desk\nMap'/><a href='/West\tGate' />Office</html>",
+            b"<html><img src=\"desk map\"/><a href=\"/west\tgate\" />office</html>".as_slice(),
+            b" Desk Map\" /West Gate office ".as_slice(),
+        ),
+        (
+            "quoted-data-delimiter",
+            "<html><img alt='data:text/plain,Notice' src='Map'/><img src='Data:text/plain,Office' />Monthly</html>",
+            br#"<html><img alt="data"src="map" /><img src="data:text/plain,office" />monthly</html>"#.as_slice(),
+            b" Data:text/plain,Office monthly ".as_slice(),
+        ),
+        (
+            "unquoted-data-delimiter",
+            "<html><img src=data:text/plain,Desk/><a href='/Map'>Route</a><img src=data:text/plain,Hall />West</html>",
+            b"<html><img src=data<a href=\"/map\">route</a><img src=data/>west</html>".as_slice(),
+            b" route west ".as_slice(),
+        ),
+        (
+            "tab-and-line-break",
+            "<html><img alt='Red\tBlue\nGreen'/><a href='/Red\tBlue\nGreen'>Report</a></html>",
+            b"<html><img alt=\"red\tblue green'/><a href=\"/red\tblue green'>report</a></html>".as_slice(),
+            b" /Red Blu report ".as_slice(),
+        ),
+        (
+            "carriage-return",
+            "<html><img alt='North\rRoad\tEast'/><a href='/North\rRoad\tEast'>Report</a></html>",
+            b"<html><img alt=\"northroad\teast\"/><a href=\"/northroad\teast\">report</a></html>".as_slice(),
+            b" /NorthRoad East report ".as_slice(),
+        ),
+        (
+            "multiline-title",
+            "<html><img alt='Paris\r\n  Lyon'/><a href='/Paris\r\n  Lyon'>Report</a></html>",
+            b"<html><img alt=\"paris lyon\"/><a href=\"/paris lyon\">report</a></html>".as_slice(),
+            b" /Paris Lyon report ".as_slice(),
+        ),
+        (
+            "inline-text",
+            "<html><img alt='data:text/plain,Inventory'/><a href='/data:text/plain,Inventory'>Report</a></html>",
+            br#"<html><img alt="data"/><a href="/data:text/plain,inventory">report</a></html>"#.as_slice(),
+            b" /data:text/plain,Inventory report ".as_slice(),
+        ),
         (
             "tag-endings",
             "<?sheet value?><?sheet value ?><?sheet val=a?><?sheet val='a'?><?sheet flag other?><table><input disabled/><input disabled /><input disabled='x'/><item name=value/><item name=value /><br/><br />Inventory</table>",
@@ -190,6 +234,60 @@ fn cases() -> io::Result<Vec<Case>> {
             text: digest(text.as_bytes())?,
         });
     }
+    for len in [8191, 8192, 8193] {
+        let value = format!("/{}\nGate", "R".repeat(len - 6));
+        let page = format!("<html><a href=\"{value}\">Ticket {len}</a></html>");
+        let markup = page.to_ascii_lowercase().replace('\n', " ");
+        let text = format!(" {} ticket {len} ", &value[..1022]);
+        cases.push(Case {
+            id: format!("route{len}"),
+            page,
+            markup: digest(markup.as_bytes())?,
+            text: digest(text.as_bytes())?,
+        });
+    }
+    let split = "\r".repeat(19_000);
+    for (id, reference, markup, text) in [
+        (
+            "splitNamed",
+            format!("&am{split}p;"),
+            "a4a409f48dbc4a5f275e0de1369a7485:61",
+            "25cad57f9ff192dda55e37889079a3b5:21",
+        ),
+        (
+            "splitNumeric",
+            format!("&#x3{split}bb;"),
+            "ac69038ba2a628b7069c151396806164:68",
+            "32db0989391cab2e0c66ab50e8e5dba6:21",
+        ),
+    ] {
+        cases.push(Case {
+            id: id.into(),
+            page: format!(
+                "<html><a href=\"Account {reference}Due\" title='Office'>Review</a></html>"
+            ),
+            markup: markup.into(),
+            text: text.into(),
+        });
+    }
+    // This placement drops one space at the start of a reference input block.
+    let path_list = "list-a list-b\r\n data-section ".repeat(1000);
+    cases.push(Case {
+        id: "blockSpace".into(),
+        page: format!("<html><a href=\"{path_list}\" title='Office'>Review</a></html>"),
+        markup: "68977dfa4b8a228fa0c9b5f962a4e49b:27048".into(),
+        text: "318a09841e6c1e33b122bff4dc00f721:21".into(),
+    });
+    // Pinned stock hashes for a multiline ledger style list and its visible label.
+    let classes = "section-Accounts\r\n  item-current\titem-review &amp; status-Due ".repeat(800);
+    cases.push(Case {
+        id: "ledger".into(),
+        page: format!(
+            "<html><table class=\"{classes}\" id='Ledger'><tr><td>Ledger</td></tr></table></html>"
+        ),
+        markup: "2f7b99ed342313b014dc1dcba1a6b345:47273".into(),
+        text: "0c44d736017dd92c086648dae6a58ae5:8".into(),
+    });
     Ok(cases)
 }
 
@@ -198,8 +296,19 @@ fn compare(exe: &Path) -> io::Result<()> {
     let db = root.path().join("db");
     fs::create_dir(&db)?;
     let cases = cases()?;
+    let ledger = cases.iter().find(|case| case.id == "ledger").unwrap();
+    let archive = zip::zip(
+        &[("ledger.html", ledger.page.as_bytes())],
+        true,
+        false,
+        false,
+    )?;
     for markup in [true, false] {
-        let mut rules = String::new();
+        let mut rules = format!(
+            "{}:Page.Zip\n{}:Page.Original\n",
+            digest(&archive)?,
+            digest(ledger.page.as_bytes())?
+        );
         for case in &cases {
             rules.push_str(&format!("{}:Page.{}.Text\n", case.text, case.id));
             if markup {
@@ -229,6 +338,12 @@ fn compare(exe: &Path) -> io::Result<()> {
                 case.page
             );
         }
+        let response = daemon::unix_request(&socket, &daemon::stream_frame(&archive)?)?;
+        let kind = if markup { "Markup" } else { "Text" };
+        assert_eq!(
+            response,
+            format!("stream: Page.ledger.{kind}.UNOFFICIAL FOUND\0")
+        );
     }
     Ok(())
 }
@@ -242,4 +357,70 @@ fn html_entities() -> io::Result<()> {
 #[ignore = "requires pinned Debian clamd"]
 fn stock_html_entities() -> io::Result<()> {
     compare(Path::new("/usr/sbin/clamd"))
+}
+
+#[test]
+fn large_inline_attribute_checks_cancel_before_submitting_views() -> io::Result<()> {
+    use barnacle::objects::{Options, Verdict, scan};
+    let page = format!(
+        "<html><img src='data:text/plain,{}'/></html>",
+        "A".repeat(512 * 1024)
+    );
+    let long_title = format!(
+        "<html><img title='{}'/></html>",
+        "Monthly\r\n  notice ".repeat(32 * 1024)
+    );
+    let dir = tempfile::tempdir()?;
+    for page in [&page, &long_title] {
+        let mut checks = 0;
+        let mut seen = false;
+        let result = scan(
+            page.as_bytes(),
+            &Options::default(),
+            dir.path(),
+            |_, _| {
+                seen = true;
+                Ok(Verdict::Miss)
+            },
+            || {
+                checks += 1;
+                if checks == 24 {
+                    Err(io::ErrorKind::Interrupted.into())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert!(!seen);
+    }
+    Ok(())
+}
+
+#[test]
+fn excluded_long_attribute_does_not_create_scratch_files() -> io::Result<()> {
+    use barnacle::objects::{Options, Verdict, scan};
+    let page = format!(
+        "<html><p class='{}'>Office</p></html>",
+        "list-a list-b\r\n data-section ".repeat(5000)
+    );
+    let dir = tempfile::tempdir()?;
+    let absent = dir.path().join("absent");
+    let options = Options {
+        max_files: 1,
+        alert_exceeds_max: true,
+        ..Options::default()
+    };
+    let verdict = scan(
+        page.as_bytes(),
+        &options,
+        &absent,
+        |_, _| Ok(Verdict::Miss),
+        || Ok(()),
+    )?;
+    assert_eq!(
+        verdict,
+        Verdict::Found("Heuristics.Limits.Exceeded.MaxFiles".into())
+    );
+    Ok(())
 }

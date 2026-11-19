@@ -92,7 +92,7 @@ pub(super) fn before_raw(
         Parser::Uuencoded => attachments::uu(bytes, sink),
         Parser::Utf16Html => sink.utf16_html(bytes),
         Parser::Html { big_endian: true } => unicode_html(bytes, false, sink),
-        Parser::Html { big_endian: false } => html::extract(bytes, sink, bytes.len()),
+        Parser::Html { big_endian: false } => html::extract(bytes, sink, bytes.len(), true),
         Parser::Mail => mail::extract(bytes, sink),
         _ => Ok(Handling::Unrecognized),
     }
@@ -149,7 +149,7 @@ pub(super) fn unicode_html(
         buffer.retain(|b| *b != b'\r');
         spool.write_all(buffer.trim_ascii_start())?;
     }
-    spool.with_bytes(|data| html::extract(data, sink, size))
+    spool.with_bytes(|data| html::extract(data, sink, size, false))
 }
 
 struct NormalizedText<'a> {

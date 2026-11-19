@@ -99,7 +99,8 @@ impl Format {
             }
             let (event, error) = match xml.read_event() {
                 Ok(event) => {
-                    let error = lexical_error(&event, sink)?.map(|offset| at + offset);
+                    let in_element = !levels.is_empty() || ignored != 0;
+                    let error = lexical_error(&event, in_element, sink)?.map(|offset| at + offset);
                     (event, error)
                 }
                 Err(quick_xml::Error::Encoding(quick_xml::encoding::EncodingError::Utf8(
@@ -264,7 +265,11 @@ struct PendingText {
     range: Range<usize>,
 }
 
-fn lexical_error(event: &Event<'_>, sink: &mut dyn ChildSink) -> io::Result<Option<usize>> {
+fn lexical_error(
+    event: &Event<'_>,
+    in_element: bool,
+    sink: &mut dyn ChildSink,
+) -> io::Result<Option<usize>> {
     // quick-xml checks UTF-8 and tag matching. XML 1.0 further restricts text characters
     // and the five predefined entities, including content outside an attachment.
     let text: &str = event;
@@ -285,7 +290,11 @@ fn lexical_error(event: &Event<'_>, sink: &mut dyn ChildSink) -> io::Result<Opti
         return Ok(Some(pos));
     }
     match event {
-        Event::GeneralRef(reference) if entity(reference).is_none() => return Ok(Some(0)),
+        // In element text an ampersand can start a valid reference. The parser
+        // must read the following byte before rejecting it, possibly in a new block.
+        Event::GeneralRef(reference) if entity(reference).is_none() => {
+            return Ok(Some(usize::from(in_element)));
+        }
         Event::Start(element) | Event::Empty(element) => {
             for (index, attribute) in element.attributes().enumerate() {
                 if index == MAX_ATTRIBUTES {
