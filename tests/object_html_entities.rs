@@ -22,6 +22,24 @@ fn cases() -> io::Result<Vec<Case>> {
     let mut cases = Vec::new();
     for (id, page, markup, text) in [
         (
+            "tag-endings",
+            "<?sheet value?><?sheet value ?><?sheet val=a?><?sheet val='a'?><?sheet flag other?><table><input disabled/><input disabled /><input disabled='x'/><item name=value/><item name=value /><br/><br />Inventory</table>",
+            br#"<?sheet value?><?sheet value ?><?sheet val=a?><?sheet val="a" ?><?sheet flag other?><table><input disabled/><input disabled /><input disabled="x" /><item name=value/><item name=value /><br/><br />inventory</table>"#.as_slice(),
+            b" inventory ".as_slice(),
+        ),
+        (
+            "spaced-attribute-endings",
+            r#"<html><img alt='Two words'/><img alt='Deux mots ici'/><img alt="Deux mots ici" /><img alt='A&#32;B'/><?paper alt='Print this'?><?paper alt='Print this' ?>Report</html>"#,
+            br#"<html><img alt="two words"/><img alt="deux mots ici'/><img alt="deux mots ici" /><img alt="a b" /><?paper alt="print this"?><?paper alt="print this" ?>report</html>"#.as_slice(),
+            b" report ".as_slice(),
+        ),
+        (
+            "office-paths",
+            r#"<?xml version="1.0"?><table><row path='xl/workbook.xml' format='Word.Document' alt='HWPML report'/>Documents</table>"#,
+            br#"<?xml version="1.0" ?><table><row path="xl/workbook.xml" format="word.document" alt="hwpml report"/>documents</table>"#.as_slice(),
+            b" documents ".as_slice(),
+        ),
+        (
             "press",
             "<html><p>Research & Development & Publications.</p></html>",
             b"<html><p>research & development & publications.</p></html>".as_slice(),

@@ -172,14 +172,21 @@ fn tag(
     }
     bytes = &bytes[len..];
     text.separate()?;
+    let mut attach_terminator = false;
     loop {
+        let untrimmed = bytes;
         bytes = ws(bytes);
         if let Some(rest) = bytes.strip_prefix(b">") {
             full.write(b">")?;
             return Ok(Some((input.len() - rest.len(), script, close)));
         }
-        if let Some(rest) = bytes.strip_prefix(b"/>") {
-            full.write(b"/>")?;
+        if let [end, b'>', rest @ ..] = bytes
+            && (*end == b'/' || (*end == b'?' && name.starts_with(b"?")))
+        {
+            if !attach_terminator || untrimmed.len() != bytes.len() {
+                full.write(b" ")?;
+            }
+            full.write(&[*end, b'>'])?;
             return Ok(Some((input.len() - rest.len(), false, close)));
         }
         let len = bytes.iter().take_while(|b| name_byte(**b)).count();
@@ -191,11 +198,13 @@ fn tag(
         for &b in attr {
             full.write(&[b.to_ascii_lowercase()])?;
         }
-        bytes = ws(&bytes[len..]);
-        if !bytes.starts_with(b"=") {
+        bytes = &bytes[len..];
+        let after_name = ws(bytes);
+        if !after_name.starts_with(b"=") {
+            attach_terminator = true;
             continue;
         }
-        bytes = ws(&bytes[1..]);
+        bytes = ws(&after_name[1..]);
         let Some(&first) = bytes.first() else {
             return Ok(None);
         };
@@ -223,6 +232,7 @@ fn tag(
             if attr_bytes.len != 0 {
                 return Ok(None);
             }
+            attach_terminator = false;
             urls.push(bytes.len() + usize::from(quoted), val.len())?;
             full.write(if quoted { b"=\"data\"" } else { b"=data" })?;
             continue;
@@ -295,6 +305,9 @@ fn tag(
             }
             val = rest;
         }
+        // A literal space in a quoted value makes a directly following terminator
+        // part of the same token. An entity that decodes to a space does not.
+        attach_terminator = spaces > 0;
         if quoted {
             full.write(&[if spaces >= 2 { first } else { b'"' }])?;
         }

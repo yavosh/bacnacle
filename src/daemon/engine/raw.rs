@@ -138,8 +138,8 @@ pub(super) fn eligible(header: &[u8], file_type: &str) -> bool {
     {
         return false;
     }
-    // The classifier already checked HTML and mail in a printable text header.
-    // Office XML and XDP can select separate document parsers.
+    // The classifier already checked HTML, mail and legacy Office XML.
+    // OOXML member names and namespaces do not identify a legacy document.
     let generic_xml = file_type == "CL_TYPE_TEXT_ASCII"
         && header.starts_with(b"<")
         && header
@@ -148,16 +148,9 @@ pub(super) fn eligible(header: &[u8], file_type: &str) -> bool {
         && std::str::from_utf8(header)
             .err()
             .is_none_or(|e| e.error_len().is_none())
-        && ![
-            b"<%".as_slice(),
-            b"workbook",
-            b"worddocument",
-            b"word.document",
-            b"hwpml",
-            b"<xdp:",
-        ]
-        .iter()
-        .any(|m| header.windows(m.len()).any(|s| s.eq_ignore_ascii_case(m)));
+        && ![b"<%".as_slice(), b"<xdp:"]
+            .iter()
+            .any(|m| header.windows(m.len()).any(|s| s.eq_ignore_ascii_case(m)));
     if !generic_xml
         && header.iter().enumerate().any(|(i, &byte)| {
             byte == b'<'
@@ -241,11 +234,11 @@ mod tests {
         let document = b"<?xml version=\"1.0\"?><report><price>30</price></report>";
         assert!(eligible(document, "CL_TYPE_TEXT_ASCII"));
         assert!(!eligible(document, "CL_TYPE_HTML"));
-        for header in [
-            b"<?xml version=\"1.0\"?><Workbook/>".as_slice(),
-            b"<xdp:xdp/>",
-            b"<% directive %>",
-        ] {
+        assert!(!eligible(
+            b"<?xml version=\"1.0\"?><Workbook/>",
+            "CL_TYPE_XML_XL"
+        ));
+        for header in [b"<xdp:xdp/>".as_slice(), b"<% directive %>"] {
             assert!(!eligible(header, "CL_TYPE_TEXT_ASCII"));
         }
     }

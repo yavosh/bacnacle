@@ -126,8 +126,49 @@ fn compare(stock: bool) -> io::Result<()> {
         ),
         0,
     );
-    let hashes = files.clone() + &hash(&word, "Word") + &hash(&excel, "Excel") + &hash(&hwp, "Hwp");
+    let mut hashes =
+        files.clone() + &hash(&word, "Word") + &hash(&excel, "Excel") + &hash(&hwp, "Hwp");
+    // Ordinary XML can refer to these formats without selecting their attachment handler.
+    // A competing decoded attachment hash makes an incorrect classification observable.
+    let mut ordinary = Vec::new();
+    let version = r#"version="1.0""#;
+    for (name, declaration, tag) in [
+        ("WorkbookLower", version, "workbook"),
+        ("WorkbookUpper", version, "WORKBOOK"),
+        ("SingleQuote", "version='1.0'", "Workbook"),
+        ("LongPrefix", version, "ss:Workbook xmlns:ss='urn:billing'"),
+        ("WorkbookValue", version, "catalog ref='urn:Workbook'"),
+        (
+            "WorkbookPath",
+            version,
+            "catalog src='xl/workbook.xml' workbookViewId='2'",
+        ),
+        ("WordValue", version, "catalog format='Word.Document'"),
+        (
+            "WordPath",
+            version,
+            "catalog src='documents/wordDocument.xml'",
+        ),
+        (
+            "HwpPath",
+            version,
+            "catalog src='documents/HWPML/receipt.xml'",
+        ),
+    ] {
+        let root = tag.split_ascii_whitespace().next().unwrap();
+        let body = format!("<?xml {declaration}?><{tag}><binData>{A}\n</binData></{root}>");
+        hashes += &hash(body.as_bytes(), name);
+        ordinary.push((name, body));
+    }
+    let note = format!(
+        r#"<?xml version="1.0"?><report><note>Export Word.Document or HWPML</note><binData>{A}&#10;</binData></report>"#
+    );
+    hashes += &hash(note.as_bytes(), "OfficeNamesInText");
+    ordinary.push(("OfficeNamesInText", note));
     let daemon = Server::start(stock, "", &hashes, "")?;
+    for (name, body) in ordinary {
+        daemon.check(name, body.as_bytes(), Some(name))?;
+    }
     daemon.check("Word child before document", &word, Some("First"))?;
     daemon.check("Excel reversed children", &excel, Some("Second"))?;
     daemon.check("HWP base64", &hwp, Some("First"))?;
