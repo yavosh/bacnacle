@@ -22,14 +22,8 @@ pub(super) fn contents(bytes: &[u8], kind: &str, sink: &mut dyn ChildSink) -> io
     }
 }
 
-pub(super) fn extract(
-    bytes: &[u8],
-    carrier: &str,
-    offsets: std::ops::Range<usize>,
-    count: &mut usize,
-    sink: &mut dyn ChildSink,
-) -> io::Result<Handling> {
-    if matches!(
+pub(super) fn enabled(carrier: &str) -> bool {
+    !matches!(
         carrier,
         "CL_TYPE_GZ"
             | "CL_TYPE_CPIO_OLD"
@@ -37,9 +31,16 @@ pub(super) fn extract(
             | "CL_TYPE_OLD_TAR"
             | "CL_TYPE_POSIX_TAR"
             | "CL_TYPE_PART_ANY"
-    ) {
-        return Ok(Handling::Unrecognized);
-    }
+    )
+}
+
+pub(super) fn extract(
+    bytes: &[u8],
+    carrier: &str,
+    offsets: std::ops::Range<usize>,
+    count: &mut usize,
+    sink: &mut dyn ChildSink,
+) -> io::Result<Handling> {
     let mut result = Handling::Unrecognized;
     let max_files = sink.max_files();
     let mut start = offsets.start;

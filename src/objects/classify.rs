@@ -1,6 +1,7 @@
 use super::udf;
 use super::{
-    ChildSink, Handling, Options, archive, iso, office, ole, onenote, pdf, rtf, swf, text,
+    ChildSink, Handling, InputKind, Options, archive, iso, office, ole, onenote, pdf, rtf, swf,
+    text,
 };
 use crate::body::{ObjectContext, Target};
 use std::io;
@@ -21,6 +22,8 @@ pub(super) enum Parser {
     Image,
     Iso(iso::Layout),
     Udf,
+    Partition,
+    HfsPlus,
     Text,
     None,
 }
@@ -40,13 +43,19 @@ pub(super) fn ignored(bytes: &[u8]) -> bool {
 }
 
 impl FileType {
-    pub fn classify(
-        bytes: &[u8],
-        target: Option<Target>,
-        sink: &mut dyn ChildSink,
-    ) -> io::Result<Self> {
-        if let Some(target) = target {
-            return Ok(Self::typed(bytes, target, Parser::None));
+    pub fn classify(bytes: &[u8], kind: InputKind, sink: &mut dyn ChildSink) -> io::Result<Self> {
+        match kind {
+            InputKind::Normalized(target) => return Ok(Self::typed(bytes, target, Parser::None)),
+            InputKind::Partition => {
+                let (name, parser) = match bytes.get(1024..1028) {
+                    Some(b"H+\x00\x04" | b"HX\x00\x05") => {
+                        ("CL_TYPE_PART_HFSPLUS", Parser::HfsPlus)
+                    }
+                    _ => ("CL_TYPE_PART_ANY", Parser::Partition),
+                };
+                return Ok(Self::generic(bytes, name, parser));
+            }
+            InputKind::File => {}
         }
         if let Some(layout) = iso::Layout::recognize(bytes) {
             return Ok(Self::generic(
@@ -149,11 +158,36 @@ impl FileType {
     }
 }
 
-impl Parser {
-    pub fn disk_descriptor(self) -> Option<(usize, &'static str)> {
+#[derive(Clone, Copy)]
+pub(super) enum Disk {
+    Iso(iso::Layout),
+    Udf,
+    Dmg,
+}
+
+impl Disk {
+    pub fn name(self) -> &'static str {
         match self {
-            Self::Iso(layout) => Some((layout.descriptor_offset(), "CL_TYPE_ISO9660")),
-            Self::Udf => Some((udf::RECOGNITION, "CL_TYPE_UDF")),
+            Self::Iso(_) => "CL_TYPE_ISO9660",
+            Self::Udf => "CL_TYPE_UDF",
+            Self::Dmg => "CL_TYPE_DMG",
+        }
+    }
+
+    pub fn extract(self, bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handling> {
+        match self {
+            Self::Iso(layout) => iso::extract(bytes, layout, sink),
+            Self::Udf => udf::extract(bytes, sink),
+            Self::Dmg => super::dmg::extract(bytes, sink),
+        }
+    }
+}
+
+impl Parser {
+    pub fn disk_descriptor(self) -> Option<(usize, Disk)> {
+        match self {
+            Self::Iso(layout) => Some((layout.descriptor_offset(), Disk::Iso(layout))),
+            Self::Udf => Some((udf::RECOGNITION, Disk::Udf)),
             _ => None,
         }
     }
@@ -166,6 +200,7 @@ impl Parser {
     ) -> io::Result<Handling> {
         match self {
             Self::Archive if options.scan_archive => archive::extract(bytes, sink),
+            Self::HfsPlus if options.scan_archive => super::hfs::extract(bytes, sink),
             Self::Rtf if options.scan_archive => rtf::extract(bytes, sink),
             Self::Ole2 if options.scan_ole2 => ole::extract(bytes, sink),
             Self::Swf if options.scan_swf => swf::extract(bytes, sink),
@@ -187,6 +222,8 @@ impl Parser {
             | Self::Image
             | Self::Iso(_)
             | Self::Udf
+            | Self::Partition
+            | Self::HfsPlus
             | Self::Mail
             | Self::Tnef
             | Self::Html
@@ -204,8 +241,6 @@ impl Parser {
     ) -> io::Result<Handling> {
         match self {
             Self::Pdf if options.scan_pdf => pdf::extract(bytes, sink),
-            Self::Iso(layout) if options.scan_archive => iso::extract(bytes, layout, sink),
-            Self::Udf if options.scan_archive => udf::extract(bytes, sink),
             Self::Text if options.scan_html => text::after_raw(bytes, sink),
             _ => Ok(Handling::Unrecognized),
         }

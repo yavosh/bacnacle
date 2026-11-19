@@ -131,7 +131,6 @@ pub(super) fn eligible(header: &[u8], file_type: &str) -> bool {
         b"Delivere",
         b"/RGB",
         b"\x19\x04\x00\x10",
-        b"koly",
     ];
     if MARKERS
         .iter()
@@ -151,7 +150,6 @@ pub(super) fn eligible(header: &[u8], file_type: &str) -> bool {
             .is_none_or(|e| e.error_len().is_none())
         && ![
             b"<%".as_slice(),
-            b"<!",
             b"workbook",
             b"worddocument",
             b"word.document",
@@ -174,8 +172,6 @@ pub(super) fn eligible(header: &[u8], file_type: &str) -> bool {
                         b"script",
                         b"table",
                         b"%",
-                        b"?",
-                        b"!",
                         b"xdp:",
                     ]
                     .iter()
@@ -188,6 +184,15 @@ pub(super) fn eligible(header: &[u8], file_type: &str) -> bool {
                     })
                 })
         })
+    {
+        return false;
+    }
+    // Office document markers require an XML declaration at the beginning.
+    // An ordinary plist can occur inside a disk image's binary header.
+    if !generic_xml
+        && (header.starts_with(b"<?")
+            || header.starts_with(b"<\0?")
+            || header.starts_with(b"\0<\0?"))
     {
         return false;
     }

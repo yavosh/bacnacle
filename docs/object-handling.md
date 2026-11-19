@@ -43,6 +43,36 @@ Document names come from the winning signature. [End-to-end fixtures](../tests/o
 | Policies and truncated input | Parser disabled, recursion and expanded-size alerts, a missing final trailer, and a truncated stream. |
 | Additional PDF stages | Encryption, compressed object streams, JavaScript actions and other stream filters require further comparisons. |
 
+### Apple disk images
+
+Stock scans the raw DMG, then its XML catalog, then each partition listed in the catalog.
+An outer hash wins over a catalog hash. A catalog hash wins over a partition hash.
+Stock preserves catalog order across partitions. Within a partition, it sorts stripes by starting sector.
+The reconstructed partition has no filename and has `CL_TYPE_DMG` as its parent. [DMG comparisons](../tests/object_dmg.rs)
+
+Four read-only images from Apple `hdiutil` reproduce the same harmless partition.
+They cover stored data (UDRO), ADC (UDCO), zlib (UDZO), and bzip2 (UDBZ).
+Rust fixtures cover zero-filled stripes, sparse-only partitions, multiple maps, and a DMG inside ZIP.
+A catalog or projected partition exceeding its size budget stops the pass, including when alerts are disabled.
+Segmented images, resource-only catalogs, and additional codecs need separate comparisons. [Control images](../tests/fixtures/dmg)
+
+### HFS+ and HFSX partitions
+
+Both daemons visit regular files in catalog leaf order inside a DMG partition.
+They scan the decompressed file, data fork, and resource fork in that order.
+The original basename applies to each fork. The HFS partition supplies the parent type.
+A DMG hash wins over a file hash. A file hash wins over a partition hash.
+Apple's `hdiutil` control verifies detection of a root file and a nested file. [Control image](../tests/fixtures/dmg/hdiutil-hfsplus.dmg.gz)
+
+Rust fixtures cover HFSX, fragmented data, Unicode names, symbolic links, and zlib data in attributes and resource forks.
+Stock skips an inline stored attachment until it has inflated another file in the same catalog.
+The comparisons also cover `ScanArchive`, recursion depth, file count, and the exact cumulative byte limit. [HFS comparisons](../tests/object_hfs.rs)
+
+Barnacle reads contiguous forks directly and streams fragmented forks and compressed resources.
+It handles eight extents per fork and indexes up to 32,768 compression attributes per partition.
+Forks requiring overflow extents and larger attribute indexes produce incomplete coverage.
+When an allocation block exceeds the catalog node size, both daemons skip file extraction and match the partition.
+
 ### UDF optical images
 
 Stock scans the raw disc before its UDF members. An outer whole-file hash takes precedence.

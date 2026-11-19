@@ -28,6 +28,16 @@ fn gzip(data: &[u8]) -> io::Result<Vec<u8>> {
     encoder.finish()
 }
 
+fn lzma_archive(data: &[u8]) -> io::Result<Vec<u8>> {
+    use sevenz_rust2::{ArchiveEntry, ArchiveWriter, encoder_options::LzmaOptions};
+    let mut writer = ArchiveWriter::new(io::Cursor::new(Vec::new())).map_err(io::Error::other)?;
+    writer.set_content_methods(vec![LzmaOptions::from_level(0).into()]);
+    writer
+        .push_archive_entry(ArchiveEntry::new_file("report"), Some(data))
+        .map_err(io::Error::other)?;
+    Ok(writer.finish()?.into_inner())
+}
+
 fn bzip(data: &[u8]) -> io::Result<Vec<u8>> {
     let mut encoder = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
     encoder.write_all(data)?;
@@ -358,6 +368,7 @@ fn compare(exe: &Path) -> io::Result<()> {
         ("bzip2", bzip(FIRST)?),
         ("two bzip2 members", bzip_members),
         ("XZ", xz.to_vec()),
+        ("7z LZMA", lzma_archive(FIRST)?),
         ("SZDD", szdd(FIRST)),
         (
             "7z",
@@ -378,6 +389,14 @@ fn compare(exe: &Path) -> io::Result<()> {
                     ("report", FIRST),
                 ],
             )?,
+        ),
+        (
+            "solid 7z competing matches",
+            legacy::sevenzip(true, &entries)?,
+        ),
+        (
+            "solid 7z nested winner before a later member",
+            legacy::sevenzip(true, &[("nested", &gzip(FIRST)?), ("later", SECOND)])?,
         ),
         ("stored ALZ", alz(0)?),
         ("bzip2 ALZ", alz(1)?),
@@ -454,6 +473,19 @@ fn compare(exe: &Path) -> io::Result<()> {
         "stream: Archive.Joined.UNOFFICIAL FOUND\0",
         "two XZ streams"
     );
+    // The fixture uses one LZMA2 filter. A larger valid dictionary preserves
+    // its output, and the second stream requires a larger admission charge.
+    let mut larger_window = xz.to_vec();
+    larger_window[18] = 30;
+    let mut checksum = flate2::Crc::new();
+    checksum.update(&larger_window[12..28]);
+    larger_window[28..32].copy_from_slice(&checksum.sum().to_le_bytes());
+    let joined = [xz.as_slice(), &larger_window].concat();
+    assert_eq!(
+        unix_request(&socket, &stream_frame(&joined)?)?,
+        "stream: Archive.Joined.UNOFFICIAL FOUND\0",
+        "two XZ streams with increasing dictionaries"
+    );
     let expected = if exe == Path::new("/usr/sbin/clamd") {
         "stream: OK\0"
     } else {
@@ -496,6 +528,26 @@ fn compare(exe: &Path) -> io::Result<()> {
         unix_request(&socket, &stream_frame(&chm::chm(FIRST, SECOND, true))?)?,
         "stream: Archive.First.UNOFFICIAL FOUND\0",
         "CHM member crossing an LZX reset"
+    );
+    drop(_chm_daemon);
+    let socket = dir.path().join("deadline.sock");
+    let config = dir.path().join("deadline.conf");
+    fs::write(
+        &config,
+        format!(
+            "Foreground yes\nLocalSocket {}\nDatabaseDirectory {}\nTemporaryDirectory {}\nSelfCheck 0\nDisableCache yes\nMaxScanTime 1\nAlertExceedsMax yes\n",
+            socket.display(),
+            db.display(),
+            dir.path().display()
+        ),
+    )?;
+    let report = b"Ordinary monthly filing notes.\n".repeat(512 * 1024);
+    let archive = legacy::sevenzip(true, &[("report", &report), ("later", SECOND)])?;
+    let _deadline_daemon = Daemon::start(exe, &config, &socket)?;
+    assert_eq!(
+        unix_request(&socket, &stream_frame(&archive)?)?,
+        "stream: Heuristics.Limits.Exceeded.MaxScanTime FOUND\0",
+        "deadline during solid 7z before a later match"
     );
     Ok(())
 }

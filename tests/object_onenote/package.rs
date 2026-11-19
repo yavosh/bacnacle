@@ -2,11 +2,14 @@
 const GUID: [u8; 16] = *b"Barnacle section";
 
 fn number(v: usize) -> Vec<u8> {
-    if v < 128 {
-        vec![((v as u8) << 1) | 1]
-    } else {
-        (((v as u16) << 2) | 2).to_le_bytes().to_vec()
+    let v = v as u64;
+    for width in 1..=7 {
+        if v < (1u64 << (7 * width)) {
+            let code = (v << width) | (1 << (width - 1));
+            return code.to_le_bytes()[..width].to_vec();
+        }
     }
+    [vec![128], v.to_le_bytes().to_vec()].concat()
 }
 fn extended(guid: [u8; 16], n: u8) -> Vec<u8> {
     let mut r = vec![128];
@@ -28,14 +31,17 @@ fn node(kind: u16, value: Vec<u8>, children: Option<Vec<u8>>) -> Vec<u8> {
             .to_le_bytes()
             .to_vec()
     } else {
-        ((value.len() as u32) << 17 | u32::from(kind) << 3 | u32::from(flags) | 2)
+        ((value.len().min(0x7fff) as u32) << 17 | u32::from(kind) << 3 | u32::from(flags) | 2)
             .to_le_bytes()
             .to_vec()
     };
+    if value.len() >= 0x7fff {
+        bytes.extend(number(value.len()));
+    }
     bytes.extend(value);
     if let Some(children) = children {
         bytes.extend(children);
-        // Object-group metadata uses an 8-bit end even when its start is 32 bits.
+        // These generated compounds use the shortest end record for their type.
         if kind < 64 {
             bytes.push((kind as u8) << 2 | 1);
         } else {

@@ -5,7 +5,9 @@ use std::path::Path;
 
 mod archive;
 mod classify;
+mod dmg;
 mod embedded;
+mod hfs;
 mod iso;
 mod office;
 mod ole;
@@ -47,6 +49,7 @@ trait ChildSink {
     ) -> io::Result<bool>;
     fn child_bytes(&mut self, bytes: &[u8], name: Option<&[u8]>) -> io::Result<bool>;
     fn embedded_archive(&mut self, kind: &'static str, bytes: &[u8]) -> io::Result<Handling>;
+    fn partition(&mut self, snapshot: Snapshot) -> io::Result<bool>;
     fn view(&mut self, data: &mut dyn Read, target: Target) -> io::Result<bool>;
 
     fn check(&mut self) -> io::Result<()>;
@@ -222,6 +225,13 @@ struct Traversal<'a> {
     check: &'a mut dyn FnMut() -> io::Result<()>,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum InputKind {
+    File,
+    Normalized(Target),
+    Partition,
+}
+
 pub fn scan(
     bytes: &[u8],
     options: &Options,
@@ -240,7 +250,7 @@ pub fn scan(
         matcher: &mut matcher,
         check: &mut check,
     };
-    walk.visit(bytes, None, None)?;
+    walk.visit(bytes, InputKind::File, None)?;
     Ok(walk.stopped.unwrap_or_else(|| match walk.first_limit {
         Some(limit) if options.alert_exceeds_max => Verdict::Found(limit.signature()),
         _ => Verdict::Miss,
@@ -255,12 +265,7 @@ impl Traversal<'_> {
         }
     }
 
-    fn visit(
-        &mut self,
-        bytes: &[u8],
-        typed: Option<Target>,
-        name: Option<&[u8]>,
-    ) -> io::Result<()> {
+    fn visit(&mut self, bytes: &[u8], kind: InputKind, name: Option<&[u8]>) -> io::Result<()> {
         self.check()?;
         if bytes.len() <= 5 {
             return Ok(());
@@ -275,13 +280,13 @@ impl Traversal<'_> {
         }
         self.files_scanned += 1;
         self.bytes_scanned += bytes.len() as u64;
-        if typed.is_none() && classify::ignored(bytes) {
+        if kind == InputKind::File && classify::ignored(bytes) {
             if self.parents.is_empty() {
                 self.stopped = Some(Verdict::Skipped);
             }
             return Ok(());
         }
-        let file_type = classify::FileType::classify(bytes, typed, self)?;
+        let file_type = classify::FileType::classify(bytes, kind, self)?;
         self.parents.push(Layer {
             target: file_type.context.target(),
             file_type: file_type.name,
@@ -301,7 +306,7 @@ impl Traversal<'_> {
                 context: &file_type.context,
                 layer,
                 parents,
-                normalized: typed.is_some(),
+                normalized: matches!(kind, InputKind::Normalized(_)),
                 body_only: false,
                 handled_format: handling == Handling::Complete,
             };
@@ -311,7 +316,7 @@ impl Traversal<'_> {
             }
         }
         if self.stopped.is_none() {
-            let recognize = typed.is_none()
+            let recognize = kind == InputKind::File
                 && self.options.scan_archive
                 && (file_type.parser != classify::Parser::Html || !self.options.scan_html);
             if self.after_raw(bytes, &file_type, recognize)? == Handling::Incomplete {
@@ -328,23 +333,34 @@ impl Traversal<'_> {
         file_type: &classify::FileType,
         recognize: bool,
     ) -> io::Result<Handling> {
-        let mut count = 0;
-        let disk = file_type.parser.disk_descriptor().filter(|_| recognize);
-        let split = disk.map_or(bytes.len(), |(offset, _)| offset);
-        if recognize {
-            let result = embedded::extract(bytes, file_type.name, 0..split, &mut count, self)?;
+        if recognize && embedded::enabled(file_type.name) {
+            let mut count = 0;
+            let mut start = 0;
+            let mut disks = [
+                file_type.parser.disk_descriptor(),
+                dmg::recognized(bytes).then(|| (bytes.len() - 512, classify::Disk::Dmg)),
+            ];
+            disks.sort_by_key(|disk| disk.map_or(usize::MAX, |(offset, _)| offset));
+            for (offset, disk) in disks.into_iter().flatten() {
+                let before =
+                    embedded::extract(bytes, file_type.name, start..offset, &mut count, self)?;
+                if before == Handling::Incomplete || self.stopped.is_some() {
+                    return Ok(before);
+                }
+                self.parents.last_mut().expect("current image").file_type = disk.name();
+                let result = disk.extract(bytes, self)?;
+                if result == Handling::Incomplete || self.stopped.is_some() {
+                    return Ok(result);
+                }
+                start = offset;
+            }
+            let result =
+                embedded::extract(bytes, file_type.name, start..bytes.len(), &mut count, self)?;
             if result == Handling::Incomplete || self.stopped.is_some() {
                 return Ok(result);
             }
         }
-        if let Some((_, name)) = disk {
-            self.parents.last_mut().expect("current image").file_type = name;
-        }
-        let result = file_type.parser.after_raw(bytes, self.options, self)?;
-        if disk.is_some() && self.stopped.is_none() && result != Handling::Incomplete {
-            return embedded::extract(bytes, file_type.name, split..bytes.len(), &mut count, self);
-        }
-        Ok(result)
+        file_type.parser.after_raw(bytes, self.options, self)
     }
 
     fn record_size_limit(&mut self, size: u64) {
@@ -371,6 +387,16 @@ impl Traversal<'_> {
 }
 
 impl ChildSink for Traversal<'_> {
+    fn partition(&mut self, snapshot: Snapshot) -> io::Result<bool> {
+        snapshot.with_bytes(|bytes| {
+            if self.skip_declared_size(bytes.len() as u64) || !self.can_enter_child() {
+                return Ok(false);
+            }
+            self.visit(bytes, InputKind::Partition, None)?;
+            Ok(self.stopped.is_some())
+        })
+    }
+
     fn embedded_archive(&mut self, kind: &'static str, bytes: &[u8]) -> io::Result<Handling> {
         if self.skip_declared_size(bytes.len() as u64) || !self.can_enter_child() {
             return Ok(Handling::Complete);
@@ -407,7 +433,8 @@ impl ChildSink for Traversal<'_> {
         target: Option<Target>,
         name: Option<&[u8]>,
     ) -> io::Result<bool> {
-        snapshot.with_bytes(|bytes| self.visit(bytes, target, name))?;
+        let kind = target.map_or(InputKind::File, InputKind::Normalized);
+        snapshot.with_bytes(|bytes| self.visit(bytes, kind, name))?;
         Ok(self.stopped.is_some())
     }
 
@@ -421,7 +448,7 @@ impl ChildSink for Traversal<'_> {
             self.record_size_limit(limit.saturating_add(1));
             return Ok(false);
         }
-        self.visit(bytes, None, name)?;
+        self.visit(bytes, InputKind::File, name)?;
         Ok(self.stopped.is_some())
     }
 

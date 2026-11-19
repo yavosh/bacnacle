@@ -6,6 +6,7 @@ use std::io::{self, Read, Write};
 mod attachments;
 mod html;
 mod mail;
+pub(super) use mail::{base64_reader, valid_base64};
 
 fn text_byte(b: u8) -> bool {
     matches!(b, 7..=10 | 12 | 13 | 27 | 0x20..=0x7e | 0x80..=0xff)

@@ -16,6 +16,7 @@ mod lha;
 mod sevenzip;
 mod sis;
 mod szdd;
+mod workspace;
 mod xar;
 mod zip;
 pub(super) use zip::directory as zip_directory;
@@ -109,15 +110,51 @@ pub(super) fn extract(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Hand
         // Stock concatenates all gzip members into a single child.
         Some("CL_TYPE_GZ") => decoded(MultiGzDecoder::new(bytes), None, true, sink),
         Some("CL_TYPE_BZ") => decoded(BzDecoder::new(bytes), None, false, sink),
-        Some("CL_TYPE_XZ") => {
-            // The pinned XZ allocator rejects individual allocations over one GiB.
-            // This decoder checks its estimated working set before allocating.
-            let reader = XzReader::new_mem_limit(bytes, true, 1024 * 1024);
-            decoded(reader, None, false, sink)
-        }
+        Some("CL_TYPE_XZ") => xz(bytes, sink),
         Some("CL_TYPE_POSIX_TAR" | "CL_TYPE_OLD_TAR") => tar(bytes, sink),
         Some(_) => cpio::extract(bytes, sink),
         None => Ok(Handling::Unrecognized),
+    }
+}
+
+fn xz(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handling> {
+    const STOCK_LIMIT_KIB: u32 = 1024 * 1024;
+    let history = workspace::history(sink.remaining()).saturating_add(2 << 20);
+    // The reader checks every block's model before allocation. Try a quarter
+    // of the shared budget first, so ordinary dictionaries can run together.
+    let mut limit_kib = (workspace::BUDGET / 4 / 1024) as u32;
+    loop {
+        let (snapshot, decoder_failed) = {
+            let estimate = history.min(u64::from(limit_kib) * 1024);
+            let _lease = workspace::acquire(estimate, || sink.check())?;
+            let mut decoder = Decoded {
+                reader: XzReader::new_mem_limit(bytes, true, limit_kib),
+                failed: false,
+                allow_partial: false,
+            };
+            (sink.read_child(&mut decoder), decoder.failed)
+        };
+        match snapshot {
+            // A concatenated stream may increase its dictionary. Drop the
+            // earlier pass before acquiring a larger reservation and replay.
+            Err(e)
+                if decoder_failed
+                    && e.kind() == io::ErrorKind::OutOfMemory
+                    && limit_kib < STOCK_LIMIT_KIB =>
+            {
+                limit_kib = STOCK_LIMIT_KIB;
+            }
+            Err(_) if decoder_failed => return Ok(Handling::Incomplete),
+            Err(e) => return Err(e),
+            Ok(snapshot) => {
+                if let Some(data) = snapshot
+                    && sink.visit_snapshot(data, None, None)?
+                {
+                    return Ok(Handling::Stopped);
+                }
+                return Ok(Handling::Complete);
+            }
+        }
     }
 }
 

@@ -47,6 +47,8 @@ fn compare(executable: &Path, stock: bool) -> io::Result<()> {
     let mut packaged = package::section(false, FIRST, SECOND);
     packaged.extend(LABEL);
     let packaged_reverse = package::section(true, FIRST, SECOND);
+    let large = vec![b'x'; 4 << 20];
+    let large_package = package::section(true, &large, SECOND);
     let boundary = document(65531, &[FIRST]);
     let short = document(1024, &[b"tiny", SECOND]);
     let nested = document(1024, &[&reverse]);
@@ -60,6 +62,7 @@ fn compare(executable: &Path, stock: bool) -> io::Result<()> {
         ("", &reverse, "Local.Second.UNOFFICIAL"),
         ("", &packaged, "Local.Second.UNOFFICIAL"),
         ("", &packaged_reverse, "Local.First.UNOFFICIAL"),
+        ("", &large_package, "Local.Large.UNOFFICIAL"),
         ("ScanOneNote no", &packaged, "Local.Envelope.UNOFFICIAL"),
         (
             &format!("MaxScanSize {}", packaged.len() + SECOND.len()),
@@ -104,7 +107,8 @@ fn compare(executable: &Path, stock: bool) -> io::Result<()> {
         ),
     ];
     let outer = LABEL.iter().map(|b| format!("{b:02x}")).collect::<String>();
-    let data = hash(FIRST, "Local.First") + &hash(SECOND, "Local.Second");
+    let data =
+        hash(FIRST, "Local.First") + &hash(SECOND, "Local.Second") + &hash(&large, "Local.Large");
     let mut settings: Vec<_> = expectations.iter().map(|e| e.0).collect();
     settings.sort_unstable();
     settings.dedup();
@@ -288,5 +292,30 @@ fn package_attachments_keep_page_order_and_names() -> io::Result<()> {
         || Ok(()),
     )?;
     assert_eq!(names, [b"second.txt".to_vec(), b"first.txt".to_vec()]);
+    Ok(())
+}
+
+#[test]
+fn large_package_blob_borrows_the_input() -> io::Result<()> {
+    use barnacle::objects::{Options, Verdict, scan};
+    let mut large = vec![b'x'; 4 << 20];
+    large[..FIRST.len()].copy_from_slice(FIRST);
+    let doc = package::section(true, &large, SECOND);
+    let dir = tempfile::tempdir()?;
+    let verdict = scan(
+        &doc,
+        &Options::default(),
+        dir.path(),
+        |object, _| {
+            if object.layer.name.as_deref() == Some(b"first.txt") {
+                assert_eq!(object.bytes, large);
+                assert!(doc.as_ptr_range().contains(&object.bytes.as_ptr()));
+                return Ok(Verdict::Found("borrowed".into()));
+            }
+            Ok(Verdict::Miss)
+        },
+        || Ok(()),
+    )?;
+    assert_eq!(verdict, Verdict::Found("borrowed".into()));
     Ok(())
 }

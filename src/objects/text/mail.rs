@@ -138,6 +138,40 @@ struct Body<'a> {
     final_lf: bool,
 }
 
+pub(in crate::objects) fn valid_base64(data: &[u8], sink: &mut dyn ChildSink) -> io::Result<bool> {
+    let mut digits = 0;
+    let mut pads = 0;
+    for block in data.chunks(8192) {
+        sink.check()?;
+        for &b in block {
+            if b.is_ascii_whitespace() {
+                continue;
+            }
+            if b == b'=' && pads < 2 {
+                pads += 1;
+            } else if pads == 0 && b64(b).is_some() {
+                digits += 1;
+            } else {
+                return Ok(false);
+            }
+        }
+    }
+    if digits % 4 == 1 || (pads != 0 && (digits + pads) % 4 != 0) {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+pub(in crate::objects) fn base64_reader(data: &[u8]) -> impl Read + '_ {
+    Body {
+        data,
+        mode: Encoding::Base64,
+        code: 0,
+        bits: 0,
+        final_lf: false,
+    }
+}
+
 impl Body<'_> {
     fn next_byte(&mut self) -> io::Result<Option<u8>> {
         while let Some((&b, rest)) = self.data.split_first() {
@@ -277,27 +311,8 @@ fn part(input: &[u8], sink: &mut dyn ChildSink, depth: usize) -> io::Result<Hand
             Ok(Handling::Incomplete)
         };
     }
-    if matches!(mode, Encoding::Base64) {
-        let mut digits = 0;
-        let mut pads = 0;
-        for block in p.body.chunks(8192) {
-            sink.check()?;
-            for &b in block {
-                if b.is_ascii_whitespace() {
-                    continue;
-                }
-                if b == b'=' && pads < 2 {
-                    pads += 1;
-                } else if pads == 0 && b64(b).is_some() {
-                    digits += 1;
-                } else {
-                    return Ok(Handling::Incomplete);
-                }
-            }
-        }
-        if digits % 4 == 1 || (pads != 0 && (digits + pads) % 4 != 0) {
-            return Ok(Handling::Incomplete);
-        }
+    if matches!(mode, Encoding::Base64) && !valid_base64(p.body, sink)? {
+        return Ok(Handling::Incomplete);
     }
     let filename = parameter(&p.disposition, b"filename").or_else(|| parameter(&p.kind, b"name"));
     let mut data = Body {
