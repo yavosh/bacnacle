@@ -351,3 +351,426 @@ fn stock_xml_documents() -> io::Result<()> {
     assert_eq!(version.stdout, b"1.4.3+dfsg-1");
     compare(true)
 }
+
+fn legacy_doc(root: &str, label: &str, body: &[u8]) -> Vec<u8> {
+    let mut document = Vec::new();
+    if root == HWP {
+        document.extend([0xef, 0xbb, 0xbf]);
+    }
+    document.extend(
+        format!("<?xml version=\"1.0\" encoding='{label}'?><{root} xmlns:w=\"urn:word\">").bytes(),
+    );
+    document.extend(body);
+    document.extend(format!("</{root}>").bytes());
+    document
+}
+
+fn legacy_compare(stock: bool) -> io::Result<()> {
+    let cases: &[(&[&str], &[u8], &str, &str)] = &[
+        (
+            &["ISO-8859-1", "Latin1", "iso_8859-1", "CP819"],
+            b"caf\xe9 &amp; ann\xe9e &#x20ac;",
+            "café & année €",
+            "Latin1",
+        ),
+        (
+            &["ISO8859-1", "L1"],
+            b"report \x80 next",
+            "report \u{80} next",
+            "C1",
+        ),
+        (
+            &["ISO-8859-2", "ISO8859-2", "latin2"],
+            b"raport \xa3\xf3d\xbc",
+            "raport Łódź",
+            "Latin2",
+        ),
+        (
+            &["Windows-1252", "CP1252"],
+            b"prix \x80 et caf\xe9",
+            "prix € et café",
+            "Windows",
+        ),
+        (
+            &["Windows-1251", "CP1251"],
+            b"report \xcc\xe8\xf0",
+            "report Мир",
+            "Cyrillic",
+        ),
+        (
+            &["EUC-KR", "EUCKR", "CP949"],
+            b"report \xb0\xa1\xb3\xaa\xb4\xd9",
+            "report 가나다",
+            "Korean",
+        ),
+        (&["EUC-KR"], b"report \xa2\xe8", "report ㉾", "KoreanSymbol"),
+        (
+            &["CP949"],
+            b"report \x81\x41",
+            "report 갂",
+            "ExtendedKorean",
+        ),
+        (
+            &["Shift_JIS", "SJIS", "shift-jis", "CP932"],
+            b"report \x93\xfa\x96\x7b",
+            "report 日本",
+            "Japanese",
+        ),
+        (
+            &["Shift_JIS"],
+            b"report \\ ~ \x81\x60",
+            "report ¥ ‾ 〜",
+            "Jis",
+        ),
+        (
+            &["CP932"],
+            b"report \\ ~ \x81\x60",
+            "report \\ ~ ～",
+            "WindowsJapanese",
+        ),
+        (
+            &["US-ASCII", "ASCII", "UTF8"],
+            b"report ABC",
+            "report ABC",
+            "Ascii",
+        ),
+    ];
+    let mut rules = hash(FIRST, "First");
+    for &(_, _, decoded, name) in cases {
+        rules.push_str(&hash(decoded.as_bytes(), name));
+    }
+    let server = Server::start(stock, "", &rules, "")?;
+    for &(labels, raw, _, name) in cases {
+        for &label in labels {
+            let data = [b"<TAIL><BINDATA>".as_slice(), raw, b"</BINDATA></TAIL>"].concat();
+            server.check(label, &legacy_doc(HWP, label, &data), Some(name))?;
+            let data = [
+                b"<Note>".as_slice(),
+                raw,
+                b"</Note><binData>",
+                A.as_bytes(),
+                b"&#10;</binData>",
+            ]
+            .concat();
+            for root in [WORD, EXCEL] {
+                server.check(label, &legacy_doc(root, label, &data), Some("First"))?;
+            }
+        }
+    }
+    for (label, raw) in [
+        ("x-unknown", b"report ABC".as_slice()),
+        ("windows1252", b"prix \x80 et caf\xe9"),
+        ("ks_c_5601-1987", b"report \xb0\xa1\xb3\xaa\xb4\xd9"),
+        ("US-ASCII", b"report caf\xe9"),
+        ("Windows-1252", b"report \x81 note"),
+    ] {
+        let data = [
+            b"<Note>".as_slice(),
+            raw,
+            b"</Note><binData>",
+            A.as_bytes(),
+            b"\n</binData>",
+        ]
+        .concat();
+        server.check(label, &legacy_doc(EXCEL, label, &data), None)?;
+    }
+    for (size, expected) in [(3_333_333, Some("First")), (3_333_334, None)] {
+        let mut data = b"<Note>".to_vec();
+        data.resize(data.len() + size, 0x80);
+        data.extend(format!("</Note><binData>{A}\n</binData>").bytes());
+        server.check(
+            "converted text-node limit",
+            &legacy_doc(WORD, "Windows-1252", &data),
+            expected,
+        )?;
+    }
+    drop(server);
+    // Place a two-byte character across the 4096-byte conversion boundary.
+    let header = legacy_doc(HWP, "Shift_JIS", b"<BINDATA>").len() - b"</HWPML>".len() - 3;
+    let pad = 4095 - header;
+    let raw = [
+        b"<BINDATA>".as_slice(),
+        &vec![b'a'; pad],
+        &[0x81, 0x60, b'~', b'\\'].repeat(20_000),
+        b"</BINDATA>",
+    ]
+    .concat();
+    let expected = "a".repeat(pad) + &"〜‾¥".repeat(20_000);
+    let across = Server::start(stock, "", &hash(expected.as_bytes(), "AcrossBoundary"), "")?;
+    across.check(
+        "multibyte input and repeated punctuation across conversion blocks",
+        &legacy_doc(HWP, "Shift_JIS", &raw),
+        Some("AcrossBoundary"),
+    )?;
+    drop(across);
+    let text = "€".repeat(3000);
+    let payload = [b"<BINDATA>".as_slice(), &vec![0x80; 3000], b"</BINDATA>"].concat();
+    let document = legacy_doc(HWP, "windows-1252", &payload);
+    let rules = hash(text.as_bytes(), "LargeLegacy") + &hash(&vec![0x80; 3000], "OriginalBytes");
+    for (setting, bound, limit_name) in [
+        (
+            "MaxFileSize",
+            text.len(),
+            "Heuristics.Limits.Exceeded.MaxFileSize",
+        ),
+        (
+            "MaxScanSize",
+            document.len() + text.len(),
+            "Heuristics.Limits.Exceeded.MaxScanSize",
+        ),
+    ] {
+        for (limit, name) in [(bound, "LargeLegacy"), (bound - 1, limit_name)] {
+            let server = Server::start(
+                stock,
+                &format!("{setting} {limit}\nAlertExceedsMax yes"),
+                &rules,
+                "",
+            )?;
+            server.check(
+                "legacy attachment counts UTF-8 bytes",
+                &document,
+                Some(name),
+            )?;
+        }
+    }
+    if stock {
+        let text = "prix € et café";
+        let hex = text
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        let rules = format!(
+            "Local.LegacyParent;Engine:81-255,Target:0,Container:CL_TYPE_XML_HWP;0;{hex}\n"
+        );
+        let server = Server::start(true, "", "", &rules)?;
+        let data = legacy_doc(HWP, "cp1252", b"<BINDATA>prix \x80 et caf\xe9</BINDATA>");
+        server.check(
+            "legacy parent",
+            &zip::zip(&[("report.hml", &data)], true, false, false)?,
+            Some("LegacyParent"),
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn barnacle_declared_xml_encodings() -> io::Result<()> {
+    legacy_compare(false)
+}
+#[test]
+#[ignore = "requires Debian clamd 1.4.3+dfsg-1"]
+fn stock_declared_xml_encodings() -> io::Result<()> {
+    let version = std::process::Command::new("dpkg-query")
+        .args(["-W", "-f=${Version}", "clamav-daemon"])
+        .output()?;
+    assert_eq!(version.stdout, b"1.4.3+dfsg-1");
+    legacy_compare(true)
+}
+#[test]
+fn legacy_xml_attachment_context() -> io::Result<()> {
+    use barnacle::objects::{Options, Verdict, scan};
+    let tmp = tempfile::tempdir()?;
+    let data = legacy_doc(
+        HWP,
+        "windows-1252",
+        b"<BINDATA>prix \x80 et caf\xe9</BINDATA>",
+    );
+    let zipped = zip::zip(&[("report.hml", &data)], true, false, false)?;
+    let verdict = scan(
+        &zipped,
+        &Options::default(),
+        tmp.path(),
+        |obj, _| {
+            if !obj.normalized && obj.bytes == "prix € et café".as_bytes() {
+                assert_eq!(
+                    obj.parents.iter().map(|p| p.file_type).collect::<Vec<_>>(),
+                    ["CL_TYPE_ZIP", "CL_TYPE_XML_HWP"]
+                );
+                assert_eq!(obj.parents[1].size, data.len());
+                assert!(obj.layer.name.is_none());
+                return Ok(Verdict::Found("text".into()));
+            }
+            Ok(Verdict::Miss)
+        },
+        || Ok(()),
+    )?;
+    assert_eq!(verdict, Verdict::Found("text".into()));
+    Ok(())
+}
+
+#[test]
+fn large_ascii_legacy_document_can_be_cancelled_before_its_attachment() -> io::Result<()> {
+    use barnacle::objects::{Options, Verdict, scan};
+    let mut body = b"<Note>".to_vec();
+    body.resize(3 * 1024 * 1024, b'x');
+    body.extend(format!("</Note><binData>{A}\n</binData>").bytes());
+    let document = legacy_doc(EXCEL, "Windows-1252", &body);
+    let tmp = tempfile::tempdir()?;
+    let mut calls = 0;
+    let result = scan(
+        &document,
+        &Options::default(),
+        tmp.path(),
+        |obj, _| {
+            assert_ne!(obj.bytes, FIRST);
+            Ok(Verdict::Miss)
+        },
+        || {
+            calls += 1;
+            if calls == 32 {
+                Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "cancelled XML scan",
+                ))
+            } else {
+                Ok(())
+            }
+        },
+    );
+    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+    Ok(())
+}
+
+fn read_ahead_sample(
+    label: &str,
+    child_at: usize,
+    error_at: usize,
+    invalid: &[u8],
+    tail: usize,
+) -> Vec<u8> {
+    let mut doc =
+        format!("<?xml version=\"1.0\" encoding='{label}'?><Workbook><Note>").into_bytes();
+    if label == "Windows-1252" {
+        doc.extend(b"caf\xe9");
+    }
+    doc.resize(child_at - 7, b'x');
+    doc.extend(format!("</Note><binData>{A}\n</binData><Note>").bytes());
+    assert!(doc.len() <= error_at);
+    doc.resize(error_at, b'x');
+    doc.extend(invalid);
+    doc.resize(doc.len() + tail, b'x');
+    doc.extend(b"</Note></Workbook>");
+    doc
+}
+
+fn malformed_legacy_xml(stock: bool) -> io::Result<()> {
+    let child = format!("<binData>{A}\n</binData>");
+    let mut cases = Vec::new();
+    for invalid in [b"&nbsp;".as_slice(), b"&#0;", b"\x01"] {
+        let mut leading = b"<Note>caf\xe9 ".to_vec();
+        leading.extend(invalid);
+        leading.extend(b"</Note>");
+        leading.extend(child.as_bytes());
+        cases.push((legacy_doc(EXCEL, "Windows-1252", &leading), None));
+        for (gap, expected) in [(5, None), (100_000, Some("First"))] {
+            let mut trailing = [child.as_bytes(), b"<Note>caf\xe9 "].concat();
+            trailing.resize(trailing.len() + gap, b'x');
+            trailing.extend(invalid);
+            trailing.extend(b"</Note>");
+            cases.push((legacy_doc(EXCEL, "Windows-1252", &trailing), expected));
+        }
+    }
+    for note in [
+        "<Note id='1' id='2'>metadata</Note>",
+        "<Note id='&nbsp;'>metadata</Note>",
+        "<Note id='&#0;'>metadata</Note>",
+        "<Note>&#+10;</Note>",
+    ] {
+        cases.push((
+            legacy_doc(EXCEL, "Windows-1252", format!("{note}{child}").as_bytes()),
+            None,
+        ));
+    }
+    for (gap, expected) in [(10, None), (100_000, Some("First"))] {
+        let mut doc = [child.as_bytes(), b"<Note>"].concat();
+        doc.resize(doc.len() + gap, b'x');
+        doc.extend(b"\xff</Note>");
+        cases.push((legacy_doc(EXCEL, "UTF-8", &doc), expected));
+    }
+    for (label, invalid) in [("Windows-1252", 0x81), ("ASCII", 0xff), ("CP932", 0xff)] {
+        for (child_at, error_at, tail, expected) in [
+            (100, 158, 0, Some("First")),
+            (464, 524, 0, None),
+            (500, 558, 0, None),
+            (500, 558, 600, Some("First")),
+            (500, 1008, 0, None),
+            (500, 1009, 0, Some("First")),
+            (500, 100_000, 0, Some("First")),
+        ] {
+            let doc = read_ahead_sample(label, child_at, error_at, &[invalid], tail);
+            cases.push((doc, expected));
+        }
+    }
+    let near_edge = read_ahead_sample("Windows-1252", 430, 515, b"&#0;", 0);
+    let invalid_before_child = legacy_doc(
+        EXCEL,
+        "Windows-1252",
+        format!("<Note>&nbsp;</Note>{child}").as_bytes(),
+    );
+    let mut rules =
+        hash(FIRST, "First") + &hash(&near_edge, "Outer") + &hash(&invalid_before_child, "Outer");
+    for (doc, expected) in &cases {
+        if expected.is_some() {
+            rules.push_str(&hash(doc, "Outer"));
+        }
+    }
+    let server = Server::start(stock, "", &rules, "")?;
+    for (index, (doc, expected)) in cases.iter().enumerate() {
+        server.check(&format!("malformed XML read-ahead {index}"), doc, *expected)?;
+    }
+    server.check(
+        "closely spaced attachment and invalid character reference",
+        &near_edge,
+        stock.then_some("First"),
+    )?;
+    server.check(
+        "raw hash after unsupported XML metadata",
+        &invalid_before_child,
+        stock.then_some("Outer"),
+    )?;
+    Ok(())
+}
+
+#[test]
+fn barnacle_malformed_xml_read_ahead() -> io::Result<()> {
+    malformed_legacy_xml(false)
+}
+
+#[test]
+#[ignore = "requires Debian clamd 1.4.3+dfsg-1"]
+fn stock_malformed_xml_read_ahead() -> io::Result<()> {
+    malformed_legacy_xml(true)
+}
+
+#[test]
+fn xml_attribute_count_bounds_duplicate_checks() -> io::Result<()> {
+    use barnacle::objects::{Options, Verdict, scan};
+    let tmp = tempfile::tempdir()?;
+    for (count, expected) in [
+        (1024, Verdict::Found("first".into())),
+        (1025, Verdict::Incomplete),
+    ] {
+        let attrs = (0..count).map(|i| format!(" n{i}='x'")).collect::<String>();
+        let doc = legacy_doc(
+            EXCEL,
+            "ASCII",
+            format!("<Note{attrs}/><binData>{A}\n</binData>").as_bytes(),
+        );
+        let result = scan(
+            &doc,
+            &Options::default(),
+            tmp.path(),
+            |obj, _| {
+                Ok(if obj.bytes == FIRST {
+                    Verdict::Found("first".into())
+                } else {
+                    Verdict::Miss
+                })
+            },
+            || Ok(()),
+        )?;
+        assert_eq!(result, expected);
+    }
+    Ok(())
+}

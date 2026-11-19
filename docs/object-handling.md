@@ -15,7 +15,7 @@ The raw engine inventory lists individual submodules, including disabled entries
 | Installers and embedded files | NSIS, AutoIt, InstallShield and embedded file recognition | Tests exercise NSIS, InstallShield and embedded PE resources. AutoIt still needs a separate comparison. [Installer comparisons](../tests/object_installers.rs) · [Embedded comparisons](../tests/object_embedded.rs) |
 | Documents | OLE2, OOXML, Word/Excel XML, HWP, OneNote, PDF, RTF and SWF | Tests cover ordinary PDF, Office, RTF and Flash documents, including competing child detections and scan limits. [PDF comparisons](../tests/object_pdf.rs) · [OLE comparisons](../tests/object_ole.rs) |
 | Text and mail | HTML, UTF-16 HTML, script normalization, JavaScript, script encoding, mbox/MIME, TNEF and uuencoding | Rust fixtures exercise ordinary scripts, HTML, MIME, TNEF, uuencoded files, and data URLs. [Text comparisons](../tests/object_text.rs) |
-| Executables and graphics | PE, ELF, Mach-O, universal Mach-O, RIFF, GIF, PNG, JPEG and TIFF | Tests cover universal Mach-O slices, ELF sections, and BMP and GIF signatures. Full image heuristics and executable unpacking remain open. [Mach-O and ELF comparisons](../tests/object_macho.rs) · [Image comparisons](../tests/object_images.rs) |
+| Executables and media | PE, ELF, Mach-O, universal Mach-O, Java, RIFF, GIF, PNG, JPEG and TIFF | Tests cover Mach-O slices, ELF sections, Java classes, WAVE audio, and five image formats. Image heuristics and executable unpacking remain open. [Executable comparisons](../tests/object_macho.rs) · [Media comparisons](../tests/object_images.rs) |
 
 The engine also enables password support for archives and format-specific detection heuristics.
 The reference image lacks an installed UnRAR helper even though its engine configuration lists RAR.
@@ -23,6 +23,10 @@ The reference applies format settings and limits individually. [Effective clamd 
 
 `ScanXMLDOCS no` leaves ZIP member scanning enabled in packaged Word, Excel, PowerPoint, and HWP documents.
 Both daemons detect the same member hash with this setting. [Office container comparisons](../tests/object_parents.rs)
+
+HWPX assets under `BinData/` can trigger a central-directory lookup for `Contents/content.hpf`.
+Stock accepts a prefix in the first three local headers and requires the complete filename in the directory.
+Both daemons preserve the resulting HWPX or ZIP parent type. [HWPX comparisons](../tests/object_parents.rs)
 
 ### Executable containers
 
@@ -34,6 +38,13 @@ Both daemons match raw hashes and section-relative rules on ordinary ELF files w
 Both also match an outer PE hash before processing a nested PE resource.
 `ScanPE no` disables nested PE extraction. `MaxEmbeddedPE` includes an exact-size resource, and zero disables the size cap.
 [ELF comparisons](../tests/object_macho.rs) · [Embedded PE comparisons](../tests/object_embedded.rs)
+
+A Java 17 interface matched its target-12 body signature both directly and inside a JAR.
+A Java 11 class matched its whole-file hash in both locations. Stock treated the Java 21 control as generic data.
+Both daemons selected its whole-file hash over a target-12 rule. [Java fixtures](../tests/fixtures/java)
+
+Little-endian and big-endian WAVE files matched generic body and whole-file signatures both directly and inside ZIP files.
+PNG, JPEG, TIFF, GIF, and BMP controls matched graphics signatures before whole-file hashes. [Media comparisons](../tests/object_images.rs)
 
 ### Binary HWP documents
 
@@ -67,7 +78,28 @@ The reference stops parsing after a text node exceeds 10,000,000 bytes. [Word 20
 HWPML supports plain text, Base64, and raw DEFLATE attachments.
 With a 12,000-byte file limit, both daemons detect a hash of the first 8,192 expanded bytes.
 Barnacle streams expansion into a private spool. DTDs, names exceeding 1,024 bytes, and nesting beyond 256 levels produce incomplete coverage.
-These comparisons cover UTF-8 documents. Other declared encodings need separate fixtures. [Hancom HWPML specification](https://cdn.hancom.com/link/docs/%ED%95%9C%EA%B8%80%EB%AC%B8%EC%84%9C%ED%8C%8C%EC%9D%BC%ED%98%95%EC%8B%9D3.0_HWPML_revision1.2.pdf)
+The HWPML marker can precede a document with a declared legacy encoding. [Hancom HWPML specification](https://cdn.hancom.com/link/docs/%ED%95%9C%EA%B8%80%EB%AC%B8%EC%84%9C%ED%8C%8C%EC%9D%BC%ED%98%95%EC%8B%9D3.0_HWPML_revision1.2.pdf)
+
+Both daemons scan plain XML attachment text as UTF-8 and preserve the original bytes inside Base64 attachments.
+Comparisons cover UTF-8, ASCII, ISO-8859-1, ISO-8859-2, Windows-1251, Windows-1252, Shift_JIS, CP932, EUC-KR, and CP949.
+They verify encoding aliases, numeric references, and the distinction between Latin-1 controls and Windows punctuation.
+The file-size limit uses the UTF-8 child length. The cumulative limit also includes the original XML byte count.
+The text-node limit applies after conversion. Barnacle checks XML characters, references, and duplicate attributes before releasing an attachment.
+It returns incomplete coverage for unsupported declarations or elements with more than 1,024 attributes. [Encoding comparisons](../tests/object_xml.rs)
+
+Stock's XML reader pushes 512-byte input blocks. The final block can contain a conversion error after a matching attachment.
+Both scanners preserved the same result across 4,980 such Windows-1252, ASCII, and CP932 controls.
+A further 6,640 controls placed UTF-8 errors, undefined entities, invalid references, and control characters around block boundaries.
+Barnacle withheld 514 attachment matches from stock and produced no extra matches across the 11,620 controls.
+In one reproducible Workbook, the attachment starts at byte 430 and an invalid character reference starts at byte 515.
+Stock detects that attachment. Barnacle returns incomplete coverage. Stock can also detect the raw document hash after a metadata error.
+Barnacle returns incomplete coverage when the earlier matching stage remains uncertain. [Rust controls](../tests/object_xml.rs) · [Pinned libxml2 reader](https://github.com/GNOME/libxml2/blob/v2.9.14/xmlreader.c)
+
+Barnacle reuses ASCII-compatible input when its bytes need no conversion.
+For the supported encodings, each conversion spool uses at most three bytes per admitted input byte.
+With scan limits enabled, concurrent conversion spools within one scan use at most three times its cumulative scan-byte limit.
+Four concurrent Windows-1252 ledger scans peaked at 30.3 MiB for Barnacle and 79.6 MiB for stock.
+The UTF-8 control and throughput measurements use the same attachment hash. [Benchmark results](benchmarks/object-xml-charset.md)
 
 ### ISO 9660 disk images
 
@@ -207,6 +239,19 @@ A child inside a nested storage still has the enclosing compound file as its sca
 Rust tests compare competing raw streams and embedded packages in macro-free Word, Excel, and PowerPoint documents.
 They cover flat directories, nested storages, shared stream names, and the underlying filesystem’s scan order.
 Barnacle creates empty private directory entries when it needs that order. It reads each payload from the compound file.
+
+Both daemons scan top-level PowerPoint `ExOleObjStg` zlib payloads before the root presentation stream and its file hash.
+A root native Package still wins. A presentation inside a storage receives its attachment pass after the root raw-stream pass.
+Stock records the original attachment name as `ppt0000000c.doc` when the compressed data starts at byte 12.
+An uncompressed external object produced no child match. [PowerPoint controls](../tests/object_ole_ppt.rs) · [Microsoft record definition](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-ppt/305e541f-2c91-49c5-a742-4955330fd2b9)
+
+Temporary-directory order selects among competing attachments. On the pinned Linux filesystem, reversing two records reversed the winning signature.
+Stock stops the attachment pass when an expanded object exceeds a size limit. The tested 8,192-byte prefix never matched.
+Barnacle keeps at most 4,096 record offsets per presentation stream, including with `MaxFiles 0`.
+If the stream needs traversal, the next record returns incomplete coverage. The tests verify scratch cleanup after success, overflow, and cancellation.
+Stock checks each attachment's byte limit before its file count and recursion depth.
+A smaller blocked attachment can therefore report its limit before a later oversized attachment.
+When both depth and file count exclude an attachment, stock reports the file count.
 Barnacle reads streams with the MIT-licensed `cfb` crate. [Dependency license](https://github.com/mdsteele/rust-cfb/blob/master/LICENSE)
 
 ## Reference order and limits
@@ -218,6 +263,8 @@ Both the protocol and log observations identify the signature. [Rust runner](../
 
 Barnacle matched 165 protocol and log rows exactly, including every stock detection and limit alert.
 The remaining 85 stock `OK` replies produced Barnacle's explicit incomplete-coverage error.
+The daemon returns this error for both unsupported objects and completed traversals with no matcher hit.
+These 85 replies therefore do not measure how many object handlers remain unfinished.
 
 | Observation | Stock result |
 | --- | --- |

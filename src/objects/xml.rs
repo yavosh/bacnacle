@@ -1,11 +1,16 @@
 //! Word 2003 XML, SpreadsheetML and HWPML attachment streams.
+mod charset;
 use super::{ChildSink, Handling, Snapshot, text};
 use flate2::{Decompress, FlushDecompress, Status};
 use quick_xml::{
     Reader,
     events::{BytesStart, Event},
 };
-use std::io::{self, Read, Write};
+use std::{
+    collections::VecDeque,
+    io::{self, Read, Write},
+    ops::Range,
+};
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) enum Format {
@@ -17,6 +22,7 @@ pub(super) enum Format {
 const DECL: &[u8] = b"<?xml version=\"1.0\"";
 const DEPTH: usize = 20;
 const MAX_TEXT: usize = 10_000_000;
+const MAX_ATTRIBUTES: usize = 1024;
 
 impl Format {
     pub(super) fn recognize(bytes: &[u8]) -> Option<Self> {
@@ -53,12 +59,31 @@ impl Format {
     }
 
     pub(super) fn extract(self, bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handling> {
+        let bom = usize::from(bytes.starts_with(b"\xef\xbb\xbf")) * 3;
+        let bytes = &bytes[bom..];
+        let Some(charset) = charset::Charset::declaration(bytes) else {
+            return Ok(Handling::Incomplete);
+        };
+        charset.with_utf8(bytes, sink, |data, sink, partial| {
+            self.parse(data, sink, partial, charset, bom)
+        })
+    }
+
+    fn parse(
+        self,
+        bytes: &[u8],
+        sink: &mut dyn ChildSink,
+        partial: bool,
+        charset: charset::Charset,
+        bom: usize,
+    ) -> io::Result<Handling> {
         // The reader borrows text and keeps open element names for end-tag validation.
-        let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
         let mut xml = Reader::from_reader(bytes);
         let mut levels = Vec::with_capacity(DEPTH);
         let mut ignored = 0usize;
         let mut start = None;
+        let mut pending: VecDeque<PendingText> = VecDeque::new();
+        let mut root_seen = false;
         loop {
             sink.check()?;
             let at = xml.buffer_position() as usize;
@@ -72,11 +97,55 @@ impl Format {
             {
                 return Ok(Handling::Incomplete);
             }
-            let event = match xml.read_event() {
-                Ok(e) => e,
+            let (event, error) = match xml.read_event() {
+                Ok(event) => {
+                    let error = lexical_error(&event, sink)?.map(|offset| at + offset);
+                    (event, error)
+                }
+                Err(quick_xml::Error::Encoding(quick_xml::encoding::EncodingError::Utf8(
+                    error,
+                ))) => (Event::Eof, Some(at + error.valid_up_to())),
                 Err(_) => return Ok(Handling::Incomplete),
             };
+            let end = xml.buffer_position() as usize;
+            let eof = matches!(event, Event::Eof);
+            let finished = eof
+                && error.is_none()
+                && (partial || root_seen && levels.is_empty() && ignored == 0);
+            // The reference validates a complete 512-byte source block before exposing its
+            // nodes. Transcoding may expand one source byte into three UTF-8 bytes.
+            let through = if finished {
+                usize::MAX
+            } else if let Some(offset) = error
+                && !pending.is_empty()
+            {
+                charset.earlier_block(&bytes[..offset], bom, sink)?
+            } else {
+                end.saturating_sub(3 * 512 + 4)
+            };
+            if let Some(last) = pending.back_mut()
+                && last.tag_end == at
+            {
+                // A closing tag on the block edge may still be the reader's last node.
+                // Its next sibling or parent end tag commits it on malformed input.
+                last.ready = (end + 1).min(at.saturating_add(3 * 512 + 4));
+            }
+            while pending.front().is_some_and(|item| item.ready <= through) {
+                let item = pending.pop_front().unwrap();
+                if let Some(result) = scan_text(Some(item.content), &bytes[item.range], sink)? {
+                    return Ok(result);
+                }
+            }
+            if error.is_some() {
+                return Ok(Handling::Incomplete);
+            }
             if matches!(event, Event::Text(_) | Event::GeneralRef(_)) {
+                if levels.is_empty()
+                    && ignored == 0
+                    && !event.as_bytes().iter().all(u8::is_ascii_whitespace)
+                {
+                    return Ok(Handling::Incomplete);
+                }
                 start.get_or_insert(at);
                 continue;
             }
@@ -86,9 +155,27 @@ impl Format {
                 } else {
                     None
                 };
-                if let Some(result) = scan_text(content, &bytes[from..at], sink)? {
+                if let Some(content) = content {
+                    if !eof && (!partial || end < bytes.len()) {
+                        pending.push_back(PendingText {
+                            tag_end: end,
+                            ready: usize::MAX,
+                            content,
+                            range: from..at,
+                        });
+                    }
+                } else if let Some(result) = scan_text(None, &bytes[from..at], sink)? {
                     return Ok(result);
                 }
+            }
+            if matches!(event, Event::Start(_) | Event::Empty(_))
+                && levels.is_empty()
+                && ignored == 0
+            {
+                if root_seen {
+                    return Ok(Handling::Incomplete);
+                }
+                root_seen = true;
             }
             match event {
                 Event::Start(ref e) if ignored != 0 || levels.len() == DEPTH || self.ignore(e) => {
@@ -170,6 +257,61 @@ impl Format {
     }
 }
 
+struct PendingText {
+    tag_end: usize,
+    ready: usize,
+    content: Content,
+    range: Range<usize>,
+}
+
+fn lexical_error(event: &Event<'_>, sink: &mut dyn ChildSink) -> io::Result<Option<usize>> {
+    // quick-xml checks UTF-8 and tag matching. XML 1.0 further restricts text characters
+    // and the five predefined entities, including content outside an attachment.
+    let text: &str = event;
+    for (block, chunk) in text.as_bytes().chunks(64 * 1024).enumerate() {
+        if block != 0 {
+            sink.check()?;
+        }
+        if let Some(pos) = chunk
+            .iter()
+            .position(|&b| b < 0x20 && !matches!(b, 9 | 10 | 13))
+        {
+            return Ok(Some(block * 64 * 1024 + pos));
+        }
+    }
+    if text.as_bytes().contains(&0xef)
+        && let Some(pos) = text.find(['\u{fffe}', '\u{ffff}'])
+    {
+        return Ok(Some(pos));
+    }
+    match event {
+        Event::GeneralRef(reference) if entity(reference).is_none() => return Ok(Some(0)),
+        Event::Start(element) | Event::Empty(element) => {
+            for (index, attribute) in element.attributes().enumerate() {
+                if index == MAX_ATTRIBUTES {
+                    return Ok(Some(0));
+                }
+                let Ok(attribute) = attribute else {
+                    return Ok(Some(0));
+                };
+                let value = attribute.value.as_ref();
+                if value.contains('<')
+                    || value.split('&').skip(1).any(|tail| {
+                        tail.split_once(';')
+                            .and_then(|(key, _)| entity(key))
+                            .is_none()
+                    })
+                {
+                    return Ok(Some(0));
+                }
+            }
+        }
+        Event::Text(text) if text.contains("]]>") => return Ok(Some(0)),
+        _ => {}
+    }
+    Ok(None)
+}
+
 #[derive(Clone, Copy)]
 struct Content {
     base64: bool,
@@ -233,11 +375,22 @@ fn entity(key: &str) -> Option<char> {
         "quot" => Some('"'),
         "apos" => Some('\''),
         _ => if let Some(hex) = key.strip_prefix("#x") {
-            u32::from_str_radix(hex, 16).ok()
+            hex.bytes()
+                .all(|b| b.is_ascii_hexdigit())
+                .then(|| u32::from_str_radix(hex, 16).ok())
+                .flatten()
         } else {
-            key.strip_prefix('#')?.parse().ok()
+            let digits = key.strip_prefix('#')?;
+            digits
+                .bytes()
+                .all(|b| b.is_ascii_digit())
+                .then(|| digits.parse().ok())
+                .flatten()
         }
-        .and_then(char::from_u32),
+        .and_then(char::from_u32)
+        .filter(|c| {
+            matches!(c, '\t' | '\n' | '\r') || *c >= ' ' && !matches!(c, '\u{fffe}' | '\u{ffff}')
+        }),
     }
 }
 
