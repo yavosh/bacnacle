@@ -10,6 +10,7 @@ use std::{
 };
 
 const EXCEL: &[u8] = include_bytes!("fixtures/xls/dots.xls");
+const CALC: &[u8] = include_bytes!("fixtures/xls/arithmetic.xls");
 const DOTS: &[u8] = include_bytes!("fixtures/xls/dots.png");
 const JPEG: &[u8] = include_bytes!("fixtures/images/blue.jpg");
 const TIFF: &[u8] = include_bytes!("fixtures/images/blue.tiff");
@@ -263,6 +264,45 @@ fn compare(stock: bool) -> io::Result<()> {
         "",
     )?;
     report.check("report hash before PNG", EXCEL, Some("Report"))?;
+    report.check(
+        "authored ordinary formulas preserve the short report",
+        CALC,
+        Some("Report"),
+    )?;
+    daemon.check(
+        "authored arithmetic and square root formulas before picture",
+        CALC,
+        Some("Dots"),
+    )?;
+    let integer = [0x1e, 2, 0];
+    for tokens in [
+        [integer.as_slice(), &[0x1e, 3, 0, 0x03]].concat(), // 2+3
+        vec![0x44, 4, 0, 1, 0xc0, 0x1e, 2, 0, 0x05, 0x41, 0x14, 0], // SQRT(B5*2)
+        vec![0x25, 0, 0, 3, 0, 0, 0, 0, 0, 0x19, 0x10, 0, 0], // SUM(A1:A4)
+        [vec![0x1f], f64::MAX.to_le_bytes().to_vec()].concat(),
+    ] {
+        let mut cell = vec![0; 22];
+        cell[20..22].copy_from_slice(&(tokens.len() as u16).to_le_bytes());
+        cell.extend(tokens);
+        let doc = single(&[biff(6, &cell), one.clone()].concat())?;
+        report.check("short formula report before image", &doc, Some("Report"))?;
+        daemon.check("image after short formula report", &doc, Some("Dots"))?;
+    }
+    // A long sum of ordinary integer literals fills the stock report buffer.
+    let mut tokens = integer.to_vec();
+    for _ in 0..350 {
+        tokens.extend(integer);
+        tokens.push(3);
+    }
+    let mut cell = vec![0; 22];
+    cell[20..22].copy_from_slice(&(tokens.len() as u16).to_le_bytes());
+    cell.extend(tokens);
+    let long = single(&[biff(6, &cell), one.clone()].concat())?;
+    report.check(
+        "multi-block formula report cannot match its preamble hash",
+        &long,
+        stock.then_some("Dots"),
+    )?;
     let needle = b"BIFF content extracted"
         .iter()
         .map(|b| format!("{b:02x}"))

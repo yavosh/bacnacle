@@ -12,15 +12,45 @@ const REPORT_HEADER: &[u8] = b"-- BIFF content extracted and disassembled from C
 // length of its ordinary record lines to establish when only its preamble is visible.
 fn report_line_bound(opcode: u16) -> Option<usize> {
     Some(match opcode {
-        0x0006 | 0x0018 | 0x0207 => return None, // Formula, Name, and String have variable listings.
-        0x0031 => 24,                            // FONT has no label in the reference listing.
-        0x000a => 32,                            // EOF
-        0x00e0 => 35,                            // XF
+        0x0018 | 0x0207 => return None, // Name and String have variable listings.
+        0x0031 => 24,                   // FONT has no label in the reference listing.
+        0x000a => 32,                   // EOF
+        0x00e0 => 35,                   // XF
         0x0809 | 0x0022 | 0x00a1 | 0x00fc | 0x0293 => 40,
+        0x0042 | 0x003d | 0x008d | 0x0200 | 0x005d | 0x001d => 48,
         0x00eb => 63,  // MSODRAWINGGROUP
         0x0085 => 110, // BOUNDSHEET appends its sheet kind and visibility.
         _ => 74, // The longest static opcode description uses 59 bytes, plus 15 bytes of formatting.
     })
+}
+
+fn formula_bound(data: &[u8]) -> Option<usize> {
+    let count = u16::from_le_bytes(data.get(20..22)?.try_into().ok()?) as usize;
+    let mut tokens = data.get(22..)?;
+    if tokens.len() != count {
+        return None;
+    }
+    // Fixed record/coordinate text, the final token boundary, and the terminating newline.
+    let mut bound = 96;
+    while let Some(&code) = tokens.first() {
+        // Each bound includes the token label and all printed operands. The scanner only
+        // describes these BIFF tokens. Their formulas and functions are never evaluated.
+        let (width, printed) = match code {
+            0x03..=0x16 => (1, 16), // arithmetic, comparisons, and range operators
+            0x1c | 0x1d => (2, 24), // error or Boolean
+            0x1e => (3, 16),        // unsigned 16-bit integer
+            0x1f => (9, 336), // a finite double has at most 309 digits before the decimal point
+            0x01 | 0x24 | 0x44 | 0x64 => (5, 40), // cell references
+            0x25 | 0x45 | 0x65 => (9, 64), // cell ranges
+            0x21 | 0x41 | 0x61 => (3, 64), // fixed-arity function
+            0x22 | 0x42 | 0x62 if *tokens.get(3)? < 0x80 => (4, 80), // worksheet function
+            0x19 if *tokens.get(1)? == 0x10 => (4, 24), // optimized SUM
+            _ => return None,
+        };
+        tokens = tokens.get(width..)?;
+        bound += printed;
+    }
+    Some(bound)
 }
 
 pub(super) fn scan(mut input: Input<'_>, sink: &mut dyn ChildSink) -> io::Result<Handling> {
@@ -44,7 +74,13 @@ pub(super) fn scan(mut input: Input<'_>, sink: &mut dyn ChildSink) -> io::Result
             return Ok(Handling::Incomplete);
         }
         if report_can_fit {
-            let bound = match report_line_bound(opcode) {
+            let line = if opcode == 0x0006 {
+                input.read_exact(&mut buf[..size])?;
+                formula_bound(&buf[..size])
+            } else {
+                report_line_bound(opcode)
+            };
+            let bound = match line {
                 Some(bound) => bound,
                 // Bound variable report text when only its admission can affect the verdict.
                 // A formula token can print a decimal double. Its 22-byte header is fixed.
@@ -67,7 +103,7 @@ pub(super) fn scan(mut input: Input<'_>, sink: &mut dyn ChildSink) -> io::Result
             }
             input.read_exact(&mut buf[..size])?;
             group.write_all(&buf[..size])?;
-        } else {
+        } else if !report_can_fit || opcode != 0x0006 {
             input.seek(SeekFrom::Current(size as i64))?;
         }
         remaining -= size as u64 + 4;

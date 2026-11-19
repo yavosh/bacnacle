@@ -284,7 +284,9 @@ Stock metadata describes an unnamed PNG under `CL_TYPE_MSXL`. Its parent signatu
 Barnacle joins drawing-group and continuation records in a private spool. The controls cover PNG, JPEG, TIFF, and a multi-record DIB.
 A bare JPEG followed by another store entry includes its next 17 bytes in the tested one-identifier layout.
 The first image exceeding the byte budget stops picture traversal. Disabling `ScanImage` preserves picture hashes. Disabling `ScanOLE2` skips them.
-Report layouts that might fill stock's 4,096-byte output buffer return incomplete coverage. Formula, Name, and String listings also return incomplete coverage.
+The authored formula control contains `2+3` and `SQRT(A1*2)`. Both daemons match its 117-byte report before the PNG.
+Barnacle bounds the report text for common arithmetic, references, ranges, and worksheet functions without evaluating the cells.
+When the report can fit the scan budget, unrecognized tokens, Name and String listings, or a possible full 4,096-byte block return incomplete coverage. [BIFF formula example](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-xls/bccb00ac-67a1-490a-9f0b-5ce59978eb9a)
 Delayed picture data, metafiles, multiple Workbook streams, and mixed Office extraction passes remain unverified. [OfficeArt picture records](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-odraw/c67b883b-8136-4e91-a1a3-2981d16e934f)
 
 Both daemons scan top-level PowerPoint `ExOleObjStg` zlib payloads before the root presentation stream and its file hash.
