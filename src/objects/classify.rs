@@ -65,7 +65,7 @@ impl FileType {
                 };
                 return Ok(Self::generic(bytes, name, parser));
             }
-            InputKind::File => {}
+            InputKind::File | InputKind::MailboxLetter => {}
         }
         if let Some(name) = partition::initial(bytes) {
             return Ok(Self::generic(bytes, name, Parser::PartitionMap(name)));

@@ -36,6 +36,23 @@ pub(super) fn pe_carrier(kind: &str) -> bool {
     matches!(kind, "CL_TYPE_MSEXE" | "CL_TYPE_MSOLE2")
 }
 
+// A saved text leaf with an embedded map can consume additional file and byte budgets.
+pub(super) fn possible_text_map(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<bool> {
+    for start in (0..bytes.len()).step_by(65536) {
+        sink.check()?;
+        let end = (start + 65536 + FINDER.max_pattern_len() - 1).min(bytes.len());
+        if FINDER.find_iter(&bytes[start..end]).any(|m| {
+            !matches!(
+                MAGICS[m.pattern().as_usize()].1,
+                "CL_TYPE_MSEXE" | "CL_TYPE_ISHIELD_MSI" | "CL_TYPE_NULSFT" | "CL_TYPE_RAR"
+            )
+        }) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub(super) fn enabled(carrier: &str) -> bool {
     !matches!(
         carrier,

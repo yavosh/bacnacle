@@ -159,8 +159,15 @@ Different saved forwards and the extra recovery file from explicit 7bit remain i
 
 A standalone `message/rfc822` uses the literal embedded headers. A Base64 body without headers produced no mail child.
 A simple quoted-printable-wrapped text message retained its literal body. More complex standalone quoted-printable layouts remain incomplete.
-For the two-letter mbox fixture, stock selected the first letter on overlayfs and the second on tmpfs.
-Barnacle selected the first on both. [Mbox comparison](../tests/object_text.rs)
+Stock scans ordinary mbox attachments in message order before visiting the shared recovery directory.
+Named Base64 PDF, PNG, CSV, XLSX and WAV attachments followed this order both standalone and inside multipart/mixed.
+Unencoded named CSV joined the saved letters when standalone. Inside multipart/mixed, stock scanned it directly.
+Unencoded plain bodies get private filenames. With competing signatures, overlayfs returned the first body and tmpfs returned the second.
+Barnacle revisits the mailbox without retaining a list of bodies. It scans each ordinary saved letter once when all fit. It reports a shared or unique winning signature.
+Different winners or a budget that makes the winner depend on directory order produce incomplete coverage.
+Empty bodies produce no saved file. Nonempty saved bodies of five bytes or fewer count toward the MIME limit but consume no scanned-file slot.
+MaxFileSize applies to each letter and eligible script view. MaxScanSize covers their shared remaining byte allowance.
+Explicit 7bit can create another recovery file. More complex mailbox layouts remain partial. [Mbox comparisons](../tests/object_mail_forward.rs)
 [Forwarded mail comparisons](../tests/object_mail_forward.rs) · [Throughput and memory](benchmarks/object-forwarded-mail.md)
 
 ### Binary HWP documents

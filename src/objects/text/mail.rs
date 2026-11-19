@@ -1,4 +1,6 @@
+mod mbox;
 use super::{ChildSink, Handling};
+pub(in crate::objects) use mbox::SavedLetters;
 use std::io::{self, Read};
 
 pub(super) fn recognizes(bytes: &[u8]) -> bool {
@@ -34,6 +36,52 @@ struct Part<'a> {
     disposition: Vec<u8>,
     encoding: Vec<u8>,
     body: &'a [u8],
+}
+
+impl Part<'_> {
+    fn media_type(&self) -> &[u8] {
+        self.kind
+            .split(|&b| b == b';')
+            .next()
+            .unwrap_or_default()
+            .trim_ascii()
+    }
+    fn direct_encoding(&self) -> bool {
+        [
+            b"base64".as_slice(),
+            b"quoted-printable",
+            b"8bit",
+            b"binary",
+        ]
+        .iter()
+        .any(|name| self.encoding.eq_ignore_ascii_case(name))
+    }
+
+    fn named_attachment(&self) -> bool {
+        self.disposition
+            .split(|&b| b == b';')
+            .next()
+            .unwrap_or_default()
+            .trim_ascii()
+            .eq_ignore_ascii_case(b"attachment")
+            && parameter(&self.disposition, b"filename").is_some_and(|name| !name.is_empty())
+    }
+}
+
+fn mailbox_media(mime: &[u8]) -> bool {
+    let Some(slash) = mime.iter().position(|&b| b == b'/') else {
+        return false;
+    };
+    slash + 1 < mime.len()
+        && [
+            b"application".as_slice(),
+            b"audio",
+            b"image",
+            b"text",
+            b"video",
+        ]
+        .iter()
+        .any(|family| mime[..slash].eq_ignore_ascii_case(family))
 }
 
 fn line(input: &[u8]) -> (&[u8], &[u8]) {
@@ -335,12 +383,16 @@ struct ForwardFiles<'a> {
     multiple_notes: bool,
 }
 
-fn forward_files<'a>(mut body: &'a [u8], sink: &mut dyn ChildSink) -> io::Result<ForwardFiles<'a>> {
+fn forward_files<'a>(
+    mut body: &'a [u8],
+    mut check: impl FnMut() -> io::Result<()>,
+    next_line: impl Fn(&[u8]) -> (&[u8], &[u8]),
+) -> io::Result<ForwardFiles<'a>> {
     const MARKER: &[u8] = b"Content-Transfer-Encoding";
     let mut files = ForwardFiles::default();
     while !body.is_empty() {
-        sink.check()?;
-        let (row, next) = line(body);
+        check()?;
+        let (row, next) = next_line(body);
         // Stock checks this case-insensitive prefix even in prose, without a colon.
         if let Some((name, rest)) = row.split_at_checked(MARKER.len())
             && name.eq_ignore_ascii_case(MARKER)
@@ -380,6 +432,8 @@ struct Deferred<'a> {
     has_uu: bool,
     oversized_mixed: bool,
     direct_members: usize,
+    mbox: bool,
+    rejected_direct: bool,
 }
 
 // Identical saved messages have the same children and scan cost in either directory order.
@@ -437,12 +491,16 @@ fn part<'a>(
     let Some(p) = headers(input) else {
         return Ok(Handling::Incomplete);
     };
-    let mime = p
-        .kind
-        .split(|&b| b == b';')
-        .next()
-        .unwrap_or_default()
-        .trim_ascii();
+    let mime = p.media_type();
+    if deferred.mbox && multipart_member {
+        // In ordinary mixed mail, stock directly scans the text cover and decoded attachments.
+        let cover = mime.eq_ignore_ascii_case(b"text/plain") && p.encoding.is_empty();
+        let attachment = mailbox_media(mime)
+            && (p.direct_encoding() || p.encoding.is_empty() && p.named_attachment());
+        if depth != 1 || !(cover || attachment) {
+            return Ok(Handling::Incomplete);
+        }
+    }
     if mime
         .get(..10)
         .is_some_and(|v| v.eq_ignore_ascii_case(b"multipart/"))
@@ -530,7 +588,7 @@ fn part<'a>(
     let mut prefix = &[][..];
     let mut body = p.body;
     if forwarded && matches!(mode, Encoding::Plain) {
-        let files = forward_files(p.body, sink)?;
+        let files = forward_files(p.body, || sink.check(), line)?;
         if let Some(encoded) = files.note {
             let delayed = enc.is_empty() || enc.eq_ignore_ascii_case(b"7bit");
             let note = super::attachments::recovered_note(encoded, sink)?;
@@ -577,6 +635,11 @@ fn part<'a>(
         .or_else(|| parameter(&p.kind, b"name"))
         .or(forwarded.then_some(b"textportion".as_slice()));
     deferred.direct_members += 1;
+    if deferred.mbox && body.len() as u64 + 1 > sink.remaining() {
+        let remaining = sink.remaining();
+        deferred.rejected_direct |=
+            decoded_size(Body::new(body, mode), remaining, sink)? > remaining;
+    }
     deferred.prior_limit |= sink.child_limit().is_some();
     submit_parts(prefix, body, mode, filename, sink)
 }
@@ -626,14 +689,8 @@ fn parse_message(bytes: &[u8], standalone: bool, sink: &mut dyn ChildSink) -> io
             if !standalone || !sink.at_root() || deferred.direct_members != 1 {
                 return Ok(Handling::Incomplete);
             }
-            for block in bytes.chunks(8192) {
-                sink.check()?;
-                if !block
-                    .iter()
-                    .all(|b| b.is_ascii_graphic() || b.is_ascii_whitespace())
-                {
-                    return Ok(Handling::Incomplete);
-                }
+            if !printable(bytes, sink)? {
+                return Ok(Handling::Incomplete);
             }
             // Printable top-level mail has no subsequent embedded map. A note miss leaves
             // the outer raw matcher and the already recorded size limit identical in both orders.
@@ -648,29 +705,25 @@ fn parse_message(bytes: &[u8], standalone: bool, sink: &mut dyn ChildSink) -> io
     }
 }
 
+fn printable(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<bool> {
+    for block in bytes.chunks(8192) {
+        sink.check()?;
+        if !block
+            .iter()
+            .all(|b| b.is_ascii_graphic() || b.is_ascii_whitespace())
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 pub(super) fn extract(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handling> {
     if bytes.starts_with(b">From ") {
         return Ok(Handling::Incomplete);
     }
     if bytes.starts_with(b"From ") {
-        let (_, mut rest) = line(bytes);
-        let mut message = rest;
-        let mut empty = true;
-        while !rest.is_empty() {
-            let (row, next) = line(rest);
-            sink.check()?;
-            if empty && row.starts_with(b"From ") {
-                let previous = &message[..message.len() - rest.len()];
-                let result = parse_message(previous, false, sink)?;
-                if result != Handling::Complete {
-                    return Ok(result);
-                }
-                message = next;
-            }
-            empty = row.is_empty();
-            rest = next;
-        }
-        return parse_message(message, false, sink);
+        return mbox::extract(bytes, sink);
     }
     parse_message(bytes, true, sink)
 }

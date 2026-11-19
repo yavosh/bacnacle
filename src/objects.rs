@@ -46,6 +46,7 @@ trait ChildSink {
             None => Ok(false),
         }
     }
+    fn mailbox_letters(&mut self, letters: &mut text::SavedLetters) -> io::Result<Handling>;
     fn read_child(&mut self, data: &mut dyn Read) -> io::Result<Option<Snapshot>>;
     fn visit_snapshot(
         &mut self,
@@ -294,6 +295,7 @@ struct Traversal<'a> {
 #[derive(Clone, Copy, PartialEq)]
 enum InputKind {
     File,
+    MailboxLetter,
     Normalized(Target),
     Partition,
 }
@@ -353,6 +355,20 @@ impl Traversal<'_> {
             return Ok(());
         }
         let file_type = classify::FileType::classify(bytes, kind, self)?;
+        if kind == InputKind::MailboxLetter {
+            // Directory order is uncertain. Combining hits is valid only for text
+            // leaves with the byte and file costs measured by the mailbox parser.
+            if !matches!(file_type.parser, classify::Parser::Text)
+                || self.options.scan_archive && partition::from_mbr(bytes).is_some()
+                || embedded::possible_text_map(bytes, self)?
+            {
+                self.stopped = Some(Verdict::Incomplete);
+                return Ok(());
+            }
+            if classify::ignored(bytes) {
+                return Ok(());
+            }
+        }
         self.parents.push(Layer {
             target: file_type.context.target(),
             file_type: file_type.name,
@@ -548,6 +564,47 @@ impl ChildSink for Traversal<'_> {
         let result = embedded::contents(bytes, kind, self);
         self.parents.pop();
         result
+    }
+
+    fn mailbox_letters(&mut self, letters: &mut text::SavedLetters) -> io::Result<Handling> {
+        // For ordinary text, each admitted letter costs one map and its exact decoded size.
+        // A separately mapped script checks one more file slot and at most its input size.
+        let mapped = self.options.scan_html
+            && self.options.scan_normalized_script
+            && self.options.map_normalized_script
+            && letters.largest_script != 0;
+        let bytes = letters.total + if mapped { letters.largest_script } else { 0 };
+        let slots = letters.count + usize::from(mapped);
+        let scan_remaining =
+            unlimited_if_zero(self.options.max_scan_size).saturating_sub(self.bytes_scanned);
+        if bytes > scan_remaining
+            || letters.largest > self.max_file_size()
+            || self.options.max_files != 0
+                && self.options.max_files.saturating_sub(self.files_scanned) < slots
+        {
+            return Ok(Handling::Incomplete);
+        }
+        let mut winner = None;
+        for _ in 0..letters.count {
+            let Some(body) = letters.read(self)? else {
+                return Ok(Handling::Incomplete);
+            };
+            self.visit(body.as_ref(), InputKind::MailboxLetter, None)?;
+            let verdict = self.stopped.take().unwrap_or(Verdict::Miss);
+            match verdict {
+                Verdict::Miss => (),
+                Verdict::Found(name) if winner.as_ref().is_none_or(|other| other == &name) => {
+                    winner = Some(name)
+                }
+                _ => return Ok(Handling::Incomplete),
+            }
+        }
+        Ok(if let Some(name) = winner {
+            self.stopped = Some(Verdict::Found(name));
+            Handling::Stopped
+        } else {
+            Handling::Complete
+        })
     }
 
     fn read_child(&mut self, data: &mut dyn Read) -> io::Result<Option<Snapshot>> {

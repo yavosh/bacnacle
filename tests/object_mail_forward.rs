@@ -30,6 +30,15 @@ fn b64(bytes: &[u8]) -> String {
     }
     result
 }
+fn mime_base64(bytes: &[u8]) -> String {
+    b64(bytes)
+        .as_bytes()
+        .chunks(64)
+        .map(|row| std::str::from_utf8(row).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n"
+}
 fn inner() -> String {
     format!(
         "{HEAD}Content-Type: multipart/mixed; boundary=receipt\n\n--receipt\nContent-Type: text/plain\n\nAttached receipt.\n--receipt\nContent-Type: application/octet-stream; name=receipt.txt\nContent-Disposition: attachment; filename=receipt.txt\nContent-Transfer-Encoding: base64\n\n{}\n--receipt--\n",
@@ -39,15 +48,7 @@ fn inner() -> String {
 fn forward(enc: &str, nested: bool) -> String {
     let inner = inner();
     let body = match enc {
-        "base64" => {
-            b64(inner.as_bytes())
-                .as_bytes()
-                .chunks(64)
-                .map(|c| std::str::from_utf8(c).unwrap())
-                .collect::<Vec<_>>()
-                .join("\n")
-                + "\n"
-        }
+        "base64" => mime_base64(inner.as_bytes()),
         "quoted-printable" => inner.replace("=", "=3D").replace(" ", "=20"),
         _ => inner,
     };
@@ -965,4 +966,472 @@ fn stock_duplicate_forward_winners() -> io::Result<()> {
         )?;
     }
     Ok(())
+}
+
+fn mbox_pair(first: &str, second: &str) -> String {
+    format!(
+        "From office@example.invalid Fri Nov 19 02:00:00 2026\n{first}\nFrom depot@example.invalid Fri Nov 19 02:01:00 2026\n{second}"
+    )
+}
+
+fn mbox_orders(stock: bool) -> io::Result<()> {
+    let a = format!("{HEAD}Content-Type: text/plain\n\n{RECEIPT}");
+    let b = format!("{HEAD}Content-Type: text/plain\n\n{CONTACT}");
+    let attachment = format!(
+        "{HEAD}Content-Type: application/octet-stream; name=contact.vcf\nContent-Disposition: attachment; filename=contact.vcf\nContent-Transfer-Encoding: base64\n\n{}\n",
+        b64(CONTACT.as_bytes())
+    );
+    // Stock retains the blank line before the following From separator.
+    let ra =
+        hash("Receipt", RECEIPT.as_bytes())? + &hash("Receipt", format!("{RECEIPT}\n").as_bytes())?;
+    let rb =
+        hash("Contact", CONTACT.as_bytes())? + &hash("Contact", format!("{CONTACT}\n").as_bytes())?;
+    for (first, second, direct) in [
+        (&a, &b, false),
+        (&b, &a, false),
+        (&a, &attachment, true),
+        (&attachment, &a, true),
+    ] {
+        let lf = mbox_pair(first, second);
+        for doc in [lf.clone(), lf.replace('\n', "\r\n")] {
+            let outer = hash("Outer", doc.as_bytes())?;
+            for (db, want) in [
+                (ra.clone() + &outer, "Receipt"),
+                (rb.clone() + &outer, "Contact"),
+                (outer.clone(), "Outer"),
+            ] {
+                check(&Server::new(stock, "", &db)?, &doc, want)?;
+            }
+            let server = Server::new(stock, "", &(ra.clone() + &rb + &outer))?;
+            if direct {
+                check(&server, &doc, "Contact")?;
+            } else if stock {
+                for _ in 0..6 {
+                    let reply = server.scan(doc.as_bytes())?;
+                    assert!(
+                        reply == "stream: Fwd.Receipt.UNOFFICIAL FOUND\0"
+                            || reply == "stream: Fwd.Contact.UNOFFICIAL FOUND\0",
+                        "{reply:?}"
+                    );
+                }
+            } else {
+                check(&server, &doc, "Incomplete")?;
+            }
+        }
+    }
+    let doc = mbox_pair(&a, &b);
+    let rules = ra.clone() + &rb;
+    for (opts, want) in [
+        (
+            format!("MaxFiles 1\nMaxScanSize {}", doc.len()),
+            "Heuristics.Limits.Exceeded.MaxFiles",
+        ),
+        (
+            format!("MaxRecursion 1\nMaxScanSize {}", doc.len()),
+            "Heuristics.Limits.Exceeded.MaxScanSize",
+        ),
+        (
+            "MaxRecursion 1".into(),
+            "Heuristics.Limits.Exceeded.MaxRecursion",
+        ),
+        (
+            format!("MaxScanSize {}", doc.len() + RECEIPT.len()),
+            "Heuristics.Limits.Exceeded.MaxScanSize",
+        ),
+    ] {
+        check(
+            &Server::new(stock, &format!("{opts}\nAlertExceedsMax yes"), &rules)?,
+            &doc,
+            want,
+        )?;
+    }
+    for opts in [
+        "MaxFiles 2".to_owned(),
+        format!("MaxScanSize {}", doc.len() + RECEIPT.len() + 1),
+    ] {
+        let s = Server::new(stock, &format!("{opts}\nAlertExceedsMax yes"), &rules)?;
+        if stock {
+            let r = s.scan(doc.as_bytes())?;
+            assert!(
+                r == "stream: Fwd.Receipt.UNOFFICIAL FOUND\0"
+                    || r == "stream: Fwd.Contact.UNOFFICIAL FOUND\0"
+                    || r == "stream: Heuristics.Limits.Exceeded.MaxScanSize FOUND\0"
+            );
+        } else {
+            check(&s, &doc, "Incomplete")?;
+        }
+    }
+    let shared =
+        hash("Ledger", format!("{RECEIPT}\n").as_bytes())? + &hash("Ledger", CONTACT.as_bytes())?;
+    check(&Server::new(stock, "", &shared)?, &doc, "Ledger")?;
+    let with_markup = format!(
+        "{HEAD}Content-Type: text/plain\n\nMail <desk@example.invalid> about café invoices.\n"
+    );
+    let body = "Mail <desk@example.invalid> about café invoices.\n";
+    check(
+        &Server::new(stock, "", &hash("Ledger", body.as_bytes())?)?,
+        &mbox_pair(&a, &with_markup),
+        "Ledger",
+    )?;
+    let cover = "Attached receipt.\n";
+    let mixed = inner();
+    for doc in [mbox_pair(&b, &mixed), mbox_pair(&mixed, &b)] {
+        let cover_sig = hash("Cover", cover.as_bytes())?;
+        check(
+            &Server::new(stock, "", &(cover_sig + &ra + &rb))?,
+            &doc,
+            "Cover",
+        )?;
+        check(
+            &Server::new(stock, "", &(ra.clone() + &rb))?,
+            &doc,
+            "Receipt",
+        )?;
+        check(&Server::new(stock, "", &rb)?, &doc, "Contact")?;
+    }
+    // A rejected direct attachment remains in the recovery directory beside the smaller letter.
+    let pair = mbox_pair(&a, &attachment);
+    let opts = format!(
+        "MaxScanSize {}\nAlertExceedsMax yes",
+        pair.len() + RECEIPT.len() + 1
+    );
+    let s = Server::new(stock, &opts, &ra)?;
+    if stock {
+        let reply = s.scan(pair.as_bytes())?;
+        assert!(
+            reply == "stream: Fwd.Receipt.UNOFFICIAL FOUND\0"
+                || reply == "stream: Heuristics.Limits.Exceeded.MaxScanSize FOUND\0"
+        );
+    } else {
+        check(&s, &pair, "Incomplete")?;
+    }
+    check(
+        &Server::new(stock, &opts, &hash("Outer", pair.as_bytes())?)?,
+        &pair,
+        "Outer",
+    )?;
+    for (line, wire, expected) in [
+        (997, true, "\n"),
+        (998, true, "\n\n"),
+        (998, false, "\n"),
+        (999, false, "\n\n"),
+    ] {
+        let row = "Z".repeat(line);
+        let note = format!("{HEAD}Content-Type: text/plain\n\n{row}\n");
+        let m = mbox_pair(&a, &note);
+        let m = if wire { m.replace('\n', "\r\n") } else { m };
+        check(
+            &Server::new(
+                stock,
+                "",
+                &hash("Long", format!("{row}{expected}").as_bytes())?,
+            )?,
+            &m,
+            "Long",
+        )?;
+    }
+    let note = format!("{HEAD}Content-Type: text/plain\n\nNorth\n\n\nWednesday\n \t \nPaid\n");
+    let doc = mbox_pair(&a, &note);
+    check(
+        &Server::new(stock, "", &hash("Copy", b"North\n\nWednesday\n \nPaid\n")?)?,
+        &doc,
+        "Copy",
+    )?;
+    let seven = a.replace(
+        "Content-Type: text/plain\n",
+        "Content-Type: text/plain\nContent-Transfer-Encoding: 7bit\n",
+    );
+    let doc = mbox_pair(&seven, &b);
+    let s = Server::new(
+        stock,
+        "MaxFiles 3\nAlertExceedsMax yes",
+        &hash("Miss", b"unlisted ledger")?,
+    )?;
+    check(
+        &s,
+        &doc,
+        if stock {
+            "Heuristics.Limits.Exceeded.MaxFiles"
+        } else {
+            "Incomplete"
+        },
+    )?;
+    Ok(())
+}
+#[test]
+fn mbox_winners() -> io::Result<()> {
+    mbox_orders(false)
+}
+#[test]
+#[ignore = "requires pinned Debian clamd"]
+fn stock_mbox_winners() -> io::Result<()> {
+    mbox_orders(true)
+}
+
+fn longer_mbox(stock: bool) -> io::Result<()> {
+    let plain = |s: &str| format!("{HEAD}Content-Type: text/plain\n\n{s}");
+    let bin = |s: &str| {
+        format!(
+            "{HEAD}Content-Type: application/octet-stream; name=receipt.txt\nContent-Transfer-Encoding: base64\n\n{}\n",
+            b64(s.as_bytes())
+        )
+    };
+    let series = |parts: &[&String]| {
+        parts
+            .iter()
+            .map(|s| format!("From desk@example.invalid Fri Nov 19 02:00:00 2026\n{s}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let first = plain(RECEIPT);
+    let second = plain(CONTACT);
+    let end = "Purchased train tickets for Friday.\n";
+    let late = bin(end);
+    let big = bin(&"Annual expense report, North Office. ".repeat(40));
+    let receipts = hash("Receipt", format!("{RECEIPT}\n").as_bytes())?;
+    let contact =
+        hash("Contact", format!("{CONTACT}\n").as_bytes())? + &hash("Contact", CONTACT.as_bytes())?;
+    let direct = hash("Tickets", end.as_bytes())?;
+    for parts in [
+        vec![&first, &second, &late],
+        vec![&first, &second, &first, &second, &late],
+    ] {
+        let doc = series(&parts);
+        let rules = receipts.clone() + &contact + &direct + &hash("Outer", doc.as_bytes())?;
+        check(&Server::new(stock, "", &rules)?, &doc, "Tickets")?;
+        check(
+            &Server::new(stock, &format!("MaxFiles {}", parts.len()), &rules)?,
+            &doc,
+            "Tickets",
+        )?;
+        let s = Server::new(
+            stock,
+            &format!("MaxFiles {}\nAlertExceedsMax yes", parts.len() - 1),
+            &direct,
+        )?;
+        check(&s, &doc, "Heuristics.Limits.Exceeded.MaxFiles")?;
+    }
+    let plain_end = plain(end);
+    let doc = series(&[&first, &second, &first, &second, &plain_end]);
+    check(&Server::new(stock, "", &direct)?, &doc, "Tickets")?;
+    check(&Server::new(stock, "", &receipts)?, &doc, "Receipt")?;
+    let h = hash("Outer", doc.as_bytes())?;
+    check(&Server::new(stock, "", &h)?, &doc, "Outer")?;
+    for parts in [[&big, &first, &second], [&first, &second, &big]] {
+        let doc = series(&parts);
+        let opts = format!(
+            "MaxScanSize {}\nAlertExceedsMax yes",
+            doc.len() + RECEIPT.len() + CONTACT.len() + 4
+        );
+        let s = Server::new(stock, &opts, &receipts)?;
+        if stock {
+            let reply = s.scan(doc.as_bytes())?;
+            assert!(
+                reply == "stream: Fwd.Receipt.UNOFFICIAL FOUND\0"
+                    || reply == "stream: Heuristics.Limits.Exceeded.MaxScanSize FOUND\0",
+                "{reply:?}"
+            );
+        } else {
+            check(&s, &doc, "Incomplete")?;
+        }
+        check(
+            &Server::new(stock, &opts, &direct)?,
+            &doc,
+            "Heuristics.Limits.Exceeded.MaxScanSize",
+        )?;
+        check(
+            &Server::new(stock, &opts, &hash("Outer", doc.as_bytes())?)?,
+            &doc,
+            "Outer",
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn longer_mbox_winners() -> io::Result<()> {
+    longer_mbox(false)
+}
+
+#[test]
+#[ignore = "requires pinned Debian clamd"]
+fn stock_longer_mbox_winners() -> io::Result<()> {
+    longer_mbox(true)
+}
+
+fn small_mail_and_views(stock: bool) -> io::Result<()> {
+    let plain = |s: &str| format!("{HEAD}Content-Type: text/plain\n\n{s}");
+    let a = "North office received more folders.\n".repeat(90);
+    let b = "Bookkeeper approved the delivery.\n".repeat(70);
+    let hdb = hash("B", b.as_bytes())? + &hash("B", format!("{b}\n").as_bytes())?;
+    let only_view = "Unused:7:EOF-6:7a717a717a71\n";
+    let ar = plain(&a);
+    let br = plain(&b);
+    let doc = mbox_pair(&ar, &br);
+    let aggregate = doc.len() + a.len() + 1 + b.len();
+    for option in [
+        format!("MaxFileSize {}", doc.len()),
+        "ScanHTML no\nMaxFiles 3".to_owned(),
+        format!("ScanHTML no\nMaxScanSize {aggregate}"),
+        "MaxScriptNormalize 16\nMaxFiles 3".into(),
+        format!("MaxScriptNormalize 16\nMaxScanSize {aggregate}"),
+    ] {
+        for (rules, winner) in [(&hdb, "B"), (&hash("Outer", doc.as_bytes())?, "Outer")] {
+            let s = Server::with_rules(
+                stock,
+                &format!("{option}\nAlertExceedsMax yes"),
+                rules,
+                Some(("views.ndb", only_view)),
+            )?;
+            check(&s, &doc, winner)?;
+        }
+    }
+    for tiny in ["", "\n", "OK\n", "yes\n"] {
+        let item = plain(tiny);
+        for doc in [mbox_pair(&item, &br), mbox_pair(&br, &item)] {
+            check(
+                &Server::new(stock, "MaxFiles 2\nAlertExceedsMax yes", &hdb)?,
+                &doc,
+                "B",
+            )?;
+            check(
+                &Server::new(stock, "", &hash("Outer", doc.as_bytes())?)?,
+                &doc,
+                "Outer",
+            )?;
+        }
+        let doc = format!(
+            "{}\nFrom desk@example.invalid Fri Nov 19 02:01:00 2026\n{br}",
+            mbox_pair(&item, &item)
+        );
+        let s = Server::new(stock, "MaxFiles 2\nAlertExceedsMax yes", &hdb)?;
+        check(
+            &s,
+            &doc,
+            if tiny.trim().is_empty() {
+                "B"
+            } else {
+                "Heuristics.Limits.Exceeded.MaxFiles"
+            },
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn mbox_small_bodies_and_script_limits() -> io::Result<()> {
+    small_mail_and_views(false)
+}
+
+#[test]
+#[ignore = "requires pinned Debian clamd"]
+fn stock_mbox_small_bodies_and_script_limits() -> io::Result<()> {
+    small_mail_and_views(true)
+}
+
+fn business_member(mime: &str, name: &str, encoding: &str, body: &str, mixed: bool) -> String {
+    let typ = format!(
+        "Content-Type: {mime}; name=\"{name}\"\nContent-Disposition: attachment; filename=\"{name}\"\n"
+    );
+    let cte = if encoding.is_empty() {
+        String::new()
+    } else {
+        format!("Content-Transfer-Encoding: {encoding}\n")
+    };
+    if mixed {
+        format!(
+            "{HEAD}Content-Type: multipart/mixed; boundary=office\n\n--office\nContent-Type: text/plain\n\nAttached for the inventory.\n--office\n{typ}{cte}\n{body}--office--\n"
+        )
+    } else {
+        format!("{HEAD}{typ}{cte}\n{body}")
+    }
+}
+
+fn business_messages(stock: bool) -> io::Result<()> {
+    const CSV: &[u8] = b"Month,Office,Count\nNovember,North,42\n";
+    let items: &[(&str, &str, &[u8])] = &[
+        (
+            "application/pdf",
+            "invoice.pdf",
+            include_bytes!("fixtures/pdf/qpdf-object-stream.pdf"),
+        ),
+        (
+            "image/png",
+            "stamp.png",
+            include_bytes!("fixtures/images/blue.png"),
+        ),
+        ("text/csv", "inventory.csv", CSV),
+        (
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "report.xlsx",
+            include_bytes!("fixtures/ooxml/report.xlsx"),
+        ),
+    ];
+    let first = format!("{HEAD}Content-Type: text/plain\n\n{RECEIPT}");
+    let receipt = hash("Receipt", format!("{RECEIPT}\n").as_bytes())?;
+    let cover = hash("Cover", b"Attached for the inventory.\n")?;
+    for &(mime, name, data) in items {
+        let file = hash("File", data)?;
+        let encodings = if data == CSV {
+            &["base64", "quoted-printable", "8bit", "binary", ""][..]
+        } else {
+            &["base64"][..]
+        };
+        for &enc in encodings {
+            let wire = if enc == "base64" {
+                mime_base64(data)
+            } else {
+                std::str::from_utf8(data).unwrap().to_owned()
+            };
+            for mixed in [false, true] {
+                let member = business_member(mime, name, enc, &wire, mixed);
+                let two = mbox_pair(&first, &member);
+                let three =
+                    format!("From desk@example.invalid Fri Nov 19 01:59:00 2026\n{first}\n{two}");
+                let outer = hash("Outer", two.as_bytes())? + &hash("Outer", three.as_bytes())?;
+                let all = Server::new(stock, "", &(file.clone() + &receipt + &outer))?;
+                for doc in [&two, &three] {
+                    if enc.is_empty() && !mixed {
+                        // Stock saves unencoded standalone CSV beside the earlier receipt.
+                        if stock {
+                            let r = all.scan(doc.as_bytes())?;
+                            assert!(
+                                matches!(
+                                    r.as_str(),
+                                    "stream: Fwd.File.UNOFFICIAL FOUND\0"
+                                        | "stream: Fwd.Receipt.UNOFFICIAL FOUND\0"
+                                ),
+                                "{r:?}"
+                            );
+                        } else {
+                            check(&all, doc, "Incomplete")?;
+                        }
+                        check(&Server::new(stock, "", &file)?, doc, "File")?;
+                    } else {
+                        check(&all, doc, "File")?;
+                    }
+                }
+                check(&Server::new(stock, "", &outer)?, &two, "Outer")?;
+                if mixed {
+                    check(
+                        &Server::new(stock, "", &(cover.clone() + &file + &receipt + &outer))?,
+                        &three,
+                        "Cover",
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn business_attachment_mbox() -> io::Result<()> {
+    business_messages(false)
+}
+
+#[test]
+#[ignore = "requires pinned Debian clamd"]
+fn stock_business_attachment_mbox() -> io::Result<()> {
+    business_messages(true)
 }

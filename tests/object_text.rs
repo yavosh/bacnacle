@@ -129,7 +129,6 @@ fn compare(executable: &Path, stock: bool) -> io::Result<()> {
         (b"<html><script>function Say(Word) { var Content = Word; return Content; } Say(\"Hello\");</script></html>", Some("Function")),
         (b"<html><script>var View = Report.Value; if(View > 1) { View = View + 2; } document.write(View);</script></html>", Some("Property")),
         (mail, Some("MailBody")),
-        (b"From alpha@example.invalid Fri Nov 19 02:00:00 2026\nFrom: alpha@example.invalid\nSubject: one\nContent-Type: text/plain\n\nFirst Letter\n\nFrom beta@example.invalid Fri Nov 19 02:01:00 2026\nFrom: beta@example.invalid\nSubject: two\nContent-Type: text/plain\n\nSecond Letter\n", Some("FirstLetter")),
         (b"From: report@example.invalid\nSubject: message\nContent-Type: message/rfc822\n\nFrom: source@example.invalid\nSubject: nested\nContent-Type: text/plain\n\nSecond Letter\n", Some("NextLetter")),
         (b"From: report@example.invalid\nSubject: alternatives\nContent-Type: multipart/alternative;\n boundary=\"abc\"\n\n--abc\nContent-Type: text/plain\n\nFirst Letter\n--abc\nContent-Type: text/html\n\n<html><p>HTML LaBeL</p></html>\n--abc--\n", Some("FirstLetter")),
         (b"From: letter@example.invalid\nSubject: EnvelopeMarker\nContent-Type: text/plain\n\nChildContextMarker\n", Some("MailParent")),
@@ -146,6 +145,22 @@ fn compare(executable: &Path, stock: bool) -> io::Result<()> {
             unix_request(&socket, &stream_frame(sample)?)?,
             expected,
             "text fixture {i}"
+        );
+    }
+    let mbox = b"From alpha@example.invalid Fri Nov 19 02:00:00 2026\nFrom: alpha@example.invalid\nSubject: one\nContent-Type: text/plain\n\nFirst Letter\n\nFrom beta@example.invalid Fri Nov 19 02:01:00 2026\nFrom: beta@example.invalid\nSubject: two\nContent-Type: text/plain\n\nSecond Letter\n";
+    let reply = unix_request(&socket, &stream_frame(mbox)?)?;
+    if stock {
+        assert!(
+            [
+                "stream: Local.FirstLetter.UNOFFICIAL FOUND\0",
+                "stream: Local.NextLetter.UNOFFICIAL FOUND\0"
+            ]
+            .contains(&reply.as_str())
+        );
+    } else {
+        assert_eq!(
+            reply,
+            "stream: Incomplete scan: unsupported detection coverage. ERROR\0"
         );
     }
     Ok(())
