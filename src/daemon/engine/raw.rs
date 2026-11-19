@@ -13,7 +13,6 @@ pub(super) fn eligible(header: &[u8]) -> bool {
     // Exclude the leading pairs of all fixed-offset-zero built-in types. Python
     // bytecode uses CR LF at bytes 2 and 3 instead. Include BOMs for encoded text.
     const PREFIXES: &[&[u8; 2]] = &[
-        b"\0\0",
         b"\x1f\x8b",
         b"#@",
         b"%!",
@@ -51,7 +50,6 @@ pub(super) fn eligible(header: &[u8]) -> bool {
         b"PK",
         b"RI",
         b"Ra",
-        b"Re",
         b"SI",
         b"SQ",
         b"SY",
@@ -87,7 +85,19 @@ pub(super) fn eligible(header: &[u8]) -> bool {
         b"\xfe\xff",
         b"\xff\xfe",
     ];
-    if PREFIXES.iter().any(|prefix| header.starts_with(*prefix))
+    // The built-in types with two leading NULs are JPEG2000 and MPEG.
+    // Keep their three-byte prefixes and the UTF-32 byte-order markers guarded.
+    let zero_prefix = matches!(header[..3], [0, 0, 0 | 1 | 0xfe | 0xff]);
+    if zero_prefix
+        || PREFIXES.iter().any(|prefix| header.starts_with(*prefix))
+        || [
+            b"Received: ".as_slice(),
+            b"Received-SPF: ",
+            b"Return-Path: ",
+            b"Return-path: ",
+        ]
+        .iter()
+        .any(|field| header.starts_with(field))
         || header.starts_with(b"begin ")
         || header[2..4] == *b"\r\n"
         || header[1..4] == *b"\r\r\n"
@@ -96,8 +106,6 @@ pub(super) fn eligible(header: &[u8]) -> bool {
         || header.get(510..512) == Some(b"\x55\xaa")
         || header.get(512..516) == Some(b"EFI ")
         || header.get(257..262) == Some(b"ustar")
-        || (header.len() >= 512
-            && (header[148].is_ascii_whitespace() || matches!(header[148], 0 | b'0'..=b'7')))
     {
         return false;
     }

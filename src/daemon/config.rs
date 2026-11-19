@@ -5,6 +5,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use barnacle::objects::Options;
 use regex::Regex;
 
 pub(super) fn invalid(message: impl Into<String>) -> io::Error {
@@ -19,8 +20,7 @@ pub(super) struct Config {
     pub fail_if_cvd_older_than: Option<u64>,
     pub detect_pua: bool,
     pub stream_max_length: u64,
-    pub max_file_size: u64,
-    pub max_scan_size: u64,
+    pub objects: Options,
     pub max_scan_time: Duration,
     pub command_read_timeout: Duration,
     pub read_timeout: Duration,
@@ -39,7 +39,6 @@ pub(super) struct Config {
     pub tcp_port: Option<u16>,
     pub backlog: i32,
     pub max_threads: usize,
-    pub(super) max_recursion: usize,
     pub max_queue: usize,
     pub idle_timeout: Duration,
     pub self_check: Duration,
@@ -68,8 +67,7 @@ impl Default for Config {
             fail_if_cvd_older_than: None,
             detect_pua: false,
             stream_max_length: 100 << 20,
-            max_file_size: 100 << 20,
-            max_scan_size: 400 << 20,
+            objects: Options::default(),
             max_scan_time: Duration::ZERO,
             command_read_timeout: Duration::from_secs(30),
             read_timeout: Duration::from_secs(120),
@@ -88,7 +86,6 @@ impl Default for Config {
             tcp_port: None,
             backlog: 200,
             max_threads: 10,
-            max_recursion: 17,
             max_queue: 100,
             idle_timeout: Duration::from_secs(30),
             self_check: Duration::from_secs(600),
@@ -144,8 +141,26 @@ impl Config {
                 self.fail_if_cvd_older_than = Some(number(value)?).filter(|d| *d > 0)
             }
             "DetectPUA" => self.detect_pua = boolean(value)?,
-            "MaxFileSize" => self.max_file_size = size(value)?,
-            "MaxScanSize" => self.max_scan_size = size(value)?,
+            "MaxFileSize" => self.objects.max_file_size = size(value)?,
+            "MaxScanSize" => self.objects.max_scan_size = size(value)?,
+            "MaxFiles" => self.objects.max_files = number(value)?,
+            "MaxRecursion" => self.objects.max_recursion = number(value)?,
+            "AlertExceedsMax" => self.objects.alert_exceeds_max = boolean(value)?,
+            "ScanArchive" => self.objects.scan_archive = boolean(value)?,
+            "ScanPDF" => self.objects.scan_pdf = boolean(value)?,
+            "ScanOLE2" => self.objects.scan_ole2 = boolean(value)?,
+            "ScanSWF" => self.objects.scan_swf = boolean(value)?,
+            "ScanHTML" => self.objects.scan_html = boolean(value)?,
+            "ScanMail" => self.objects.scan_mail = boolean(value)?,
+            "MaxHTMLNormalize" | "MaxHTMLNoTags" | "MaxScriptNormalize" => {
+                let n = size(value)?;
+                let n = if n == 0 { u64::from(u32::MAX) } else { n };
+                match key {
+                    "MaxHTMLNormalize" => self.objects.max_html_normalize = n,
+                    "MaxHTMLNoTags" => self.objects.max_html_no_tags = n,
+                    _ => self.objects.max_script_normalize = n,
+                }
+            }
             "MaxScanTime" => self.max_scan_time = Duration::from_millis(number(value)?),
             "StreamMaxLength" => self.stream_max_length = size(value)?,
             "CommandReadTimeout" => self.command_read_timeout = Duration::from_secs(number(value)?),
@@ -173,10 +188,6 @@ impl Config {
             "TCPAddr" => self.tcp_addresses.push(value.into()),
             "MaxConnectionQueueLength" => self.backlog = number(value)?,
             "MaxThreads" => self.max_threads = number(value)?,
-            "MaxRecursion" => {
-                self.max_recursion = number(value)?;
-                self.partial_engine_options.push(key.into());
-            }
             "MaxQueue" => self.max_queue = number(value)?,
             "IdleTimeout" => self.idle_timeout = Duration::from_secs(number(value)?),
             "SelfCheck" => self.self_check = Duration::from_secs(number(value)?),
@@ -270,7 +281,7 @@ impl Config {
         let (soft, _) = nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE)?;
         config.max_queue = queue_limit(
             config.max_threads,
-            config.max_recursion,
+            config.objects.max_recursion,
             config.max_queue,
             soft.try_into().unwrap_or(usize::MAX),
         );
@@ -289,13 +300,7 @@ fn queue_limit(threads: usize, recursion: usize, requested: usize, descriptors: 
 
 fn reference_engine_value(key: &str, value: &str) -> bool {
     match key {
-        "ScanMail"
-        | "ScanArchive"
-        | "ScanPE"
-        | "ScanOLE2"
-        | "ScanPDF"
-        | "ScanHTML"
-        | "ScanSWF"
+        "ScanPE"
         | "AlgorithmicDetection"
         | "ScanELF"
         | "PhishingSignatures"
@@ -314,12 +319,9 @@ fn reference_engine_value(key: &str, value: &str) -> bool {
         | "ForceToDisk"
         | "DisableCertCheck" => boolean(value).ok() == Some(false),
         "BytecodeSecurity" => value == "TrustSigned",
-        "MaxEmbeddedPE" | "MaxHTMLNormalize" => matches!(size(value), Ok(10485760 | 41943040)),
-        "MaxHTMLNoTags" => matches!(size(value), Ok(2097152 | 8388608)),
-        "MaxScriptNormalize" => matches!(size(value), Ok(5242880 | 2097152)),
+        "MaxEmbeddedPE" => matches!(size(value), Ok(10485760 | 41943040)),
         "MaxZipTypeRcg" => size(value).ok() == Some(1 << 20),
         "PCREMaxFileSize" => matches!(size(value), Ok(26214400 | 104857600)),
-        "MaxFiles" => value == "10000",
         "MaxPartitions" => value == "50",
         "MaxIconsPE" => value == "100",
         "PCREMatchLimit" => value == "10000" || value == "100000",
@@ -417,7 +419,7 @@ mod tests {
             config.local_socket.as_deref(),
             Some(Path::new("/run/test clam/socket"))
         );
-        assert_eq!(config.max_file_size, 25 << 20);
+        assert_eq!(config.objects.max_file_size, 25 << 20);
         assert_eq!(config.tcp_addresses, ["localhost", "127.0.0.1"]);
         assert_eq!(config.exclude_paths.len(), 2);
         assert_eq!(config.fail_if_cvd_older_than, Some(7));

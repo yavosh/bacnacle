@@ -89,6 +89,10 @@ pub struct Offset {
 }
 
 impl Offset {
+    pub(super) fn is_relative(&self) -> bool {
+        !matches!(self.base, Base::Any | Base::Absolute)
+    }
+
     pub fn parse(text: &str, target: Target) -> io::Result<Self> {
         if text.len() > 64 {
             return Err(invalid("offset exceeds 64 bytes"));

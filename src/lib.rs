@@ -9,6 +9,7 @@ use sha2::Sha256;
 pub mod body;
 mod feed;
 pub mod index;
+pub mod objects;
 pub use feed::{Feed, FileInventory, IgnoreSet, PINNED_FLEVEL};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

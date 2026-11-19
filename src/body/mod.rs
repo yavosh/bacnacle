@@ -132,6 +132,13 @@ impl BodyIndex {
     pub fn is_empty(&self) -> bool {
         self.rules.is_empty()
     }
+
+    /// The pinned script scanner maps its normalized output when target 7 needs relative offsets.
+    pub fn needs_normalized_script_map(&self) -> bool {
+        self.rules
+            .iter()
+            .any(|rule| rule.target == Target::Ascii && rule.offset.is_relative())
+    }
     pub fn rule_count(&self) -> usize {
         self.rules.len()
     }
