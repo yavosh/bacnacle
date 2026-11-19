@@ -23,6 +23,7 @@ fn samples() -> io::Result<Vec<(Vec<u8>, &'static str)>> {
         ("xl/workbook.xml", TYPES[2]),
         ("ppt/slides/a.xml", TYPES[3]),
         ("Contents/content.hpf", TYPES[4]),
+        ("Contents/content.hpf.bak", TYPES[4]),
     ] {
         out.push((zip::zip(&[(path, MARKER)], true, false, false)?, ty));
     }
@@ -42,6 +43,20 @@ fn samples() -> io::Result<Vec<(Vec<u8>, &'static str)>> {
             )?,
             ty,
         ));
+    }
+    for (name, ty) in [
+        ("Contents/content.hpf", TYPES[4]),
+        ("Contents/content.hpf.bak", TYPES[0]),
+    ] {
+        let entries: &[(&str, &[u8])] = &[
+            ("BinData/preview.txt", MARKER),
+            ("notes/title.txt", b"Quarterly report title"),
+            ("notes/author.txt", b"Quarterly report author"),
+            (name, b"<package/>"),
+        ];
+        for reversed in [false, true] {
+            out.push((zip::zip(entries, true, false, reversed)?, ty));
+        }
     }
     Ok(out)
 }

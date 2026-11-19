@@ -2,12 +2,13 @@
 use super::{ChildSink, archive};
 use std::io;
 
-fn office_type(name: &[u8]) -> Option<&'static str> {
+const HWP_CONTENT: &[u8] = b"Contents/content.hpf";
+
+fn office_directory_type(name: &[u8]) -> Option<&'static str> {
     for (prefix, kind) in [
         (b"word/".as_slice(), "CL_TYPE_OOXML_WORD"),
         (b"xl/", "CL_TYPE_OOXML_XL"),
         (b"ppt/", "CL_TYPE_OOXML_PPT"),
-        (b"Contents/content.hpf", "CL_TYPE_OOXML_HWP"),
     ] {
         if name.starts_with(prefix) {
             return Some(kind);
@@ -29,7 +30,7 @@ fn package_part(name: &[u8]) -> bool {
         b"settings.xml",
         b"Preview/PrvText.txt",
         b"META-INF/container.xml",
-        b"BinData\0",
+        b"BinData",
     ]
     .iter()
     .any(|prefix| name.starts_with(prefix))
@@ -51,7 +52,11 @@ pub(super) fn classify(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<&'s
         if let Some(at) = window.windows(4).position(|b| b == b"PK\x03\x04")
             && let Some(name) = window.get(at + 30..).filter(|name| name.len() > 22)
         {
-            if let Some(kind) = office_type(name) {
+            // The local check compares prefixes in the header window.
+            if name.starts_with(HWP_CONTENT) {
+                return Ok("CL_TYPE_OOXML_HWP");
+            }
+            if let Some(kind) = office_directory_type(name) {
                 return Ok(kind);
             }
             hint |= package_part(name);
@@ -87,7 +92,14 @@ pub(super) fn classify(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<&'s
         let Some(name) = fields.get(..length(28)) else {
             break;
         };
-        if let Some(kind) = office_type(name) {
+        // The central lookup compares the complete HWP package filename.
+        if name
+            .strip_prefix(HWP_CONTENT)
+            .is_some_and(|suffix| matches!(suffix.first(), None | Some(0)))
+        {
+            return Ok("CL_TYPE_OOXML_HWP");
+        }
+        if let Some(kind) = office_directory_type(name) {
             return Ok(kind);
         }
         let Some(next) = fields.get(length(28) + length(30) + length(32)..) else {

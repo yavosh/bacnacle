@@ -22,6 +22,7 @@ pub(super) enum Parser {
     Swf,
     OneNote,
     Image,
+    Raw,
     Iso(iso::Layout),
     Udf,
     Partition,
@@ -68,6 +69,15 @@ impl FileType {
         }
         if let Some(name) = partition::initial(bytes) {
             return Ok(Self::generic(bytes, name, Parser::PartitionMap(name)));
+        }
+        if bytes.starts_with(b"RIFF") || bytes.starts_with(b"RIFX") {
+            // Stock has an additional pre-match pass for animated cursors.
+            let parser = if bytes.get(8..12) == Some(b"ACON") {
+                Parser::None
+            } else {
+                Parser::Raw
+            };
+            return Ok(Self::generic(bytes, "CL_TYPE_RIFF", parser));
         }
         if let Some(layout) = iso::Layout::recognize(bytes) {
             return Ok(Self::generic(
@@ -149,6 +159,7 @@ impl FileType {
             Target::Ole2 => Parser::Ole2,
             Target::Flash => Parser::Swf,
             Target::Graphics => Parser::Image,
+            Target::Java => Parser::Raw,
             Target::Generic if name.starts_with("CL_TYPE_TEXT_") => Parser::Text,
             _ => Parser::None,
         };
@@ -182,6 +193,7 @@ impl FileType {
             Target::Pe => "CL_TYPE_MSEXE",
             Target::Elf => "CL_TYPE_ELF",
             Target::MachO => "CL_TYPE_MACHO",
+            Target::Java => "CL_TYPE_JAVA",
             Target::Ole2 => "CL_TYPE_MSOLE2",
             Target::Flash => "CL_TYPE_SWF",
             Target::Graphics => match bytes {
@@ -280,6 +292,7 @@ impl Parser {
             | Self::Swf
             | Self::OneNote
             | Self::Image
+            | Self::Raw
             | Self::Iso(_)
             | Self::Udf
             | Self::Partition

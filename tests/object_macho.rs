@@ -84,12 +84,20 @@ fn compare(exe: &Path, stock: bool) -> io::Result<()> {
         false,
         false,
     )?;
+    // Java classes and universal Mach-O files share their first four bytes.
+    let class = include_bytes!("fixtures/java/Note.class.bin");
+    let mut java11 = class.to_vec();
+    java11[7] = 55;
+    let mut java21 = class.to_vec();
+    java21[7] = 65;
     let mut rules = String::new();
     for (id, bytes) in [
         ("X86", x.as_slice()),
         ("Arm", &arm),
         ("Outer", &outer),
         ("Note", NOTE),
+        ("JavaHash", &java11),
+        ("Java21Hash", &java21),
     ] {
         rules.push_str(&format!(
             "{}:{}:Mach.{id}\n",
@@ -98,6 +106,12 @@ fn compare(exe: &Path, stock: bool) -> io::Result<()> {
         ));
     }
     fs::write(db.join("test.hdb"), rules)?;
+    fs::write(
+        db.join("java.ndb"),
+        "Mach.JavaBody:12:0:cafebabe0000003d\nMach.Java21Body:12:0:cafebabe00000041\n",
+    )?;
+    let jar = zip::zip(&[("Note.class", class)], true, false, false)?;
+    let hash_jar = zip::zip(&[("Note.class", &java11)], true, false, false)?;
     let mut zero = text.clone();
     zero[20..24].fill(0);
     let mut clipped = text.clone();
@@ -110,6 +124,11 @@ fn compare(exe: &Path, stock: bool) -> io::Result<()> {
             "ordinary",
             "",
             vec![
+                ("Java 17 interface", class.to_vec(), Some("JavaBody")),
+                ("Java 17 JAR", jar, Some("JavaBody")),
+                ("Java 11 interface", java11, Some("JavaHash")),
+                ("Java 11 JAR", hash_jar, Some("JavaHash")),
+                ("Java 21 is generic on stock", java21, Some("Java21Hash")),
                 ("direct x86", x.clone(), first),
                 ("direct arm", arm.clone(), Some("Arm")),
                 ("lipo original", apple, first),

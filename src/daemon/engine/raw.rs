@@ -70,7 +70,6 @@ pub(super) fn eligible(header: &[u8], file_type: &str) -> bool {
         b"\x89P",
         b"\xb6\xb9",
         b"\xc7q",
-        b"\xca\xfe",
         b"\xce\xfa",
         b"\xcf\xfa",
         b"\xd0\xcf",
@@ -91,7 +90,10 @@ pub(super) fn eligible(header: &[u8], file_type: &str) -> bool {
             header[..4],
             [0, 0, 1, 0xb3 | 0xba] | [0, 0, 0xfe, 0xff] | [0, 0, 0xff, 0xfe]
         );
+    // Stock's universal Mach-O and Java definitions cover only values 0 through 63.
+    let java_or_universal = matches!(header, [0xca, 0xfe, 0xba, 0xbe, 0, 0, 0, 0..=63, ..]);
     if zero_prefix
+        || java_or_universal
         || PREFIXES.iter().any(|prefix| header.starts_with(*prefix))
         || [
             b"Received: ".as_slice(),
