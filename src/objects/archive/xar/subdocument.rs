@@ -1,4 +1,5 @@
 //! Serialize each top-level subtree with the namespace bindings that it uses.
+mod attribute;
 mod markup;
 use super::{ChildSink, Handling, MAX_DEPTH, MAX_TOC, Snapshot};
 use quick_xml::{
@@ -19,7 +20,10 @@ struct Binding {
 }
 
 #[derive(Default)]
-pub(super) struct Namespaces(Vec<Binding>);
+pub(super) struct Namespaces {
+    bindings: Vec<Binding>,
+    pub(super) encoding: attribute::Encoding,
+}
 
 fn declaration(key: &str) -> Option<&str> {
     if key == "xmlns" {
@@ -78,7 +82,7 @@ impl Namespaces {
             };
             let uri = attr.value.as_ref();
             if attr.key.as_ref() == "xmlns:"
-                || self.0.len() == MAX_BINDINGS
+                || self.bindings.len() == MAX_BINDINGS
                 || prefix.len() > 256
                 || uri.len() > 2048
                 || (!prefix.is_empty() && (!ncname(prefix) || uri.is_empty()))
@@ -89,7 +93,7 @@ impl Namespaces {
             {
                 return false;
             }
-            self.0.push(Binding {
+            self.bindings.push(Binding {
                 prefix: prefix.into(),
                 uri: uri.into(),
                 depth,
@@ -99,8 +103,8 @@ impl Namespaces {
     }
 
     pub(super) fn leave(&mut self, depth: usize) {
-        while self.0.last().is_some_and(|b| b.depth >= depth) {
-            self.0.pop();
+        while self.bindings.last().is_some_and(|b| b.depth >= depth) {
+            self.bindings.pop();
         }
     }
 
@@ -125,13 +129,13 @@ impl Namespaces {
         if prefix.is_empty() && attribute {
             return Some(("", local));
         }
-        let Some(n) = self.0.iter().rposition(|b| b.prefix == prefix) else {
+        let Some(n) = self.bindings.iter().rposition(|b| b.prefix == prefix) else {
             return prefix.is_empty().then_some(("", local));
         };
-        if n < inherited && !self.0[n].uri.is_empty() && !used.contains(&n) {
+        if n < inherited && !self.bindings[n].uri.is_empty() && !used.contains(&n) {
             used.push(n);
         }
-        Some((&self.0[n].uri, local))
+        Some((&self.bindings[n].uri, local))
     }
 
     // The XML reader rejects repeated lexical attribute names. Two different
@@ -142,6 +146,7 @@ impl Namespaces {
         inherited: usize,
         used: &mut Vec<usize>,
         out: &mut impl Write,
+        sink: &mut dyn ChildSink,
     ) -> io::Result<bool> {
         if self
             .resolve(tag.name().as_ref(), false, inherited, used)
@@ -155,12 +160,12 @@ impl Namespaces {
         }
         // A single ordinary attribute in canonical spelling can be copied as a slice.
         // A second attribute introduces a quote inside value and takes the general path.
-        if let Some((key, quoted)) = raw.strip_prefix(' ').and_then(|s| s.split_once("=\""))
-            && let Some(value) = quoted.strip_suffix('"')
+        if let Some((key, quoted)) = raw.strip_prefix(' ').and_then(|s| s.split_once('='))
+            && let Some(value) = quoted.strip_prefix('"').and_then(|s| s.strip_suffix('"'))
             && key.len() <= 1024
             && key != "xmlns"
             && ncname(key)
-            && plain_value(value)
+            && attribute::plain(value)
         {
             out.write_all(raw.as_bytes())?;
             return Ok(true);
@@ -188,13 +193,12 @@ impl Namespaces {
                     first_qualified = Some((uri, local))
                 }
             }
-            if !plain_value(attr.value.as_ref()) {
-                return Ok(false);
-            }
             out.write_all(b" ")?;
             out.write_all(key.as_bytes())?;
             out.write_all(b"=\"")?;
-            out.write_all(attr.value.as_bytes())?;
+            if !self.encoding.write(&attr.value, out, sink)? {
+                return Ok(false);
+            }
             out.write_all(b"\"")?;
         }
         Ok(true)
@@ -211,9 +215,11 @@ fn inherited(
     level: usize,
     sink: &mut dyn ChildSink,
 ) -> io::Result<Option<Vec<usize>>> {
-    let boundary = scope.0.len();
+    let boundary = scope.bindings.len();
     let mut used = Vec::new();
-    if !scope.enter(root, level) || !scope.attributes(root, boundary, &mut used, &mut io::sink())? {
+    if !scope.enter(root, level)
+        || !scope.attributes(root, boundary, &mut used, &mut io::sink(), sink)?
+    {
         return Ok(None);
     }
     if !empty {
@@ -228,7 +234,7 @@ fn inherited(
                 Event::Start(ref tag) | Event::Empty(ref tag) => {
                     if depth >= MAX_DEPTH
                         || !scope.enter(tag, depth + 1)
-                        || !scope.attributes(tag, boundary, &mut used, &mut io::sink())?
+                        || !scope.attributes(tag, boundary, &mut used, &mut io::sink(), sink)?
                     {
                         return Ok(None);
                     }
@@ -296,7 +302,7 @@ fn serialize(
                 if depth >= MAX_DEPTH {
                     return Ok(false);
                 }
-                let extra = if depth == base && !scope.0.is_empty() {
+                let extra = if depth == base && !scope.bindings.is_empty() {
                     let Some(extra) = inherited(reader, tag, empty, scope, depth + 1, sink)? else {
                         return Ok(false);
                     };
@@ -304,19 +310,19 @@ fn serialize(
                 } else {
                     Vec::new()
                 };
-                let local = scope.0.len();
+                let local = scope.bindings.len();
                 if !scope.enter(tag, depth + 1) {
                     return Ok(false);
                 }
                 out.write_all(b"<")?;
                 out.write_all(tag.name().as_ref().as_bytes())?;
-                for b in &scope.0[local..] {
+                for b in &scope.bindings[local..] {
                     binding(out, b)?
                 }
                 for n in extra {
-                    binding(out, &scope.0[n])?
+                    binding(out, &scope.bindings[n])?
                 }
-                if !scope.attributes(tag, 0, &mut Vec::new(), out)? {
+                if !scope.attributes(tag, 0, &mut Vec::new(), out, sink)? {
                     return Ok(false);
                 }
                 if empty {
@@ -399,11 +405,12 @@ pub(super) fn scan(
     depth: usize,
     sink: &mut dyn ChildSink,
 ) -> io::Result<Handling> {
-    // Without ancestor bindings, serialization only reorders attributes, changes
-    // quote characters, removes redundant whitespace, or compacts empty elements.
-    // The unconsumed source therefore bounds the size before creating any scratch.
-    let upper = reader.get_ref().len() as u64;
-    if scope.0.is_empty() && sink.child_limit().is_none() && upper <= sink.remaining().min(MAX_TOC)
+    // Without inherited bindings, the largest expansion is a literal quote to `&quot;`.
+    // Other attributes, markup, and XML names also fit within this bound.
+    let upper = (reader.get_ref().len() as u64).saturating_mul(6);
+    if scope.bindings.is_empty()
+        && sink.child_limit().is_none()
+        && upper <= sink.remaining().min(MAX_TOC)
     {
         return spool(reader, scope, depth, sink);
     }

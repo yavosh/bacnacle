@@ -110,6 +110,13 @@ Barnacle reads these values from the input and keeps the 1,024-byte URL capture 
 Certain combinations of literal controls and tag delimiters in quoted attributes remain incomplete. Entity coverage outside the WHATWG list remains unverified.
 [HTML character reference comparisons](../tests/object_html_entities.rs)
 
+### Normalized script text
+
+The normalized view can borrow a prefix of the input when its bytes already match.
+Mapped views check the normalized length before file count and recursion. An excluded view needs no temporary file.
+If an admitted view differs, Barnacle writes the unchanged prefix and the remaining normalized bytes into one private spool.
+The traversal checks cancellation every 8 KiB of input, including long whitespace runs. [Stock comparisons](../tests/object_text.rs) · [Timing and memory](benchmarks/object-script-views.md)
+
 ### Forwarded email
 
 Barnacle and pinned clamd scan Base64 and quoted-printable `message/rfc822` multipart attachments as child mail objects.
@@ -361,10 +368,13 @@ Both daemons detect the namespace-bearing inventory subdocument from Apple xar b
 Each subtree keeps local namespace declarations first. It adds inherited declarations in first-use order, including uses by descendants.
 Stock preserves XML comments, processing instructions, and CDATA in this subdocument. It merges adjacent CDATA sections where possible.
 Comments and processing instructions use LF line endings. CDATA keeps its original line endings.
-The size check precedes the file-count check. Without inherited bindings, the source length bounds the output.
+Attribute serialization escapes ampersands, quotes, and angle brackets. Literal attribute whitespace becomes spaces, while referenced whitespace keeps decimal character references.
+With an explicit UTF-8 declaration, accented letters stay UTF-8. Without a declared encoding, attribute values use uppercase hexadecimal character references.
+The size check precedes the file-count check. Without inherited bindings, six times the remaining source length bounds the output.
 If that bound fits, Barnacle serializes once. Otherwise it counts the output before spilling an admitted subdocument larger than 64 KiB.
 It supports up to 256 live namespace bindings and 256 attributes per element. Names beyond 1,024 bytes, prefixes beyond 256 bytes,
-namespace URIs beyond 2,048 bytes, escaped attribute values, and extended XML serialization return incomplete coverage.
+namespace URIs beyond 2,048 bytes, escaped namespace URIs, and unverified XML serialization return incomplete coverage.
+Attribute values above 10,000,000 source bytes and character references longer than 32 bytes also return incomplete coverage.
 LZMA dictionary estimates above 64 MiB also return incomplete coverage. [Apple fixture](../tests/fixtures/xar/README.md) · [Inventory benchmarks](benchmarks/object-xar-inventory.md)
 
 ### OLE compound documents

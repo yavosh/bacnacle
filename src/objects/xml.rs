@@ -376,7 +376,7 @@ fn scan_text(
     temp.with_bytes(|value| scan(value, sink))
 }
 
-fn entity(key: &str) -> Option<char> {
+pub(super) fn entity(key: &str) -> Option<char> {
     match key {
         "lt" => Some('<'),
         "gt" => Some('>'),

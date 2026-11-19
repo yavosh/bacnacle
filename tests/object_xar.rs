@@ -370,10 +370,42 @@ fn catalog_and_extent_receive_fresh_unnamed_contexts() -> io::Result<()> {
 
 fn namespace_cases(stock: bool) -> io::Result<()> {
     let archive = include_bytes!("fixtures/xar/inventory.xar");
+    let descriptions = include_bytes!("fixtures/xar/descriptions.xar");
+    let described = "\n  <inv:catalog xmlns:inv=\"urn:warehouse:inventory\">\n   <inv:part inv:aisle=\"A&#9;7\" description=\"Folders &amp; clips, 6 &gt; 4, &quot;blue&quot; Café\" id=\"R-17\"/>\n  </inv:catalog>\n ";
     let receipt = b"Ordinary inventory receipt for 42 paper folders.\n";
     let rendered = b"\n  <inv:catalog xmlns:u=\"urn:warehouse:units\" xmlns:inv=\"urn:warehouse:inventory\">\n   <inv:part id=\"P-042\" u:unit=\"box\">Paper folders</inv:part>\n  </inv:catalog>\n ";
     let mut cases = Vec::new();
     for (root, sub, markup, expected) in [
+        (
+            " xmlns:inv='urn:inventory' xmlns:u='urn:unit'",
+            "",
+            "<Quantity inv:note='A &amp; B'><inv:Box label='&quot;A > B&quot;'/></Quantity>",
+            "<Quantity xmlns:inv=\"urn:inventory\" inv:note=\"A &amp; B\"><inv:Box label=\"&quot;A &gt; B&quot;\"/></Quantity>",
+        ),
+        (
+            "",
+            "",
+            "<Item note='Paper &amp; clips &lt;five&gt; &quot;blue&quot; &apos;two&apos; and \"two\" > three'/>",
+            "<Item note=\"Paper &amp; clips &lt;five&gt; &quot;blue&quot; 'two' and &quot;two&quot; &gt; three\"/>",
+        ),
+        (
+            "",
+            "",
+            "<Item note='  Warehouse\tlabels\r\nlocated\rhere\n  next shelf  '/>",
+            "<Item note=\"  Warehouse labels located here   next shelf  \"/>",
+        ),
+        (
+            "",
+            "",
+            "<Item note='Tabs&#9;/&#x9; returns&#13;/&#xD; lines&#10;/&#xA; space&#32;/&#x20;'/>",
+            "<Item note=\"Tabs&#9;/&#9; returns&#13;/&#13; lines&#10;/&#10; space / \"/>",
+        ),
+        (
+            "",
+            "",
+            "<Item note='&#38;&#x26;&#60;&#x3e;&#34;&#39;&#xE9;&#x1F4E6; café'/>",
+            "<Item note=\"&amp;&amp;&lt;&gt;&quot;'&#xE9;&#x1F4E6; caf&#xE9;\"/>",
+        ),
         (
             "",
             "",
@@ -476,6 +508,11 @@ fn namespace_cases(stock: bool) -> io::Result<()> {
             )
         );
         cases.push((build(&catalog, receipt)?, expected.to_owned()));
+    }
+    for (declaration, output) in [("UTF-8", "é📦"), ("US-ASCII", "é📦")] {
+        let xml = toc("<subdoc><Label value='&#233;&#x1F4E6;'/></subdoc>", "")
+            .replace("UTF-8", declaration);
+        cases.push((build(&xml, &[])?, format!("<Label value=\"{output}\"/>")));
     }
     let archive_with = |parents: &str, subdocs: &str| {
         build(
@@ -581,8 +618,12 @@ fn namespace_cases(stock: bool) -> io::Result<()> {
         format!("{md5}:{}:Xar.{name}\n", b.len())
     };
     let receipt_rule = rule("Receipt", receipt);
-    let archive_rule = rule("Archive", archive);
-    let subdoc = rule("Subdocument", rendered);
+    let (expanded_xml, expanded_rendering) = expanding_description();
+    let expanded = build(&expanded_xml, &[])?;
+    let expanded_rule = rule("Expanded", expanded_rendering.as_bytes());
+    let expanded_total = expanded.len() + expanded_xml.len() + expanded_rendering.len();
+    let archive_rule = rule("Archive", archive) + &rule("Archive", descriptions);
+    let subdoc = rule("Subdocument", rendered) + &rule("Subdocument", described.as_bytes());
     let mut all = subdoc.clone() + &receipt_rule + &archive_rule;
     for (_, artifact) in cases.iter().chain(&over_bounds) {
         all += &rule("Subdocument", artifact.as_bytes())
@@ -594,6 +635,21 @@ fn namespace_cases(stock: bool) -> io::Result<()> {
         &mut decoded,
     )?;
     for (label, options, rules, want) in [
+        (
+            "expanded-exact",
+            format!("MaxScanSize {expanded_total}"),
+            expanded_rule.clone(),
+            "Expanded",
+        ),
+        (
+            "expanded-below",
+            format!(
+                "MaxScanSize {}\nMaxFiles 2\nAlertExceedsMax yes",
+                expanded_total - 1
+            ),
+            expanded_rule,
+            "Heuristics.Limits.Exceeded.MaxScanSize",
+        ),
         ("competing", "".to_string(), all.clone(), "Subdocument"),
         (
             "heap",
@@ -667,7 +723,14 @@ fn namespace_cases(stock: bool) -> io::Result<()> {
         } else {
             format!("stream: Xar.{want}.UNOFFICIAL FOUND\0")
         };
+        if label.starts_with("expanded-") {
+            assert_eq!(reply(&expanded)?, expected, "{label}");
+            continue;
+        }
         assert_eq!(reply(archive)?, expected, "{label}");
+        if matches!(label, "competing" | "heap" | "outer" | "disabled") {
+            assert_eq!(reply(descriptions)?, expected, "Apple inventory: {label}");
+        }
         if label == "competing" {
             for (bytes, artifact) in &cases {
                 assert_eq!(reply(bytes)?, expected, "{artifact}")
@@ -700,14 +763,27 @@ fn stock_inventory_namespaces() -> io::Result<()> {
 
 #[test]
 fn subdocument_scratch_follows_admission() -> io::Result<()> {
-    use barnacle::objects::{Options, Verdict, scan};
     let uri = format!("urn:{}", "ordinary-stationery-".repeat(50));
     let siblings = "<u:Box/>".repeat(128);
     let rendered = format!("<u:Box xmlns:u=\"{uri}\"/>").repeat(128);
-    assert!(rendered.len() > 64 * 1024);
     let xml = toc(&format!("<subdoc xmlns:u='{uri}'>{siblings}</subdoc>"), "");
+    for (xml, rendered) in [(xml, rendered), expanding_description()] {
+        check_subdocument_scratch(&xml, &rendered)?;
+    }
+    Ok(())
+}
+
+fn expanding_description() -> (String, String) {
+    let source = format!("<Item note='{}'/>", "\"".repeat(16_384));
+    let rendered = format!("<Item note=\"{}\"/>", "&quot;".repeat(16_384));
+    (toc(&format!("<subdoc>{source}</subdoc>"), ""), rendered)
+}
+
+fn check_subdocument_scratch(xml: &str, rendered: &str) -> io::Result<()> {
+    use barnacle::objects::{Options, Verdict, scan};
+    assert!(rendered.len() > 64 * 1024);
     assert!(xml.len() < 64 * 1024);
-    let archive = build(&xml, &[])?;
+    let archive = build(xml, &[])?;
     let tmp = tempfile::tempdir()?;
     let missing = tmp.path().join("missing");
     for (options, path, expected) in [
@@ -755,6 +831,9 @@ fn unsupported_namespace_forms_keep_an_uncertain_member_ahead_of_the_heap() -> i
     let tmp = tempfile::tempdir()?;
     for markup in [
         "<u:Part/>",
+        "<Part note='&undeclared;'/>",
+        "<Part note='unfinished &amp'/>",
+        "<Part note='&#0;'/>",
         "<a:Part xmlns:a='urn:a&amp;b'/>",
         "<Item xmlns:a='urn:u' xmlns:b='urn:u' a:id='1' b:id='2'/>",
     ] {

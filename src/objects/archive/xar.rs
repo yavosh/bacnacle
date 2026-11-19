@@ -187,14 +187,12 @@ fn parse(toc: &[u8], heap: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handli
                 };
                 depth = d;
             }
-            Event::Decl(decl)
-                if decl.encoding().is_some_and(|e| {
-                    !e.is_ok_and(|e| {
-                        e.eq_ignore_ascii_case("UTF-8") || e.eq_ignore_ascii_case("US-ASCII")
-                    })
-                }) =>
-            {
-                return Ok(Handling::Incomplete);
+            Event::Decl(decl) => {
+                if let Some(label) = decl.encoding()
+                    && !label.is_ok_and(|label| scope.encoding.set(&label))
+                {
+                    return Ok(Handling::Incomplete);
+                }
             }
             Event::DocType(_) => return Ok(Handling::Incomplete),
             Event::Eof => {
