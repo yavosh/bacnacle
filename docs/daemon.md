@@ -33,10 +33,13 @@ Use SIGHUP to reopen logs and SIGTERM to stop the service.
 
 ## Scan results
 
-Barnacle can report a confirmed local whole-file signature with its stock name.
+Barnacle can report a confirmed local whole-file or body signature with its stock name.
+For local body scans, each worker buffers up to 64 KiB before spilling the object to a private temporary file.
+With the full official generation, additional matchers can affect the winning name. The daemon reports incomplete coverage for these scans.
+See the [body signature inventory and comparison](body-patterns.md).
 Set `ExtendedDetectionInfo yes` to include the file's MD5 and byte count in detection logs.
 INSTREAM log entries identify the Unix connection or IPv4 peer. FILDES logs the resolved path when available.
-A hash miss, an unsupported detection stage, or an ambiguous winner produces an error.
+An unmatched file, an unsupported detection stage, or an ambiguous winner produces an error.
 Keep stock clamd authoritative for complete scan verdicts. An ordinary unmatched upload produces the following NUL-terminated reply.
 
 ```text

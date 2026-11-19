@@ -62,7 +62,6 @@ pub(super) fn eligible(header: &[u8]) -> bool {
         b"ZW",
         b"[a",
         b"\x60\xea",
-        b"be",
         b"q\xc7",
         b"v:",
         b"xa",
@@ -89,6 +88,7 @@ pub(super) fn eligible(header: &[u8]) -> bool {
         b"\xff\xfe",
     ];
     if PREFIXES.iter().any(|prefix| header.starts_with(*prefix))
+        || header.starts_with(b"begin ")
         || header[2..4] == *b"\r\n"
         || header[1..4] == *b"\r\r\n"
         || header.get(2..4).is_some_and(|p| p == b"-l" || p == b"-p")
