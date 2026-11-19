@@ -2,10 +2,28 @@
 
 A 48,161-byte PDF contains a physical receipt and a 1,048,617-byte catalog inside a compressed object stream.
 One exact MD5 rule selects the receipt. A separate run selects the catalog using a second database.
-All 24,960 requests across both experiments returned the expected signature. Each run used one ARM64 CPU, 2 GiB RAM, and disabled scan caching.
+Each run used one ARM64 CPU, 2 GiB RAM, and disabled scan caching.
+
+## Signature-dependent text normalization
+
+With only a whole-file signature loaded, commit `7717297` skips plain-text normalization on the expanded PDF carrier.
+The receipt and catalog runs each saved 1,048,880 written bytes per scan.
+
+| Workload | Clients | Earlier scans/s | New scans/s | Stock scans/s | Earlier p95 ms | New p95 ms | Stock p95 ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Physical receipt | 1 | 426 | 512 | 272 | 2.84 | 2.01 | 3.96 |
+| Deferred catalog | 4 | 284 | 307 | 174 | 22.02 | 23.31 | 32.36 |
+| Generic text rule | 1 | 517 | 488 | 212 | 2.10 | 2.39 | 5.37 |
+
+Each median covers three rotated fresh-container runs with 256 warm requests and one initial request per run.
+The earlier binary used commit `5f732c7`. All 6,939 replies matched the selected signature.
+The generic control uses the mixed-case inventory and a target-0 body rule matching `warehouse order number verified`.
+Its normalized view remains eligible. The two Barnacle builds wrote the same bytes per request on this control.
+[Raw measurements](object-script-eligibility.csv) · [Inventory fixture](object-script-views.md#fixtures)
 
 ## Retained carrier with bulk ASCII normalization
 
+All 24,960 requests across the carrier retention and bulk normalization experiments returned the expected signature.
 On four clients the physical receipt reached 454 scans/s at 8.88 MiB. The preceding build reached 347 scans/s at 8.79 MiB.
 Barnacle scans printable ASCII blocks for consecutive spaces. When normalization preserves their length, it lowercases them in the caller's buffer.
 This improves the later text scan of the expanded carrier. The scanner still checks the catalog and receipt in stock order.
