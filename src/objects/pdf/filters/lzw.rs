@@ -7,6 +7,7 @@ const CLEAR: usize = 256;
 const END: usize = 257;
 const FIRST: usize = 258;
 const CODES: usize = 4096;
+const TAIL: usize = 4;
 
 struct Bits<'a> {
     input: &'a [u8],
@@ -29,10 +30,40 @@ impl Bits<'_> {
 
 #[derive(Clone, Copy, Default)]
 struct Entry {
+    // Removing the final one to four bytes leaves the word named by this prefix.
     prefix: u16,
     len: u16,
     first: u8,
-    last: u8,
+    tail: [u8; TAIL],
+}
+
+impl Entry {
+    fn append(mut self, prefix: usize, byte: u8) -> Self {
+        let at = usize::from(self.len) % self.tail.len();
+        if at == 0 {
+            self.prefix = prefix as u16;
+        }
+        self.tail[at] = byte;
+        self.len += 1;
+        self
+    }
+
+    fn write(self, table: &[Self], word: &mut [u8; CODES], out: &mut impl Write) -> io::Result<()> {
+        let len = usize::from(self.len);
+        let tail_len = (len - 1) % self.tail.len() + 1;
+        if len == tail_len {
+            return out.write_all(&self.tail[..len]);
+        }
+        let (prefix, tail) = word[..len].split_at_mut(len - tail_len);
+        tail.copy_from_slice(&self.tail[..tail_len]);
+        let mut older = self.prefix;
+        for chunk in prefix.rchunks_exact_mut(TAIL) {
+            let entry = &table[usize::from(older)];
+            chunk.copy_from_slice(&entry.tail);
+            older = entry.prefix;
+        }
+        out.write_all(&word[..len])
+    }
 }
 
 pub(super) fn decode(
@@ -49,11 +80,16 @@ pub(super) fn decode(
         count: 0,
     };
     let mut table = [Entry::default(); CODES];
+    for (byte, entry) in (0u8..=255).zip(&mut table) {
+        entry.len = 1;
+        entry.first = byte;
+        entry.tail[0] = byte;
+    }
     let mut word = [0u8; CODES];
     let mut out = retain.then(|| BufWriter::new(Snapshot::new(sink.temporary_directory())));
     let mut width = 9;
     let mut next = FIRST;
-    let mut previous = None;
+    let mut previous: Option<usize> = None;
     let mut size = 0u64;
     let mut codes = 0usize;
     while let Some(code) = bits.code(width) {
@@ -71,22 +107,15 @@ pub(super) fn decode(
             break;
         }
         // The next dictionary entry can name the previous word followed by its first byte.
-        let mut entry = if code == next {
+        let entry = if code == next {
             let Some(old) = previous else {
                 break;
             };
-            old
+            table[old].append(old, table[old].first)
         } else {
-            code
+            table[code]
         };
-        let (first, len) = if entry < FIRST {
-            (entry as u8, 1)
-        } else {
-            (table[entry].first, table[entry].len)
-        };
-        let extra = code == next;
-        let len = len + u16::from(extra);
-        size += u64::from(len);
+        size += u64::from(entry.len);
         // Filling the reference buffer requests another whole block, even if EOD follows.
         if size >= capacity {
             sink.skip_declared_size(capacity.saturating_add(STEP));
@@ -96,34 +125,12 @@ pub(super) fn decode(
         if size <= limit
             && let Some(out) = &mut out
         {
-            let mut start = CODES;
-            while entry >= FIRST {
-                // Every prefix precedes this dictionary entry.
-                start -= 1;
-                word[start] = table[entry].last;
-                entry = usize::from(table[entry].prefix);
-            }
-            start -= 1;
-            word[start] = first;
-            out.write_all(&word[start..])?;
-            if extra {
-                out.write_all(&[first])?;
-            }
+            entry.write(&table, &mut word, out)?;
         }
         if let Some(old) = previous
             && next < CODES
         {
-            let (old_first, old_len) = if old < FIRST {
-                (old as u8, 1)
-            } else {
-                (table[old].first, table[old].len)
-            };
-            table[next] = Entry {
-                prefix: old as u16,
-                len: old_len + 1,
-                first: old_first,
-                last: first,
-            };
+            table[next] = table[old].append(old, entry.first);
             next += 1;
             // The pinned scanner uses EarlyChange=1 even when the dictionary requests zero.
             if width < 12 && next + 1 == 1 << width {

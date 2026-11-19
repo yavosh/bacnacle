@@ -120,7 +120,12 @@ fn prepare(dir: &Path) -> io::Result<()> {
     }
     Ok(())
 }
-fn run(path: &Path, worker_count: usize, executable: Option<&Path>) -> io::Result<()> {
+fn run(
+    path: &Path,
+    worker_count: usize,
+    executable: Option<&Path>,
+    samples: usize,
+) -> io::Result<()> {
     let input = Arc::new(fs::read(path)?);
     let directory = tempfile::tempdir()?;
     let socket = directory.path().join("clamd.sock");
@@ -159,19 +164,23 @@ fn run(path: &Path, worker_count: usize, executable: Option<&Path>) -> io::Resul
         let socket = socket.clone();
         let start = Arc::clone(&barrier);
         workers.push(std::thread::spawn(
-            move || -> io::Result<std::time::Duration> {
+            move || -> io::Result<Vec<std::time::Duration>> {
                 start.wait();
-                let request = Instant::now();
                 if let Some(frame) = frame {
-                    let reply = daemon::unix_request(&socket, &frame)?;
-                    return if reply == "stream: Workspace.Reference.UNOFFICIAL FOUND\0" {
-                        Ok(request.elapsed())
-                    } else {
-                        Err(io::Error::other(format!(
-                            "unexpected daemon reply {reply:?}"
-                        )))
-                    };
+                    let mut timings = Vec::new();
+                    for _ in 0..samples {
+                        let request = Instant::now();
+                        let reply = daemon::unix_request(&socket, &frame)?;
+                        if reply != "stream: Workspace.Reference.UNOFFICIAL FOUND\0" {
+                            return Err(io::Error::other(format!(
+                                "unexpected daemon reply {reply:?}"
+                            )));
+                        }
+                        timings.push(request.elapsed());
+                    }
+                    return Ok(timings);
                 }
+                let request = Instant::now();
                 let verdict = objects::scan(
                     &input,
                     &Options::default(),
@@ -190,13 +199,13 @@ fn run(path: &Path, worker_count: usize, executable: Option<&Path>) -> io::Resul
                         "unexpected scan verdict {verdict:?}"
                     )));
                 }
-                Ok(request.elapsed())
+                Ok(vec![request.elapsed()])
             },
         ));
     }
     let mut requests = Vec::with_capacity(worker_count);
     for worker in workers {
-        requests.push(
+        requests.extend(
             worker
                 .join()
                 .map_err(|_| io::Error::other("scan worker panicked"))??,
@@ -218,7 +227,7 @@ fn run(path: &Path, worker_count: usize, executable: Option<&Path>) -> io::Resul
         elapsed.as_millis(),
         hwm,
         cgroup_peak.trim(),
-        worker_count as f64 / elapsed.as_secs_f64(),
+        requests.len() as f64 / elapsed.as_secs_f64(),
         p95.as_micros()
     );
     Ok(())
@@ -227,14 +236,24 @@ fn main() -> io::Result<()> {
     let args: Vec<_> = env::args().skip(1).collect();
     match args.as_slice() {
         [command, directory] if command == "prepare" => prepare(Path::new(directory)),
-        [command, file, count, rest @ ..] if command == "run" && rest.len() <= 1 => {
+        [command, file, count, rest @ ..] if command == "run" && rest.len() <= 2 => {
             let count = count
                 .parse::<std::num::NonZeroUsize>()
                 .map_err(|_| io::Error::other("workers must be a positive integer"))?;
-            run(Path::new(file), count.get(), rest.first().map(Path::new))
+            let samples = rest
+                .get(1)
+                .map(|n| n.parse::<std::num::NonZeroUsize>())
+                .transpose()
+                .map_err(|_| io::Error::other("requests per client must be a positive integer"))?;
+            run(
+                Path::new(file),
+                count.get(),
+                rest.first().map(Path::new),
+                samples.map_or(1, |n| n.get()),
+            )
         }
         _ => Err(io::Error::other(
-            "usage: archive_workspace prepare DIRECTORY | run FILE WORKERS [DAEMON]",
+            "usage: archive_workspace prepare DIRECTORY | run FILE WORKERS [DAEMON [REQUESTS_PER_CLIENT]]",
         )),
     }
 }

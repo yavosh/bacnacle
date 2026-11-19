@@ -155,6 +155,18 @@ fn compare(stock: bool) -> io::Result<()> {
     let compressed = codes([256, 65].into_iter().chain(258..=398).chain([257]), 1);
     let repeated = vec![b'A'; 142 * 143 / 2];
     let repeated_pdf = attached(filter, &compressed);
+    // Reuse each growing phrase, then append a different literal to make the next entry.
+    let mut words = vec![256, u16::from(b'A')];
+    let mut phrase = vec![b'A'];
+    let mut alphabet = phrase.clone();
+    for (i, byte) in (b'B'..=b'Z').enumerate() {
+        words.extend([u16::from(byte), 258 + 2 * i as u16]);
+        phrase.push(byte);
+        alphabet.push(byte);
+        alphabet.extend(&phrase);
+    }
+    words.push(257);
+    let alphabet_pdf = attached(filter, &codes(words, 1));
     let empty = codes([256; 16].into_iter().chain([257]), 1);
     let page = literals(PAGE, 1);
     let page_only = pdf(
@@ -165,7 +177,8 @@ fn compare(stock: bool) -> io::Result<()> {
         + &hash("Encoded", &small)
         + &hash("Large", &large)
         + &hash("Text", TEXT)
-        + &hash("Repeat", &repeated);
+        + &hash("Repeat", &repeated)
+        + &hash("Alphabet", &alphabet);
     rules.push_str(&hash("Empty", &empty));
     // The reference returns these 2,724 bytes from this conforming late-change stream.
     rules.push_str("e38ddec8983fe9f5b9480d2802b956b8:2724:Lzw.ReferenceLate\n");
@@ -305,6 +318,7 @@ fn compare(stock: bool) -> io::Result<()> {
                 repeated_pdf.clone(),
                 Some("Repeat"),
             ),
+            ("ordered dictionary phrases", alphabet_pdf, Some("Alphabet")),
         ],
     )?;
     let competing = rules.clone() + &hash("Page", PAGE);

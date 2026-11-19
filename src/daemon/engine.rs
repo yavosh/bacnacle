@@ -384,19 +384,15 @@ impl Generation {
                     // The script buffer goes directly to the body matcher. HTML parser
                     // artifacts are files and also pass through whole-file matching.
                     if self.has_hash_rules && eligible && !obj.body_only {
-                        let child;
-                        let digest = if obj.parents.is_empty() && !obj.normalized {
-                            hashes.as_ref().expect("hash rules require root digests")
+                        let found = if obj.parents.is_empty() && !obj.normalized {
+                            hashes
+                                .as_ref()
+                                .expect("hash rules require root digests")
+                                .lookup(|a, d, s| self.index.lookup(a, d, s))?
                         } else {
-                            child = hash_reader(ScanInput {
-                                reader: obj.bytes,
-                                object: None,
-                                capture_left: 0,
-                                check,
-                            })?;
-                            &child
+                            self.index.match_bytes(obj.bytes, check)?
                         };
-                        if let Some(name) = digest.lookup(|a, d, s| self.index.lookup(a, d, s))? {
+                        if let Some(name) = found {
                             return Ok(Verdict::Found(name));
                         }
                     }

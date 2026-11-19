@@ -144,7 +144,7 @@ At 262,144 bytes, stock requests another 256 KiB block. If that request exceeds 
 For an ASCIIHex/LZW chain this input is the ASCIIHex output. Later filters are skipped.
 Barnacle uses a fixed 4,096-entry dictionary and spools at most the remaining object budget.
 It counts terminal output without writing it when file count or recursion excludes the child.
-The decoded size can still trigger a size alert. [LZW comparisons](../tests/object_pdf_lzw.rs)
+The decoded size can still trigger a size alert. [LZW comparisons](../tests/object_pdf_lzw.rs) · [Sustained scan measurements](benchmarks/object-pdf-lzw-sustained.md)
 
 Both daemons scan PDF attachments in Adobe XDP forms. They visit the first matching PDF in XML order.
 If the form type appears in the first 1,024 bytes, its attached PDF can win over the form hash.
@@ -276,6 +276,7 @@ They cover flat directories, nested storages, shared stream names, and the under
 Barnacle creates empty private directory entries when it needs that order. It reads each payload from the compound file.
 
 The Excel control contains a generated PNG in a macro-free workbook saved by Spreadsheet::WriteExcel 2.40.
+Benchmarks compare the embedded PNG hash with one and four clients. [Excel picture measurements](benchmarks/object-pdf-excel.md)
 Stock scans its BIFF report, the original PNG bytes, and then the outer file. It skips the raw Workbook stream.
 The short report contains a 117-byte preamble. Generic body and whole-file signatures match it before the picture.
 A report miss leaves the file count and scan-byte budget available for the picture.
