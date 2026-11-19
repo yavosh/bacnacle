@@ -26,56 +26,137 @@ fn delimiter(b: u8) -> bool {
     white(b) || b"()<>[]{}/%".contains(&b)
 }
 
+// Each chunk is borrowed from the PDF. Check within long tokens as well as
+// between tokens, including skipped comments and nested literal strings.
+const TOKEN_BLOCK: usize = 64 * 1024;
+
+#[derive(Default)]
+struct TokenBudget(usize);
+
+impl TokenBudget {
+    fn charge(
+        &mut self,
+        bytes: usize,
+        check: &mut (impl FnMut() -> io::Result<()> + ?Sized),
+    ) -> io::Result<()> {
+        self.0 += bytes;
+        if self.0 >= TOKEN_BLOCK {
+            self.0 -= TOKEN_BLOCK;
+            check()?;
+        }
+        Ok(())
+    }
+}
+
 impl<'a> Tokens<'a> {
-    fn next(&mut self) -> Option<&'a [u8]> {
+    fn skip_while(
+        &mut self,
+        mut predicate: impl FnMut(u8) -> bool,
+        charge: &mut impl FnMut(usize) -> io::Result<()>,
+    ) -> io::Result<()> {
+        for chunk in self.data[self.pos..].chunks(TOKEN_BLOCK) {
+            let n = chunk
+                .iter()
+                .position(|&b| !predicate(b))
+                .unwrap_or(chunk.len());
+            self.pos += n;
+            charge(n)?;
+            if n != chunk.len() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn next_with(
+        &mut self,
+        charge: &mut impl FnMut(usize) -> io::Result<()>,
+    ) -> io::Result<Option<&'a [u8]>> {
         while let Some(&b) = self.data.get(self.pos) {
             if b == b'%' {
-                self.pos += self.data[self.pos..]
-                    .iter()
-                    .position(|b| matches!(b, b'\n' | b'\r'))
-                    .unwrap_or(self.data.len() - self.pos);
+                self.skip_while(|c| !matches!(c, b'\n' | b'\r'), charge)?;
             } else if white(b) {
-                self.pos += 1;
+                self.skip_while(white, charge)?;
             } else {
                 break;
             }
         }
         let at = self.pos;
-        let b = *self.data.get(at)?;
+        let Some(&b) = self.data.get(at) else {
+            return Ok(None);
+        };
         self.pos += 1;
+        charge(1)?;
         match b {
             b'(' => {
-                let mut depth = 1;
-                while let Some(&c) = self.data.get(self.pos) {
-                    self.pos += 1;
-                    match c {
-                        b'\\' => self.pos = (self.pos + 1).min(self.data.len()),
-                        b'(' => depth += 1,
-                        b')' => {
-                            depth -= 1;
-                            if depth == 0 {
-                                break;
+                let mut depth = 1usize;
+                let mut escaped = false;
+                self.skip_while(
+                    |c| {
+                        if escaped {
+                            escaped = false;
+                        } else {
+                            match c {
+                                b'\\' => escaped = true,
+                                b'(' => depth += 1,
+                                b')' => depth -= 1,
+                                _ => (),
                             }
                         }
-                        _ => (),
-                    }
-                }
+                        depth != 0
+                    },
+                    charge,
+                )?;
+                self.pos += usize::from(self.pos < self.data.len());
             }
             b'<' | b'>' if self.data.get(self.pos) == Some(&b) => self.pos += 1,
             b'<' => {
-                self.pos += self.data[self.pos..]
-                    .iter()
-                    .position(|&c| c == b'>')
-                    .map_or(self.data.len() - self.pos, |n| n + 1);
+                self.skip_while(|c| c != b'>', charge)?;
+                self.pos += usize::from(self.pos < self.data.len());
             }
             b'>' | b'[' | b']' | b'{' | b'}' | b')' => (),
-            _ => {
-                while self.data.get(self.pos).is_some_and(|&c| !delimiter(c)) {
-                    self.pos += 1;
-                }
-            }
+            _ => self.skip_while(|c| !delimiter(c), charge)?,
         }
-        Some(&self.data[at..self.pos])
+        Ok(Some(&self.data[at..self.pos]))
+    }
+
+    fn next(&mut self) -> Option<&'a [u8]> {
+        self.next_with(&mut |_| Ok(()))
+            .expect("unchecked PDF token")
+    }
+
+    fn next_checked(
+        &mut self,
+        budget: &mut TokenBudget,
+        sink: &mut dyn ChildSink,
+    ) -> io::Result<Option<&'a [u8]>> {
+        self.next_with(&mut |n| budget.charge(n, &mut || sink.check()))
+    }
+
+    fn integer_checked(
+        &mut self,
+        budget: &mut TokenBudget,
+        sink: &mut dyn ChildSink,
+    ) -> io::Result<Option<usize>> {
+        let Some(token) = self.next_checked(budget, sink)? else {
+            return Ok(None);
+        };
+        number_with(token, &mut |n| budget.charge(n, &mut || sink.check()))
+    }
+
+    fn reference_checked(
+        &self,
+        budget: &mut TokenBudget,
+        sink: &mut dyn ChildSink,
+    ) -> io::Result<Option<Id>> {
+        let mut copy = self.clone();
+        let Some(id) = copy.integer_checked(budget, sink)? else {
+            return Ok(None);
+        };
+        let Some(generation) = copy.integer_checked(budget, sink)? else {
+            return Ok(None);
+        };
+        Ok((copy.next_checked(budget, sink)? == Some(b"R")).then_some((id, generation)))
     }
 
     fn reference(&self) -> Option<Id> {
@@ -101,13 +182,34 @@ impl<'a> Tokens<'a> {
     }
 }
 
-fn number(token: &[u8]) -> Option<usize> {
-    if token.is_empty() || !token.iter().all(u8::is_ascii_digit) {
-        return None;
+fn number_with(
+    token: &[u8],
+    charge: &mut impl FnMut(usize) -> io::Result<()>,
+) -> io::Result<Option<usize>> {
+    if !token.first().is_some_and(u8::is_ascii_digit) {
+        return Ok(None);
     }
-    token.iter().try_fold(0usize, |v, &b| {
-        v.checked_mul(10)?.checked_add((b - b'0') as usize)
-    })
+    let mut value = 0usize;
+    for chunk in token.chunks(TOKEN_BLOCK) {
+        charge(chunk.len())?;
+        for &b in chunk {
+            if !b.is_ascii_digit() {
+                return Ok(None);
+            }
+            let Some(n) = value
+                .checked_mul(10)
+                .and_then(|n| n.checked_add((b - b'0') as usize))
+            else {
+                return Ok(None);
+            };
+            value = n;
+        }
+    }
+    Ok(Some(value))
+}
+
+fn number(token: &[u8]) -> Option<usize> {
+    number_with(token, &mut |_| Ok(())).expect("unchecked PDF integer")
 }
 
 #[derive(Default)]
@@ -162,6 +264,7 @@ fn trim_eol(bytes: &[u8]) -> &[u8] {
 
 fn parse<'a>(data: &'a [u8], sink: &mut dyn ChildSink) -> io::Result<Option<Pdf<'a>>> {
     let mut input = Tokens { data, pos: 0 };
+    let mut token_budget = TokenBudget::default();
     let mut pdf = Pdf {
         objects: Vec::new(),
         count: 0,
@@ -171,7 +274,7 @@ fn parse<'a>(data: &'a [u8], sink: &mut dyn ChildSink) -> io::Result<Option<Pdf<
     let mut requests = Vec::new();
     let mut count = 0usize;
     let mut last = [None, None];
-    while let Some(tok) = input.next() {
+    while let Some(tok) = input.next_checked(&mut token_budget, sink)? {
         if tok == b"/Encrypt" {
             return Ok(None);
         }
@@ -194,20 +297,20 @@ fn parse<'a>(data: &'a [u8], sink: &mut dyn ChildSink) -> io::Result<Option<Pdf<
         };
         let mut has_opening = false;
         let mut copy = input.clone();
-        if let Some(n) = copy.next().and_then(number)
-            && copy.next() == Some(b"endobj".as_slice())
+        if let Some(n) = copy.next_checked(&mut token_budget, sink)?.and_then(number)
+            && copy.next_checked(&mut token_budget, sink)? == Some(b"endobj".as_slice())
         {
             pdf.lengths.insert(obj.id, n);
         }
         loop {
-            let Some(tok) = input.next() else {
+            let Some(tok) = input.next_checked(&mut token_budget, sink)? else {
                 return Ok(None);
             };
             match tok {
                 b"endobj" => {
                     if has_opening {
                         let body = &data[obj.start..input.pos - 6];
-                        match destination::catalog(body) {
+                        match destination::catalog(body, &mut || sink.check())? {
                             Some(destination::Destination::Inline) if obj.encoded.is_none() => {
                                 obj.raw_destination = true;
                                 obj.encoded = Some(body);

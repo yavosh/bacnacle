@@ -206,12 +206,12 @@ Document names come from the winning signature. [End-to-end fixtures](../tests/o
 | Packed indirect objects | Stored and Flate object streams, packed page dictionaries, content arrays, indirect lengths, and physical stream order. [Object-stream comparisons](../tests/object_pdf_streams.rs) |
 | Additional PDF stages | Encryption, JavaScript actions and other stream filters require further comparisons. |
 
-Both daemons scan the referenced page dictionary for an explicit catalog opening destination.
+For physical objects, both daemons scan the referenced page dictionary for an explicit catalog opening destination.
 An inline local GoTo exposes the catalog. An indirect local action exposes the referenced object at its physical position.
 The child contains the bytes between `obj` and `endobj`, including surrounding line endings.
 Barnacle indexes only the requested object IDs. The PDF parser admits at most 65,536 physical objects.
 The tests cover all eight explicit destination modes, local named destinations, sparse IDs, backward references, and ZIP attachments.
-Packed catalogs, chained actions, and unresolved or ambiguous destinations remain incomplete.
+Chained actions and unresolved or ambiguous destinations remain incomplete.
 [Destination comparisons](../tests/object_pdf_destinations.rs) · [PDF 1.7 sections 12.3.2 and 12.6.4.2](https://opensource.adobe.com/dc-acrobat-sdk-docs/standards/pdfstandards/pdf/PDF32000_2008.pdf)
 
 Stock uses early LZW code-width changes for both `/LZWDecode` and `/LZW`, even with `/EarlyChange 0`.
@@ -239,6 +239,10 @@ Both daemons match the decoded object stream before later physical streams.
 Clamd reads the packed directory for the compact spelling `/Type/ObjStm`.
 A packed page can mark a later physical stream for text extraction.
 Packed dictionaries selected for scanning follow all physical streams, including the cross-reference stream.
+A packed catalog with a local opening destination exposes the earlier of the catalog and the referenced member.
+An inline GoTo exposes the catalog. Barnacle resolves one opening catalog per carrier. It checks cancellation while reading borrowed dictionary bytes.
+The paired tests include a 1 MiB catalog, a large backward page reference, and the exact remaining scan budget.
+References across carriers remain incomplete.
 With the spaced spelling `/Type /ObjStm`, only the carrier stream participates in this stage.
 The independent control uses qpdf 12.4.2 and contains one page and a text attachment. [qpdf control](../tests/fixtures/pdf/qpdf-object-stream.pdf)
 

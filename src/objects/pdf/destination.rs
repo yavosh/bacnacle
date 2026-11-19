@@ -9,27 +9,124 @@ pub(super) enum Destination {
     Indirect(Id),
 }
 
-fn coordinate(value: &[u8]) -> bool {
+// The grammar uses Option for unrecognized syntax. Keep cancellation and I/O
+// errors from the token reader distinct when returning to the scanner.
+struct Reader<'a, 's> {
+    input: Tokens<'a>,
+    budget: super::TokenBudget,
+    check: &'s mut dyn FnMut() -> io::Result<()>,
+    error: Option<io::Error>,
+}
+
+impl<'a> Reader<'a, '_> {
+    fn parse<T>(
+        body: &'a [u8],
+        check: &mut dyn FnMut() -> io::Result<()>,
+        parse: impl FnOnce(&mut Reader<'a, '_>) -> T,
+    ) -> io::Result<T> {
+        let mut reader = Reader {
+            input: Tokens { data: body, pos: 0 },
+            budget: super::TokenBudget::default(),
+            check,
+            error: None,
+        };
+        let result = parse(&mut reader);
+        reader.error.map_or(Ok(result), Err)
+    }
+
+    fn charge(&mut self, n: usize) -> Option<()> {
+        if self.error.is_some() {
+            return None;
+        }
+        self.budget
+            .charge(n, self.check)
+            .map_err(|e| self.error = Some(e))
+            .ok()
+    }
+
+    fn next(&mut self) -> Option<&'a [u8]> {
+        if self.error.is_some() {
+            return None;
+        }
+        self.input
+            .next_with(&mut |n| self.budget.charge(n, self.check))
+            .map_err(|e| self.error = Some(e))
+            .ok()
+            .flatten()
+    }
+
+    fn number(&mut self, token: &[u8]) -> Option<usize> {
+        if self.error.is_some() {
+            return None;
+        }
+        super::number_with(token, &mut |n| self.budget.charge(n, self.check))
+            .map_err(|e| self.error = Some(e))
+            .ok()
+            .flatten()
+    }
+
+    fn integer(&mut self) -> Option<usize> {
+        let token = self.next()?;
+        self.number(token)
+    }
+
+    fn reference(&mut self) -> Option<Id> {
+        let at = self.input.pos;
+        let id = (|| {
+            let id = (self.integer()?, self.integer()?);
+            (self.next()? == b"R").then_some(id)
+        })();
+        if id.is_none() {
+            self.input.pos = at;
+        }
+        id
+    }
+
+    // Skip one PDF value. Keep only the nesting depth.
+    fn skip_value(&mut self) -> Option<()> {
+        let first = self.next()?;
+        if self.number(first).is_some() {
+            let after = self.input.pos;
+            if self.integer().is_some() && self.next()? == b"R" {
+                return Some(());
+            }
+            self.input.pos = after;
+        }
+        let mut depth = usize::from(matches!(first, b"[" | b"<<"));
+        while depth != 0 {
+            match self.next()? {
+                b"[" | b"<<" => depth += 1,
+                b"]" | b">>" => depth -= 1,
+                _ => (),
+            }
+        }
+        Some(())
+    }
+}
+
+fn coordinate(value: &[u8], reader: &mut Reader<'_, '_>) -> Option<bool> {
     let value = value
         .strip_prefix(b"-")
         .or_else(|| value.strip_prefix(b"+"))
         .unwrap_or(value);
-    let mut digits = false;
-    let mut dot = false;
-    for &c in value {
-        if c.is_ascii_digit() {
-            digits = true;
-        } else if c == b'.' && !dot {
-            dot = true;
-        } else {
-            return false;
+    let (mut digits, mut dot) = (false, false);
+    for chunk in value.chunks(super::TOKEN_BLOCK) {
+        reader.charge(chunk.len())?;
+        for &c in chunk {
+            if c.is_ascii_digit() {
+                digits = true;
+            } else if c == b'.' && !dot {
+                dot = true;
+            } else {
+                return Some(false);
+            }
         }
     }
-    digits
+    Some(digits)
 }
 
-fn array(input: &mut Tokens<'_>) -> Option<Id> {
-    let id = (number(input.next()?)?, number(input.next()?)?);
+fn array(input: &mut Reader<'_, '_>) -> Option<Id> {
+    let id = (input.integer()?, input.integer()?);
     if input.next()? != b"R" {
         return None;
     }
@@ -43,14 +140,14 @@ fn array(input: &mut Tokens<'_>) -> Option<Id> {
     };
     for _ in 0..count {
         let value = input.next()?;
-        if !(coordinate(value) || value == b"null" && kind != b"/FitR") {
+        if !(coordinate(value, input)? || value == b"null" && kind != b"/FitR") {
             return None;
         }
     }
     (input.next()? == b"]").then_some(id)
 }
 
-fn goto(input: &mut Tokens<'_>) -> Option<()> {
+fn goto(input: &mut Reader<'_, '_>) -> Option<()> {
     let (mut subtype, mut dest, mut typed) = (false, false, false);
     loop {
         match input.next()? {
@@ -61,7 +158,14 @@ fn goto(input: &mut Tokens<'_>) -> Option<()> {
                     b"[" => {
                         array(input)?;
                     }
-                    v if v.starts_with(b"/") && v.len() > 1 && !v.contains(&b'#') => {}
+                    v if v.starts_with(b"/") && v.len() > 1 => {
+                        for chunk in v.chunks(super::TOKEN_BLOCK) {
+                            input.charge(chunk.len())?;
+                            if chunk.contains(&b'#') {
+                                return None;
+                            }
+                        }
+                    }
                     v if v.starts_with(b"(") && v.ends_with(b")") => {}
                     _ => return None,
                 }
@@ -75,46 +179,54 @@ fn goto(input: &mut Tokens<'_>) -> Option<()> {
 
 // Only fields in the outer dictionary identify catalogs and pages. Ignore names
 // inside strings, arrays and nested dictionaries. Duplicate fields are ambiguous.
-fn field<'a>(body: &'a [u8], name: &[u8]) -> Option<Tokens<'a>> {
-    let mut input = Tokens { data: body, pos: 0 };
+#[derive(Default)]
+struct Fields {
+    kind: Option<usize>,
+    opening: Option<usize>,
+}
+
+fn fields(input: &mut Reader<'_, '_>, read_opening: bool) -> Option<Fields> {
     if input.next()? != b"<<" {
         return None;
     }
-    let mut found = None;
+    let mut fields = Fields::default();
     loop {
-        let key = input.next()?;
-        if key == b">>" {
-            return if input.next().is_none() { found } else { None };
-        }
-        if !key.starts_with(b"/") {
+        let selected = match input.next()? {
+            b">>" => return input.next().is_none().then_some(fields),
+            b"/Type" => Some(&mut fields.kind),
+            b"/OpenAction" if read_opening => Some(&mut fields.opening),
+            key if !key.starts_with(b"/") => return None,
+            _ => None,
+        };
+        if let Some(field) = selected
+            && field.replace(input.input.pos).is_some()
+        {
             return None;
         }
-        if key == name && found.replace(input.clone()).is_some() {
-            return None;
-        }
-        if input.reference().is_some() {
-            input.next();
-            input.next();
-            input.next();
-        } else if !input.skip_value() {
-            return None;
-        }
+        input.skip_value()?;
     }
 }
 
-pub(super) fn catalog(body: &[u8]) -> Option<Destination> {
-    if field(body, b"/Type")?.next()? != b"/Catalog" {
-        return None;
-    }
-    let mut input = field(body, b"/OpenAction")?;
-    if let Some(id) = input.reference() {
-        return Some(Destination::Indirect(id));
-    }
-    match input.next()? {
-        b"[" => array(&mut input).map(Destination::Page),
-        b"<<" => goto(&mut input).map(|()| Destination::Inline),
-        _ => None,
-    }
+pub(super) fn catalog(
+    body: &[u8],
+    check: &mut dyn FnMut() -> io::Result<()>,
+) -> io::Result<Option<Destination>> {
+    Reader::parse(body, check, |input| {
+        let pos = fields(input, true)?;
+        input.input.pos = pos.kind?;
+        if input.next()? != b"/Catalog" {
+            return None;
+        }
+        input.input.pos = pos.opening?;
+        if let Some(id) = input.reference() {
+            return Some(Destination::Indirect(id));
+        }
+        match input.next()? {
+            b"[" => array(input).map(Destination::Page),
+            b"<<" => goto(input).map(|()| Destination::Inline),
+            _ => None,
+        }
+    })
 }
 
 #[derive(Default)]
@@ -131,14 +243,27 @@ enum Definition<'a> {
     Ambiguous,
 }
 
-fn passive_body(body: &[u8]) -> bool {
-    let mut input = Tokens { data: body, pos: 0 };
-    let valid = match input.next() {
-        Some(b"[") => array(&mut input).is_some(),
-        Some(b"<<") => goto(&mut input).is_some(),
-        _ => false,
-    };
-    valid && input.next().is_none()
+pub(super) fn page(body: &[u8], check: &mut dyn FnMut() -> io::Result<()>) -> io::Result<bool> {
+    Reader::parse(body, check, |input| {
+        fields(input, false).and_then(|f| f.kind).and_then(|p| {
+            input.input.pos = p;
+            input.next()
+        }) == Some(b"/Page")
+    })
+}
+
+pub(super) fn passive_body(
+    body: &[u8],
+    check: &mut dyn FnMut() -> io::Result<()>,
+) -> io::Result<bool> {
+    Reader::parse(body, check, |input| {
+        let valid = match input.next() {
+            Some(b"[") => array(input).is_some(),
+            Some(b"<<") => goto(input).is_some(),
+            _ => false,
+        };
+        valid && input.next().is_none()
+    })
 }
 
 // Only referenced IDs occupy the lookup table. A single pass finds forward and
@@ -165,8 +290,9 @@ pub(super) fn resolve<'a>(
         .filter(|o| !o.raw_destination)
         .filter_map(|o| o.encoded.map(|bytes| (o.start, bytes)));
     let mut input = Tokens { data, pos: 0 };
+    let mut token_budget = super::TokenBudget::default();
     let mut last = [None, None];
-    while let Some(token) = input.next() {
+    while let Some(token) = input.next_checked(&mut token_budget, sink)? {
         if token != b"obj" {
             last = [last[1], number(token)];
             continue;
@@ -178,13 +304,8 @@ pub(super) fn resolve<'a>(
             return Ok(false);
         };
         let definition = definitions.get_mut(&(id, generation));
-        let mut next_check = start.saturating_add(64 * 1024);
         let end = loop {
-            if input.pos >= next_check {
-                sink.check()?;
-                next_check = input.pos.saturating_add(64 * 1024);
-            }
-            match input.next() {
+            match input.next_checked(&mut token_budget, sink)? {
                 Some(b"endobj") => break input.pos - 6,
                 Some(b"stream") => {
                     stream = true;
@@ -209,8 +330,8 @@ pub(super) fn resolve<'a>(
                 Definition::Unique {
                     start,
                     body,
-                    page: field(body, b"/Type").and_then(|mut t| t.next()) == Some(b"/Page"),
-                    action: passive_body(body),
+                    page: page(body, &mut || sink.check())?,
+                    action: passive_body(body, &mut || sink.check())?,
                     selected: false,
                 }
             } else {
@@ -258,4 +379,55 @@ pub(super) fn resolve<'a>(
     }
     objects.sort_unstable_by_key(|obj| (obj.start, obj.raw_destination));
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancellation_inside_dictionary_values() {
+        let size = 5 * super::super::TOKEN_BLOCK;
+        for (prefix, filler, suffix) in [
+            (b"(".as_slice(), b'A', b")".as_slice()),
+            (b"<", b'6', b">"),
+            (b"/", b'R', b""),
+            (b"%", b'T', b"\n(Receipt)"),
+            (b"", b' ', b"(Receipt)"),
+            (b"[", b' ', b"]"),
+        ] {
+            let mut value = prefix.to_vec();
+            value.resize(size, filler);
+            value.extend_from_slice(suffix);
+            let body = [
+                b"<< /Type /Catalog /Title ".as_slice(),
+                &value,
+                b" /OpenAction << /S /GoTo /D (Receipt) >> >>",
+            ]
+            .concat();
+            let mut polls = 0;
+            let dest = catalog(&body, &mut || {
+                polls += 1;
+                Ok(())
+            })
+            .unwrap();
+            assert!(matches!(dest, Some(Destination::Inline)));
+            assert!(polls >= 5);
+            for fail_at in [1, 3] {
+                let mut polls = 0;
+                let error = catalog(&body, &mut || {
+                    polls += 1;
+                    if polls == fail_at {
+                        Err(io::Error::other("PDF checkpoint"))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .err()
+                .expect("cancellation must reach the caller");
+                assert_eq!(error.to_string(), "PDF checkpoint");
+                assert_eq!(polls, fail_at);
+            }
+        }
+    }
 }

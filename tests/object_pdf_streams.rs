@@ -3,6 +3,8 @@
 mod daemon;
 #[path = "common/pdf_text.rs"]
 mod pdf_text;
+#[path = "common/zip.rs"]
+mod zip;
 use flate2::{Compression, write::ZlibEncoder};
 use md5::{Digest, Md5};
 use std::{
@@ -69,13 +71,31 @@ fn with_member(
         b"<< /Type /Filespec /F (notes.txt) /EF << /F 7 0 R >> >>\n",
         extra,
     ];
-    let mut header = String::new();
-    let mut body = Vec::new();
     let order = if earlier {
         [1, 2, 5, 3, 4]
     } else {
         [1, 2, 3, 4, 5]
     };
+    pack(
+        compact,
+        compressed,
+        physical,
+        indirect_length,
+        members,
+        order,
+    )
+}
+
+fn pack(
+    compact: bool,
+    compressed: bool,
+    physical: [usize; 3],
+    indirect_length: bool,
+    members: [&[u8]; 5],
+    order: [usize; 5],
+) -> io::Result<Sample> {
+    let mut header = String::new();
+    let mut body = Vec::new();
     for &id in &order {
         header.push_str(&format!("{id} {} ", body.len()));
         body.extend_from_slice(members[id - 1]);
@@ -135,7 +155,7 @@ fn with_member(
     xref[9 * 7] = 1;
     xref[9 * 7 + 1..9 * 7 + 5].copy_from_slice(&(start as u32).to_be_bytes());
     pdf.extend(b"9 0 obj\n");
-    let info = if extra.starts_with(b"<<") {
+    let info = if members[4].starts_with(b"<<") {
         " /Info 5 0 R"
     } else {
         ""
@@ -149,7 +169,7 @@ fn with_member(
         file: pdf,
         directory,
         encoded,
-        page_dict,
+        page_dict: members[2].to_vec(),
         xref,
     })
 }
@@ -273,6 +293,206 @@ fn compare(stock: bool) -> io::Result<()> {
         }
         Ok(())
     };
+    let page = format!("{PAGE_DICT}6 0 R >>\n");
+    let mut rules = std::collections::BTreeSet::new();
+    let mut destinations = Vec::new();
+    for (opening, action, backward_winner) in [
+        ("[3 0 R /Fit]", "[3 0 R /Fit]\n", "OpeningPage"),
+        ("5 0 R", "<< /S /GoTo /D [3 0 R /Fit] >>\n", "OpeningAction"),
+        ("5 0 R", "[3 0 R /FitH 72]\n", "OpeningAction"),
+        (
+            "<< /S /GoTo /D [3 0 R /Fit] >>",
+            "[3 0 R /Fit]\n",
+            "Catalog",
+        ),
+    ] {
+        let catalog = format!(
+            "<< /Type /Catalog /Pages 2 0 R /Names << /EmbeddedFiles << /Names [(notes.txt) 4 0 R] >> >> /OpenAction {opening} >>\n"
+        );
+        rules.insert(hash(catalog.as_bytes(), "Catalog"));
+        rules.insert(hash(action.as_bytes(), "OpeningAction"));
+        rules.insert(hash(page.as_bytes(), "OpeningPage"));
+        for (order, compact, winner) in [
+            ([1, 2, 3, 4, 5], true, "Catalog"),
+            ([5, 3, 2, 1, 4], true, backward_winner),
+            ([1, 2, 3, 4, 5], false, "Wrapper"),
+        ] {
+            let sample = pack(
+                compact,
+                true,
+                [8, 6, 7],
+                false,
+                [
+                    catalog.as_bytes(),
+                    b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>\n",
+                    page.as_bytes(),
+                    b"<< /Type /Filespec /F (notes.txt) /EF << /F 7 0 R >> >>\n",
+                    action.as_bytes(),
+                ],
+                order,
+            )?;
+            let wrapper = zip::zip(&[("notes.pdf", &sample.file)], true, false, false)?;
+            rules.insert(hash(&wrapper, "Wrapper"));
+            destinations.push((wrapper, winner));
+        }
+    }
+    let dest_rules = rules.into_iter().collect::<String>();
+    let packed_cases: Vec<_> = destinations
+        .iter()
+        .map(|(file, winner)| ("packed opening", file.as_slice(), Some(*winner)))
+        .collect();
+    check("", &dest_rules, "", &packed_cases)?;
+    let fixed_winner = |name| {
+        destinations
+            .iter()
+            .map(|(file, _)| ("packed opening", file.as_slice(), Some(name)))
+            .collect::<Vec<_>>()
+    };
+    check(
+        "",
+        &(dest_rules.clone() + &embedded),
+        "",
+        &fixed_winner("Attachment"),
+    )?;
+    for setting in [
+        "ScanPDF no",
+        "MaxFiles 3",
+        "MaxRecursion 1",
+        "MaxScanSize 1000",
+    ] {
+        check(setting, &dest_rules, "", &fixed_winner("Wrapper"))?;
+    }
+    check("MaxFiles 9", &dest_rules, "", &packed_cases)?;
+    let mut long_cases = Vec::new();
+    let mut long_rules = String::new();
+    let suffix = b") /OpenAction << /S /GoTo /D /Receipt >> >>\n";
+    for (size, name) in [
+        (65_536, "Catalog64K"),
+        (65_537, "Catalog64KPlusOne"),
+        (1_048_617, "LargeCatalog"),
+    ] {
+        let mut catalog = b"<< /Type /Catalog /Pages 2 0 R /Note (".to_vec();
+        let memo = b"Receiving confirmed the count of paper, pens, and folders. ";
+        catalog.extend(
+            memo.iter()
+                .copied()
+                .cycle()
+                .take(size - catalog.len() - suffix.len()),
+        );
+        catalog.extend_from_slice(suffix);
+        long_rules += &hash(&catalog, name);
+        let sample = pack(
+            true,
+            true,
+            [8, 6, 7],
+            false,
+            [
+                &catalog,
+                b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>\n",
+                page.as_bytes(),
+                b"<< /Type /Filespec /F (notes.txt) /EF << /F 7 0 R >> >>\n",
+                b"<< /Title (Receipt) >>\n",
+            ],
+            [1, 2, 3, 4, 5],
+        )?;
+        if size == 65_537 {
+            let exact = sample.file.len()
+                + sample.directory.len()
+                + PAGE.len()
+                + TEXT.len()
+                + ATTACHMENT.len()
+                + sample.xref.len()
+                + size;
+            for (limit, winner) in [
+                (exact, name),
+                (exact - 1, "Heuristics.Limits.Exceeded.MaxScanSize"),
+            ] {
+                check(
+                    &format!("MaxScanSize {limit}\nAlertExceedsMax yes"),
+                    &long_rules,
+                    "",
+                    &[("last byte of packed catalog", &sample.file, Some(winner))],
+                )?;
+            }
+        }
+        long_cases.push((sample.file, Some(name)));
+    }
+    let mut long_page=b"<< /Type /Page /Parent 2 0 R /Contents 6 0 R /Resources << >> /MediaBox [0 0 100 100] /Note (".to_vec();
+    long_page.resize(192 * 1024, b'R');
+    long_page.extend_from_slice(b") >>\n");
+    let mut named_action = b"<< /S /GoTo /D (".to_vec();
+    named_action.resize(300 * 1024, b'P');
+    named_action.extend_from_slice(b") >>\n");
+    for (opening, page_body, action_body, selected, name) in [
+        (
+            "[3 0 R /Fit]",
+            long_page.as_slice(),
+            b"[3 0 R /Fit]\n".as_slice(),
+            long_page.as_slice(),
+            "LongPage",
+        ),
+        (
+            "5 0 R",
+            page.as_bytes(),
+            named_action.as_slice(),
+            named_action.as_slice(),
+            "LongAction",
+        ),
+    ] {
+        let catalog = format!("<< /Type /Catalog /Pages 2 0 R /OpenAction {opening} >>\n");
+        let sample = pack(
+            true,
+            true,
+            [8, 6, 7],
+            false,
+            [
+                catalog.as_bytes(),
+                b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>\n",
+                page_body,
+                b"<< /Type /Filespec /F (notes.txt) /EF << /F 7 0 R >> >>\n",
+                action_body,
+            ],
+            [5, 3, 2, 1, 4],
+        )?;
+        long_rules += &hash(selected, name);
+        long_cases.push((sample.file, Some(name)));
+    }
+    let large: Vec<_> = long_cases
+        .iter()
+        .map(|(file, expected)| ("catalog with long metadata", file.as_slice(), *expected))
+        .collect();
+    check("", &long_rules, "", &large)?;
+    check(
+        "",
+        &(long_rules.clone() + &embedded),
+        "",
+        &long_cases
+            .iter()
+            .map(|(file, _)| {
+                (
+                    "attachment before large catalog",
+                    file.as_slice(),
+                    Some("Attachment"),
+                )
+            })
+            .collect::<Vec<_>>(),
+    )?;
+    check(
+        "MaxScanSize 4096\nAlertExceedsMax yes",
+        &long_rules,
+        "",
+        &long_cases
+            .iter()
+            .map(|(file, _)| {
+                (
+                    "large catalog limits",
+                    file.as_slice(),
+                    Some("Heuristics.Limits.Exceeded.MaxScanSize"),
+                )
+            })
+            .collect::<Vec<_>>(),
+    )?;
+
     let deferred = with_member(
         true,
         true,
