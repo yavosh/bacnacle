@@ -1,8 +1,9 @@
-//! ISO 9660 images with an empty system area, including raw CD sectors.
+//! ISO 9660 volumes in cooked disk images and raw CD sectors.
 use super::{ChildSink, Handling};
 use std::collections::HashSet;
 use std::io::{self, Read};
 
+pub(super) const PVD: &[u8] = b"\x01CD001\x01";
 const SECTOR: usize = 2048;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct Layout {
@@ -15,11 +16,57 @@ impl Layout {
         16 * self.stride + self.prefix
     }
 
+    fn cooked(bytes: &[u8]) -> Option<Self> {
+        let layout = Self {
+            stride: SECTOR,
+            prefix: 0,
+        };
+        let primary = layout.sector(bytes, 16)?;
+        if !primary.starts_with(PVD)
+            || !matches!(
+                u16::from_le_bytes([primary[128], primary[129]]),
+                512 | 1024 | 2048
+            )
+        {
+            return None;
+        }
+        // A populated system area can have its own outer format. Only recognize a
+        // separate cooked volume when its descriptor sequence reaches a terminator.
+        for index in 17..32 {
+            let header = layout.sector(bytes, index)?;
+            if &header[1..7] != b"CD001\x01" {
+                break;
+            }
+            match header[0] {
+                255 => return Some(layout),
+                0..=3 => (),
+                _ => break,
+            }
+        }
+        None
+    }
+
+    pub fn at(bytes: &[u8], offset: usize) -> Option<(&[u8], Self)> {
+        if !offset.is_multiple_of(SECTOR) {
+            return None;
+        }
+        let base = offset.checked_sub(16 * SECTOR)?;
+        let layout = Self::cooked(bytes)?;
+        if base == 0 {
+            return Some((bytes, layout));
+        }
+        // A partitioned ISO can include a second descriptor set whose extents
+        // are relative to its own system area.
+        let volume = bytes.get(base..)?;
+        super::partition::from_mbr(bytes)?;
+        Some((volume, Self::cooked(volume)?))
+    }
+
     pub fn recognize(bytes: &[u8]) -> Option<Self> {
         for (stride, prefix) in [(SECTOR, 0), (2352, 16), (2352, 24), (2448, 16), (2448, 24)] {
             let layout = Self { stride, prefix };
             let primary = layout.descriptor_offset();
-            if bytes.get(primary..primary + 7) == Some(b"\x01CD001\x01")
+            if bytes.get(primary..primary + 7) == Some(PVD)
                 && bytes.get(primary + stride + 1..primary + stride + 6) == Some(b"CD001")
                 && (0..16).all(|i| {
                     bytes[i * stride + prefix..i * stride + prefix + SECTOR]

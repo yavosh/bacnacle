@@ -280,7 +280,8 @@ fn nested_partitions_keep_their_names_and_parent_types() -> io::Result<()> {
             },
             || Ok(()),
         )?;
-        assert_eq!(found, 1, "{kind}");
+        // The protective MBR marker repeats the initial GPT partition scan.
+        assert_eq!(found, if kind == "CL_TYPE_GPT" { 2 } else { 1 }, "{kind}");
     }
     Ok(())
 }

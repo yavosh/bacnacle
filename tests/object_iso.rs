@@ -4,7 +4,7 @@ mod daemon;
 mod zip;
 
 use barnacle::objects::{self, Options, Verdict};
-use std::{fs, io, path::Path};
+use std::{fs, io, io::Read, path::Path};
 
 const SECTOR: usize = 2048;
 const FIRST: &[u8] = b"Quarterly notes from the first meeting";
@@ -111,6 +111,9 @@ fn compare(exe: &Path, stock: bool) -> io::Result<()> {
         let first = FIRST.repeat(88);
         let primary = image(false, SECTOR, &first);
         let supplementary = image(true, SECTOR, &first);
+        let mut labelled = primary.clone();
+        let label = b"Inventory release system area";
+        labelled[..label.len()].copy_from_slice(label);
         let mut appended = primary.clone();
         appended.extend(zip::zip(&[("notes.txt", SECOND)], true, false, false)?);
         let images = [
@@ -121,6 +124,7 @@ fn compare(exe: &Path, stock: bool) -> io::Result<()> {
             image(false, 512, &first),
             image(true, 1024, &first),
             primary,
+            labelled,
             supplementary,
             appended,
         ];
@@ -163,6 +167,135 @@ fn iso_daemon() -> io::Result<()> {
 #[ignore = "requires the pinned Debian clamd"]
 fn iso_stock() -> io::Result<()> {
     compare(Path::new("/usr/sbin/clamd"), true)
+}
+
+const HYBRID_CARD: &[u8] = b"Inventory terminal operator card, revision five.\n";
+const HYBRID_NOTICE: &[u8] = b"Quarterly installation guide for the inventory terminal.\n";
+const HYBRID_MBR: &[u8] = include_bytes!("fixtures/iso-hybrid/mbr.iso.gz");
+const HYBRID_GPT: &[u8] = include_bytes!("fixtures/iso-hybrid/gpt.iso.gz");
+
+fn mbr_data_only(mut image: Vec<u8>) -> Vec<u8> {
+    // The second descriptor is the El Torito record. Keep the Joliet
+    // supplementary descriptor and volume descriptor set terminator.
+    assert_eq!(&image[17 * SECTOR..][..7], b"\0CD001\x01");
+    image.copy_within(18 * SECTOR..20 * SECTOR, 17 * SECTOR);
+    image
+}
+
+fn hybrid_image(compressed: &[u8]) -> io::Result<Vec<u8>> {
+    let mut image = Vec::new();
+    flate2::read::GzDecoder::new(compressed).read_to_end(&mut image)?;
+    Ok(image)
+}
+
+fn compare_hybrids(exe: &Path, stock: bool) -> io::Result<()> {
+    let mbr = hybrid_image(HYBRID_MBR)?;
+    let gpt = hybrid_image(HYBRID_GPT)?;
+    for (image, partition_sector, first, files) in [
+        (mbr.clone(), 36, "Outer", 10),
+        (mbr_data_only(mbr), 36, "Outer", 10),
+        (gpt, 57, "Partition", 17),
+    ] {
+        let partition = &image[partition_sector * SECTOR..][..1440 * 1024];
+        let card = signature(HYBRID_CARD, "Card")?;
+        let notice = signature(HYBRID_NOTICE, "Notice")?;
+        let children = card + &notice;
+        let partition = signature(partition, "Partition")?;
+        let outer = signature(&image, "Outer")?;
+        let label = signature(
+            b"EFI recovery volume label for the inventory terminal.\n",
+            "Recovery",
+        )?;
+        let all = children.clone() + &partition + &outer;
+        let exact = image.len() + HYBRID_CARD.len() + HYBRID_NOTICE.len();
+        for (rules, options, expected) in [
+            (&all, String::new(), first),
+            (&outer, String::new(), "Outer"),
+            (&children, String::new(), "Card"),
+            (&(children.clone() + &partition), String::new(), "Partition"),
+            (&notice, format!("MaxScanSize {exact}"), "Notice"),
+            (&notice, format!("MaxScanSize {}", exact - 1), "MaxScanSize"),
+            (&all, "ScanArchive no".into(), "Outer"),
+            (&children, "MaxFiles 1".into(), "MaxFiles"),
+            (&children, "MaxRecursion 1".into(), "MaxRecursion"),
+            (&label, format!("MaxFiles {}", files - 1), "MaxFiles"),
+            (&label, format!("MaxFiles {files}"), ""),
+        ] {
+            let tmp = tempfile::tempdir_in("/tmp")?;
+            let db = tmp.path().join("db");
+            fs::create_dir(&db)?;
+            fs::write(db.join("local.hdb"), rules)?;
+            let sock = tmp.path().join("sock");
+            let conf = tmp.path().join("instance.conf");
+            fs::write(
+                &conf,
+                format!(
+                    "Foreground yes\nDatabaseDirectory {}\nLocalSocket {}\nDisableCache yes\nAlertExceedsMax yes\n{options}\n",
+                    db.display(),
+                    sock.display()
+                ),
+            )?;
+            let _daemon = daemon::Daemon::start(exe, &conf, &sock)?;
+            let expected = if expected.is_empty() {
+                if stock {
+                    "OK".to_owned()
+                } else {
+                    "Incomplete scan: unsupported detection coverage. ERROR".to_owned()
+                }
+            } else if expected.starts_with("Max") {
+                format!("Heuristics.Limits.Exceeded.{expected} FOUND")
+            } else {
+                format!("ISO.{expected}.UNOFFICIAL FOUND")
+            };
+            assert_eq!(
+                daemon::unix_request(&sock, &daemon::stream_frame(&image)?)?,
+                format!("stream: {expected}\0"),
+                "partition sector {partition_sector}, {options}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn hybrid_iso_daemon() -> io::Result<()> {
+    compare_hybrids(Path::new(env!("CARGO_BIN_EXE_barnacle")), false)
+}
+
+#[test]
+#[ignore = "requires the pinned Debian clamd"]
+fn hybrid_iso_stock() -> io::Result<()> {
+    compare_hybrids(Path::new("/usr/sbin/clamd"), true)
+}
+
+#[test]
+fn hybrid_members_reuse_iso_bytes_and_context() -> io::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    for compressed in [HYBRID_MBR, HYBRID_GPT] {
+        let image = hybrid_image(compressed)?;
+        let position = image
+            .windows(HYBRID_CARD.len())
+            .position(|bytes| bytes == HYBRID_CARD)
+            .expect("authored ISO file");
+        let verdict = objects::scan(
+            &image,
+            &Options::default(),
+            tmp.path(),
+            |obj, _| {
+                if obj.bytes != HYBRID_CARD {
+                    return Ok(Verdict::Miss);
+                }
+                assert_eq!(obj.bytes.as_ptr(), image[position..].as_ptr());
+                assert_eq!(obj.parents.len(), 1);
+                assert_eq!(obj.parents[0].file_type, "CL_TYPE_ISO9660");
+                assert_eq!(obj.layer.name.as_deref(), Some(&b"CARD.TXT"[..]));
+                Ok(Verdict::Found("operator card".into()))
+            },
+            || Ok(()),
+        )?;
+        assert_eq!(verdict, Verdict::Found("operator card".into()));
+    }
+    Ok(())
 }
 
 #[test]

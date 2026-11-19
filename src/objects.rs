@@ -58,6 +58,12 @@ trait ChildSink {
     fn utf16_html(&mut self, bytes: &[u8]) -> io::Result<Handling>;
     fn embedded_archive(&mut self, kind: &'static str, bytes: &[u8]) -> io::Result<Handling>;
     fn embedded_xdp(&mut self, bytes: &[u8]) -> io::Result<Handling>;
+    fn cooked_iso(
+        &mut self,
+        bytes: &[u8],
+        layout: iso::Layout,
+        primary: bool,
+    ) -> io::Result<Handling>;
     fn match_generic_view(&mut self, bytes: &[u8]) -> io::Result<bool>;
     fn partition(&mut self, snapshot: Snapshot) -> io::Result<bool> {
         snapshot.with_bytes(|bytes| self.partition_bytes(bytes, None))
@@ -425,7 +431,10 @@ impl Traversal<'_> {
             let mut disks = if self.options.scan_archive {
                 [
                     file_type.parser.disk_descriptor(),
-                    if matches!(file_type.parser, classify::Parser::PartitionMap(_)) {
+                    if matches!(
+                        file_type.parser,
+                        classify::Parser::PartitionMap("CL_TYPE_APM")
+                    ) {
                         None
                     } else {
                         partition::from_mbr(bytes)
@@ -531,6 +540,21 @@ impl ChildSink for Traversal<'_> {
         }
         layer.file_type = "CL_TYPE_XDP";
         xdp::extract(bytes, self)
+    }
+
+    fn cooked_iso(
+        &mut self,
+        bytes: &[u8],
+        layout: iso::Layout,
+        primary: bool,
+    ) -> io::Result<Handling> {
+        let layer = self.parents.last_mut().expect("ISO has an owning disk");
+        // The separately scheduled descriptor already visited a plain or raw image.
+        if primary && layer.file_type == "CL_TYPE_ISO9660" {
+            return Ok(Handling::Unrecognized);
+        }
+        layer.file_type = "CL_TYPE_ISO9660";
+        iso::extract(bytes, layout, self)
     }
 
     fn partition_bytes(&mut self, bytes: &[u8], name: Option<&[u8]>) -> io::Result<bool> {

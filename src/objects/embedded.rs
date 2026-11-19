@@ -1,4 +1,4 @@
-use super::{ChildSink, Handling, Options, archive, installer, xdp};
+use super::{ChildSink, Handling, Options, archive, installer, iso, xdp};
 use crate::body::ObjectContext;
 use aho_corasick::AhoCorasick;
 use std::io;
@@ -10,6 +10,7 @@ const MAGICS: &[(&[u8], &str)] = &[
     (b"7z\xbc\xaf\x27\x1c", "CL_TYPE_7Z"),
     (b"\x60\xea", "CL_TYPE_ARJ"),
     (b"Rar!\x1a\x07\0", "CL_TYPE_RAR"),
+    (iso::PVD, "CL_TYPE_ISO9660"),
     (xdp::MAGIC, "CL_TYPE_XDP"),
     (installer::NSIS_MAGIC, "CL_TYPE_NULSFT"),
     (installer::ISHIELD_MAGIC, "CL_TYPE_ISHIELD_MSI"),
@@ -42,8 +43,12 @@ pub(super) fn possible_text_map(bytes: &[u8], sink: &mut dyn ChildSink) -> io::R
         sink.check()?;
         let end = (start + 65536 + FINDER.max_pattern_len() - 1).min(bytes.len());
         if FINDER.find_iter(&bytes[start..end]).any(|m| {
+            let kind = MAGICS[m.pattern().as_usize()].1;
+            if kind == "CL_TYPE_ISO9660" {
+                return iso::Layout::at(bytes, start + m.start()).is_some();
+            }
             !matches!(
-                MAGICS[m.pattern().as_usize()].1,
+                kind,
                 "CL_TYPE_MSEXE" | "CL_TYPE_ISHIELD_MSI" | "CL_TYPE_NULSFT" | "CL_TYPE_RAR"
             )
         }) {
@@ -87,6 +92,19 @@ pub(super) fn extract(
                 break;
             }
             let kind = MAGICS[found.pattern().as_usize()].1;
+            if kind == "CL_TYPE_ISO9660" {
+                if options.scan_archive
+                    && *count < 10
+                    && let Some((volume, layout)) = iso::Layout::at(bytes, at)
+                {
+                    *count += 1;
+                    let status = sink.cooked_iso(volume, layout, volume.len() == bytes.len())?;
+                    if matches!(status, Handling::Incomplete | Handling::Stopped) {
+                        return Ok(status);
+                    }
+                }
+                continue;
+            }
             if kind == "CL_TYPE_XDP" {
                 if options.scan_pdf
                     && xdp::can_retype(carrier)

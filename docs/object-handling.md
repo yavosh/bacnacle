@@ -233,7 +233,28 @@ The tests cover cooked sectors and raw CD sectors of 2,352 and 2,448 bytes.
 The samples use 512-, 1,024-, and 2,048-byte logical blocks. They include member data spanning sectors.
 Stock scans the outer image before its files. Within each volume, it follows directory order and descends into subdirectories.
 Barnacle borrows contiguous file bytes and skips framing bytes when reading raw sectors.
-Hybrid bootable images remain unverified. [Rust fixtures](../tests/object_iso.rs)
+The xorriso controls combine ISO files with an appended EFI partition and either MBR or GPT.
+The MBR image matches its outer hash before its partitions. The GPT image can match a partition before the outer hash.
+Both images visit ISO files after their partition checks. The files keep the ISO 9660 parent type and their directory names.
+A tight byte budget can exclude the large partition and still admit both small ISO files.
+Stock revisits GPT partitions at the protective MBR marker. It also visits the second ISO descriptor set in the GPT hybrid.
+With only the recovery label signature, the MBR fixture reports `MaxFiles` at nine files and the GPT fixture at sixteen.
+The alert clears when the budget increases by one file.
+The comparisons also cover a data-only MBR image and a plain ISO with text in its system area.
+[Rust comparisons](../tests/object_iso.rs) · [Fixture generation](../tests/fixtures/iso-hybrid/README.md)
+
+Four clients scanned the two authored images with only the notice hash loaded.
+Each trial used a fresh Linux container with one CPU, 2 GiB RAM, and daemon caching disabled.
+The driver sent one initial request, then 128 requests per client. Every request found the notice.
+The table gives medians of three trials. The peak includes the scanner and driver cgroup.
+
+| Image | Barnacle scans/s | Stock scans/s | Barnacle p95 ms | Stock p95 ms | Barnacle peak MiB | Stock peak MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| MBR hybrid | 308.52 | 180.87 | 15.58 | 31.31 | 9.42 | 18.36 |
+| GPT hybrid | 274.21 | 144.93 | 16.99 | 38.64 | 9.50 | 18.80 |
+
+The tested Barnacle Linux binary had SHA-256 `9d968da204c6979a124336978ec6ec119c81f0ccf40925770146e8bf78b7f21e`.
+[Raw hybrid ISO measurements](benchmarks/object-hybrid-iso.csv)
 
 ### PDF objects
 
