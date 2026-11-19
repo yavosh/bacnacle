@@ -70,7 +70,20 @@ impl<'a> Entry<'a> {
         let max_file_size = sink.max_file_size();
         match self.method {
             0 if self.compressed.len() >= self.expanded_len as usize => {
-                self.scan(self.compressed.take(max_file_size), sink)
+                // Stored bytes already reside in the immutable archive. The reference
+                // clips this span at MaxFileSize before checking the scan budget.
+                let len = (self.compressed.len() as u64).min(max_file_size);
+                if len <= 5 || (sink.child_limit().is_some() && sink.recorded_limit().is_some()) {
+                    return Ok(Handling::Complete);
+                }
+                let bytes = &self.compressed[..len as usize];
+                Ok(
+                    if sink.skip_declared_size(len) || sink.child_bytes(bytes, Some(self.name))? {
+                        Handling::Stopped
+                    } else {
+                        Handling::Complete
+                    },
+                )
             }
             8 => self.scan(
                 ZipOutput::new(DeflateDecoder::new(self.compressed), max_file_size),

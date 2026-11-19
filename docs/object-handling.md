@@ -43,8 +43,12 @@ The comparisons also cover nested ZIPs, streaming descriptors, a short final blo
 [Rust comparisons](../tests/object_zip_deflate64.rs) · [Fixture provenance](../tests/fixtures/zip/README.md)
 
 Barnacle limits each decoder call to 8 KiB of input and output. It releases the fixed dictionary before scanning the child.
-Stock checks the file count first. Outputs through five bytes bypass the scan-size and recursion limits.
-For larger outputs, the scan-size limit precedes recursion. If available scan bytes might run out, Barnacle counts past 64 KiB before using disk.
+Stock records the ZIP directory file limit before scanning members. An empty stored entry consumes no directory slot.
+An empty deflated entry consumes a slot because its compressed stream occupies bytes.
+Member outputs through five bytes bypass scan-size, file-count, and recursion checks.
+For larger outputs, the scan-size check precedes child file-count and recursion checks.
+Barnacle scans stored members directly from the archive, including when their length exceeds the in-memory spool threshold.
+If available scan bytes might run out during Deflate64 expansion, Barnacle counts past 64 KiB before using disk.
 A member that fits can then be decoded again. Unconstrained members need one pass.
 An invalid Deflate64 stream that the decoder rejects returns incomplete coverage. Encrypted entries and ZIP64 layouts remain outside these comparisons.
 The Rust decoder uses the MIT license. [deflate64 0.1.12](https://docs.rs/crate/deflate64/0.1.12)

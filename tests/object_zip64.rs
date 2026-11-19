@@ -381,6 +381,29 @@ fn stock_zip64_directory_sentinels() -> io::Result<()> {
 }
 
 #[test]
+fn stored_member_scans_without_scratch() -> io::Result<()> {
+    use barnacle::objects::{self, Options, Verdict};
+    let ledger = b"warehouse inventory ".repeat(16_384);
+    let archive = zip::zip(&[("forms/ledger.txt", &ledger)], false, true, false)?;
+    let scratch = tempfile::tempdir()?;
+    let verdict = objects::scan(
+        &archive,
+        &Options::default(),
+        &scratch.path().join("absent"),
+        |object, _| {
+            if object.layer.name.as_deref() == Some(b"ledger.txt") && object.bytes == ledger {
+                assert_eq!(object.parents.last().unwrap().file_type, "CL_TYPE_ZIP");
+                return Ok(Verdict::Found("Ledger".into()));
+            }
+            Ok(Verdict::Miss)
+        },
+        || Ok(()),
+    )?;
+    assert_eq!(verdict, Verdict::Found("Ledger".into()));
+    Ok(())
+}
+
+#[test]
 fn depth_rejected_member_counts_without_scratch() -> io::Result<()> {
     use barnacle::objects::{self, Limit, Options, Verdict};
     let ledger = b"Office inventory sheet. ".repeat(20_000);
@@ -404,6 +427,10 @@ fn depth_rejected_member_counts_without_scratch() -> io::Result<()> {
             )?,
             Verdict::Found(Limit::MaxScanSize.signature())
         );
+        // A stored member provides its length without reading any blocks.
+        if method == 0 {
+            continue;
+        }
         let mut polls = 0;
         let error = objects::scan(
             &file,
