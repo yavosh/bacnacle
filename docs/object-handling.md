@@ -70,6 +70,14 @@ The Apache fixtures exercise per-member sentinels. Stock skips those members and
 The comparisons cover single-disk archives with a fixed ZIP64 trailer. Large offsets, split archives, and extended trailers remain unverified.
 [Rust comparisons](../tests/object_zip64.rs) · [Writer settings](../tests/fixtures/zip64/README.md)
 
+For a 1 MiB stored ledger, four clients reached 301 scans/s with Barnacle and 247 scans/s with stock.
+Peak cgroup memory was 6.94 MiB and 22.28 MiB respectively. Borrowing the member saved 1,048,593 written bytes per scan.
+The preceding Barnacle build reached 287 scans/s at 10.36 MiB. Each median covers three fresh containers, one CPU, and 2 GiB RAM.
+The Rust driver sent one initial request and 40 warm requests per client. All responses matched the member hash.
+Reproduce the archive with `zip -0 -X archive.zip ledger.txt` using the lowercase inventory fixture as `ledger.txt`.
+Load the sole HDB rule `aa163d58f60d977b08d8c8e961d537e0:1048593:Inventory.Ledger` and disable daemon caching.
+[Fixture generation](benchmarks/object-script-views.md#fixtures) · [Raw measurements](benchmarks/object-zip-stored.csv)
+
 ### Executable containers
 
 Stock scans a universal Mach-O file's architecture slices in descriptor order before checking the whole-file hash.
