@@ -17,6 +17,7 @@ signal-hook = "0.3"
 regex = "1"
 flate2 = { version = "1", features = ["zlib-rs"] }
 bzip2 = "0.6"
+nsis = { version = "0.6.1", default-features = false }
 cfb = "0.15"
 delharc = { version = "0.8", default-features = false, features = ["std", "lh1", "lz", "no-unsafe-assertions"] }
 lzma-rust2 = { version = "0.25", default-features = false, features = ["std", "xz"] }

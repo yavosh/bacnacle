@@ -6,6 +6,7 @@ use md5::{Digest, Md5};
 use std::io::{self, BufRead, BufReader, Cursor, Read};
 
 mod directory;
+mod hwp;
 mod office;
 mod temporary;
 type Document<'a> = CompoundFile<Cursor<&'a [u8]>>;
@@ -120,13 +121,19 @@ fn visit(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handling> {
     if directory
         .streams
         .iter()
-        .any(|e| named(e, &["fileheader", "encryptioninfo", "encryptedpackage"]))
+        .any(|e| named(e, &["encryptioninfo", "encryptedpackage"]))
     {
         return Ok(Handling::Incomplete);
     }
     let temporary_pass = directory.streams.iter().any(|e| {
         native(&e.name) || named(e, &["_vba_project", "worddocument", "powerpoint document"])
     });
+    if let Some(flags) = hwp::header(&mut doc, &directory, sink)? {
+        if temporary_pass {
+            return Ok(Handling::Incomplete);
+        }
+        return hwp::scan(&mut doc, &directory, flags, sink);
+    }
     if !temporary_pass {
         for entry in &directory.streams {
             if !office::ordinary(&mut doc, &directory, entry, sink)? {
@@ -211,4 +218,15 @@ pub(super) fn extract(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Hand
         }
         result => result,
     }
+}
+
+pub(super) fn wrapped(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handling> {
+    let Some(cfb) = bytes.get(4..) else {
+        return Ok(Handling::Complete);
+    };
+    Ok(if sink.child_bytes(cfb, None)? {
+        Handling::Stopped
+    } else {
+        Handling::Complete
+    })
 }

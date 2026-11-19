@@ -12,10 +12,10 @@ The raw engine inventory lists individual submodules, including disabled entries
 | --- | --- | --- |
 | Archives and compressed streams | ZIP, gzip, bzip2, XZ, TAR, CPIO, 7z, RAR, ARJ, CAB, SZDD, CHM, BinHex, EGG, LHA, ALZ and SIS | Rust fixtures cover all listed families, including stored and compressed legacy SIS members. The RAR comparison checks the reference installation without UnRAR. [Archive comparisons](../tests/object_archives.rs) |
 | Disk images and partitions | ISO 9660, UDF, DMG, XAR, HFS+, MBR, GPT and APM | Tests cover optical images, XAR, DMG, three partition maps, and files inside HFS+ and HFSX. [ISO comparisons](../tests/object_iso.rs) · [DMG comparisons](../tests/object_dmg.rs) · [Partition comparisons](../tests/object_partition.rs) |
-| Installers and embedded files | NSIS, AutoIt, InstallShield and embedded file recognition | These handlers need individual fixtures. |
+| Installers and embedded files | NSIS, AutoIt, InstallShield and embedded file recognition | Tests exercise NSIS, InstallShield and embedded PE resources. AutoIt still needs a separate comparison. [Installer comparisons](../tests/object_installers.rs) · [Embedded comparisons](../tests/object_embedded.rs) |
 | Documents | OLE2, OOXML, Word/Excel XML, HWP, OneNote, PDF, RTF and SWF | Tests cover ordinary PDF, Office, RTF and Flash documents, including competing child detections and scan limits. [PDF comparisons](../tests/object_pdf.rs) · [OLE comparisons](../tests/object_ole.rs) |
 | Text and mail | HTML, UTF-16 HTML, script normalization, JavaScript, script encoding, mbox/MIME, TNEF and uuencoding | Rust fixtures exercise ordinary scripts, HTML, MIME, TNEF, uuencoded files, and data URLs. [Text comparisons](../tests/object_text.rs) |
-| Executables and graphics | PE, ELF, Mach-O, universal Mach-O, RIFF, GIF, PNG, JPEG and TIFF | BMP and GIF fixtures compare raw body and whole-file winners. Full image heuristics and executable unpacking remain open. [Image comparisons](../tests/object_images.rs) · [Executable offsets](body-patterns.md) |
+| Executables and graphics | PE, ELF, Mach-O, universal Mach-O, RIFF, GIF, PNG, JPEG and TIFF | Tests cover universal Mach-O slices, ELF sections, and BMP and GIF signatures. Full image heuristics and executable unpacking remain open. [Mach-O and ELF comparisons](../tests/object_macho.rs) · [Image comparisons](../tests/object_images.rs) |
 
 The engine also enables password support for archives and format-specific detection heuristics.
 The reference image lacks an installed UnRAR helper even though its engine configuration lists RAR.
@@ -23,6 +23,33 @@ The reference applies format settings and limits individually. [Effective clamd 
 
 `ScanXMLDOCS no` leaves ZIP member scanning enabled in packaged Word, Excel, PowerPoint, and HWP documents.
 Both daemons detect the same member hash with this setting. [Office container comparisons](../tests/object_parents.rs)
+
+### Executable containers
+
+Stock scans a universal Mach-O file's architecture slices in descriptor order before checking the whole-file hash.
+Each slice has its own offsets and an unnamed layer under `CL_TYPE_MACHO_UNIBIN`.
+The reference skipped the FAT64 and swapped-endian controls. [Apple-authored object files](../tests/fixtures/macho)
+
+Both daemons match raw hashes and section-relative rules on ordinary ELF files with either `ScanELF` setting.
+Both also match an outer PE hash before processing a nested PE resource.
+`ScanPE no` disables nested PE extraction. `MaxEmbeddedPE` includes an exact-size resource, and zero disables the size cap.
+[ELF comparisons](../tests/object_macho.rs) · [Embedded PE comparisons](../tests/object_embedded.rs)
+
+### Binary HWP documents
+
+HWP5 stores document streams in an OLE compound file. A `FileHeader` stream starts with the HWP signature and contains compression flags.
+An unrelated stream named `FileHeader` remains ordinary OLE data. [Hancom HWP5 format](https://cdn.hancom.com/link/docs/%ED%95%9C%EA%B8%80%EB%AC%B8%EC%84%9C%ED%8C%8C%EC%9D%BC%ED%98%95%EC%8B%9D_5.0_revision1.2.pdf)
+
+Both daemons scan HWP5 streams before the document hash in compound-directory order.
+Compressed paragraphs, document properties, and binary attachments use raw DEFLATE. Preview streams retain their original bytes.
+Raw streams receive lowercase names. Inflated streams have no filename. Both retain `CL_TYPE_MSOLE2` as their parent.
+An embedded `CL_TYPE_HWPOLE2` wrapper scans the compound file after its four-byte length, including when the length differs.
+`ScanOLE2` controls HWP5 and wrapped OLE extraction. [Binary HWP comparisons](../tests/object_hwp.rs)
+
+HWP3 uses a separate paragraph and attachment format. Stock scans the information records before the uncompressed document content and the whole-file hash.
+The fixtures cover stored and compressed paragraphs, OLE data, images, hyperlink data, background images, and ZIP ancestry.
+`ScanHWP3 no` preserves the outer hash, and `MaxRecHWP3 0` suppresses paragraph parsing.
+Rich paragraph controls, protected documents, and HWP5 streams with competing Office macro passes still have incomplete coverage. [HWP3 comparisons](../tests/object_hwp/v3.rs)
 
 ### Word 2003 XML, Excel 2003 XML, and HWPML
 
@@ -62,12 +89,26 @@ Document names come from the winning signature. [End-to-end fixtures](../tests/o
 | Page text | Parenthesized strings in page text arrays. The normalized bytes can match a whole-file hash. |
 | Nested inputs | ZIP containing a PDF and a PDF with competing raw and child rules. |
 | Policies and truncated input | Parser disabled, recursion and expanded-size alerts, a missing final trailer, and a truncated stream. |
-| Additional PDF stages | Encryption, compressed object streams, JavaScript actions and other stream filters require further comparisons. |
+| Packed indirect objects | Stored and Flate object streams, packed page dictionaries, content arrays, indirect lengths, and physical stream order. [Object-stream comparisons](../tests/object_pdf_streams.rs) |
+| Additional PDF stages | Encryption, JavaScript actions and other stream filters require further comparisons. |
 
 Both daemons scan PDF attachments in Adobe XDP forms. They visit the first matching PDF in XML order.
 If the form type appears in the first 1,024 bytes, its attached PDF can win over the form hash.
 A later type marker allows the outer hash to win first. Both paths give the PDF a `CL_TYPE_XDP` parent.
 `ScanPDF no` disables attachment extraction. `ScanArchive no` leaves it enabled. [PDF form comparisons](../tests/object_pdf.rs)
+
+Both daemons match the decoded object stream before later physical streams.
+Clamd reads the packed directory for the compact spelling `/Type/ObjStm`.
+A packed page can mark a later physical stream for text extraction.
+Packed dictionaries selected for scanning follow all physical streams, including the cross-reference stream.
+With the spaced spelling `/Type /ObjStm`, only the carrier stream participates in this stage.
+The independent control uses qpdf 12.4.2 and contains one page and a text attachment. [qpdf control](../tests/fixtures/pdf/qpdf-object-stream.pdf)
+
+The tests cover Flate expansion across the reference's initial 256 KiB buffer.
+An oversized decoded directory can still supply a page reference when it fits this buffer.
+If the next allocation exceeds the limit, the reference can scan the encoded carrier instead.
+Barnacle stores deferred arrays and selected dictionaries in one private spool, bounded by the initial remaining object budget.
+If the spool fills, a later selected object can produce incomplete coverage. [Object-stream layout](https://qpdf.readthedocs.io/en/stable/object-streams.html)
 
 ### Apple disk images
 
@@ -161,7 +202,7 @@ A child inside a nested storage still has the enclosing compound file as its sca
 | Embedded Package | A root Package payload wins against its envelope. In a nested storage, the envelope hash can win first. |
 | Nested formats | ZIP inside OLE, OLE inside ZIP, and parent-type matching on extracted streams and attachments. |
 | Limits | File count, storage depth, scan recursion, remaining scan bytes, and scanning with `ScanOLE2 no`. |
-| Coverage gaps | VBA, XLM, embedded Office images, HWP, encryption, and larger version 4 directories require further comparisons. |
+| Coverage gaps | VBA, XLM, embedded Office images, protected HWP documents, encryption, and larger version 4 directories require further comparisons. |
 
 Rust tests compare competing raw streams and embedded packages in macro-free Word, Excel, and PowerPoint documents.
 They cover flat directories, nested storages, shared stream names, and the underlying filesystem’s scan order.

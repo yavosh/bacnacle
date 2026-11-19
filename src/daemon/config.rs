@@ -146,10 +146,15 @@ impl Config {
             "MaxFiles" => self.objects.max_files = number(value)?,
             "MaxPartitions" => self.objects.max_partitions = number(value)?,
             "MaxRecursion" => self.objects.max_recursion = number(value)?,
+            "MaxRecHWP3" => self.objects.max_rec_hwp3 = number(value)?,
             "AlertExceedsMax" => self.objects.alert_exceeds_max = boolean(value)?,
             "ScanArchive" => self.objects.scan_archive = boolean(value)?,
+            "ScanPE" => self.objects.scan_pe = boolean(value)?,
+            "MaxEmbeddedPE" => self.objects.max_embedded_pe = size(value)?,
+            "ScanELF" => self.objects.scan_elf = boolean(value)?,
             "ScanPDF" => self.objects.scan_pdf = boolean(value)?,
             "ScanOLE2" => self.objects.scan_ole2 = boolean(value)?,
+            "ScanHWP3" => self.objects.scan_hwp3 = boolean(value)?,
             "ScanXMLDOCS" => self.objects.scan_xml_docs = boolean(value)?,
             "ScanSWF" => self.objects.scan_swf = boolean(value)?,
             "ScanOneNote" => self.objects.scan_onenote = boolean(value)?,
@@ -305,13 +310,9 @@ fn queue_limit(threads: usize, recursion: usize, requested: usize, descriptors: 
 
 fn reference_engine_value(key: &str, value: &str) -> bool {
     match key {
-        "ScanPE"
-        | "AlgorithmicDetection"
-        | "ScanELF"
-        | "PhishingSignatures"
-        | "PhishingScanURLs"
-        | "ScanHWP3"
-        | "Bytecode" => boolean(value).ok() == Some(true),
+        "AlgorithmicDetection" | "PhishingSignatures" | "PhishingScanURLs" | "Bytecode" => {
+            boolean(value).ok() == Some(true)
+        }
         "ArchiveBlockEncrypted"
         | "PhishingAlwaysBlockSSLMismatch"
         | "PhishingAlwaysBlockCloak"
@@ -323,13 +324,11 @@ fn reference_engine_value(key: &str, value: &str) -> bool {
         | "ForceToDisk"
         | "DisableCertCheck" => boolean(value).ok() == Some(false),
         "BytecodeSecurity" => value == "TrustSigned",
-        "MaxEmbeddedPE" => matches!(size(value), Ok(10485760 | 41943040)),
         "MaxZipTypeRcg" => size(value).ok() == Some(1 << 20),
         "PCREMaxFileSize" => matches!(size(value), Ok(26214400 | 104857600)),
         "MaxIconsPE" => value == "100",
         "PCREMatchLimit" => value == "10000" || value == "100000",
         "PCRERecMatchLimit" => value == "5000" || value == "2000",
-        "MaxRecHWP3" => value == "16",
         "BytecodeTimeout" => value == "60000" || value == "10000",
         _ => false,
     }

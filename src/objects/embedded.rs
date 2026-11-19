@@ -1,4 +1,5 @@
-use super::{ChildSink, Handling, Options, archive, xdp};
+use super::{ChildSink, Handling, Options, archive, installer, xdp};
+use crate::body::ObjectContext;
 use aho_corasick::AhoCorasick;
 use std::io;
 use std::sync::LazyLock;
@@ -10,17 +11,29 @@ const MAGICS: &[(&[u8], &str)] = &[
     (b"\x60\xea", "CL_TYPE_ARJ"),
     (b"Rar!\x1a\x07\0", "CL_TYPE_RAR"),
     (xdp::MAGIC, "CL_TYPE_XDP"),
+    (installer::NSIS_MAGIC, "CL_TYPE_NULSFT"),
+    (installer::ISHIELD_MAGIC, "CL_TYPE_ISHIELD_MSI"),
+    (b"MZ", "CL_TYPE_MSEXE"),
 ];
 static FINDER: LazyLock<AhoCorasick> = LazyLock::new(|| {
     AhoCorasick::new(MAGICS.iter().map(|(magic, _)| *magic)).expect("static archive file types")
 });
 
 pub(super) fn contents(bytes: &[u8], kind: &str, sink: &mut dyn ChildSink) -> io::Result<Handling> {
-    if kind == "CL_TYPE_ZIP" {
-        archive::zip_single(bytes, sink)
-    } else {
-        archive::extract(bytes, sink)
+    match kind {
+        "CL_TYPE_ZIP" => archive::zip_single(bytes, sink),
+        "CL_TYPE_NULSFT" | "CL_TYPE_ISHIELD_MSI" => installer::extract(kind, bytes, sink),
+        "CL_TYPE_MSEXE" => Ok(if sink.child_bytes(bytes, None)? {
+            Handling::Stopped
+        } else {
+            Handling::Complete
+        }),
+        _ => archive::extract(bytes, sink),
     }
+}
+
+pub(super) fn pe_carrier(kind: &str) -> bool {
+    matches!(kind, "CL_TYPE_MSEXE" | "CL_TYPE_MSOLE2")
 }
 
 pub(super) fn enabled(carrier: &str) -> bool {
@@ -49,8 +62,8 @@ pub(super) fn extract(
     while start < offsets.end {
         sink.check()?;
         let end = start.saturating_add(65536).min(offsets.end);
-        // Look ahead for the eight-byte CAB identifier at a chunk boundary.
-        let window = &bytes[start..end.saturating_add(7).min(bytes.len())];
+        let overlap = FINDER.max_pattern_len() - 1;
+        let window = &bytes[start..end.saturating_add(overlap).min(bytes.len())];
         for found in FINDER.find_iter(window) {
             let at = start + found.start();
             if at >= end {
@@ -67,10 +80,20 @@ pub(super) fn extract(
                 }
                 continue;
             }
-            if !options.scan_archive {
+            if !options.scan_archive && kind != "CL_TYPE_MSEXE" {
                 continue;
             }
-            let suffix = &bytes[at..];
+            let mut suffix = &bytes[at..];
+            if kind == "CL_TYPE_ISHIELD_MSI" && !installer::is_ishield(suffix) {
+                continue;
+            }
+            if kind == "CL_TYPE_MSEXE"
+                && !suffix
+                    .get(62..suffix.len().min(306))
+                    .is_some_and(|window| window.windows(4).any(|w| w == b"PE\0\0"))
+            {
+                continue;
+            }
             if kind == "CL_TYPE_ARJ" && !matches!(suffix.get(9..11), Some([0..=2, 2])) {
                 continue;
             }
@@ -84,8 +107,25 @@ pub(super) fn extract(
                 continue;
             }
             *count += 1;
-            if at == 0 || kind == carrier || kind == "CL_TYPE_RAR" {
+            if at == 0 || (kind == carrier && kind != "CL_TYPE_MSEXE") || kind == "CL_TYPE_RAR" {
                 continue;
+            }
+            match kind {
+                "CL_TYPE_NULSFT" if carrier == "CL_TYPE_MSEXE" && at > 4 => {
+                    suffix = &bytes[at - 4..]
+                }
+                "CL_TYPE_NULSFT" => continue,
+                "CL_TYPE_ISHIELD_MSI" if carrier != "CL_TYPE_MSEXE" => continue,
+                "CL_TYPE_MSEXE"
+                    if !options.scan_pe
+                        || !pe_carrier(carrier)
+                        || (options.max_embedded_pe != 0
+                            && suffix.len() as u64 > options.max_embedded_pe)
+                        || !ObjectContext::raw(suffix).is_valid_pe() =>
+                {
+                    continue;
+                }
+                _ => {}
             }
             sink.check()?;
             match sink.embedded_archive(kind, suffix)? {
@@ -95,6 +135,10 @@ pub(super) fn extract(
                     result = Handling::Complete
                 }
                 _ => {}
+            }
+            if kind == "CL_TYPE_MSEXE" {
+                // The suffix contains any subsequent architecture images. Stock visits them recursively.
+                return Ok(Handling::Stopped);
             }
         }
         start = end;

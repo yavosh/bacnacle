@@ -278,7 +278,23 @@ fn scan_value(content: Content, bytes: &[u8], sink: &mut dyn ChildSink) -> io::R
     })
 }
 
-fn scan_deflated(input: &mut dyn Read, sink: &mut dyn ChildSink) -> io::Result<bool> {
+pub(super) fn scan_deflated(input: &mut dyn Read, sink: &mut dyn ChildSink) -> io::Result<bool> {
+    let (file, _) = inflate_hwp(input, sink)?;
+    file.with_bytes(|bytes| {
+        if bytes.len() > 5 {
+            sink.child_bytes(bytes, None)
+        } else {
+            Ok(false)
+        }
+    })
+}
+
+// The boolean tells HWP3 whether to parse decompressed records or scan the partial output directly.
+pub(super) fn inflate_hwp(
+    input: &mut dyn Read,
+    sink: &mut dyn ChildSink,
+) -> io::Result<(Snapshot, bool)> {
+    let mut partial = false;
     // The pinned HWP reader checks limits after each 8192-byte input or output block.
     // On reaching a limit it still scans the preceding complete output blocks.
     let mut source = [0; 8192];
@@ -301,20 +317,19 @@ fn scan_deflated(input: &mut dyn Read, sink: &mut dyn ChildSink) -> io::Result<b
         let read = (inflater.total_in() - before) as usize;
         let written = (inflater.total_out() - after) as usize;
         if sink.skip_declared_size(size + written as u64) {
+            partial = true;
             break;
         }
         file.write_all(&output[..written])?;
         size += written as u64;
         pending = &pending[read..];
+        partial = status.is_err();
         if status.is_err() || matches!(status, Ok(Status::StreamEnd)) || (read == 0 && written == 0)
         {
             break;
         }
     }
-    if size <= 5 {
-        return Ok(false);
-    }
-    file.with_bytes(|bytes| sink.child_bytes(bytes, None))
+    Ok((file, partial))
 }
 
 fn mime_lines(mut data: &[u8]) -> Option<&[u8]> {

@@ -4,6 +4,8 @@ mod cabinet;
 mod daemon;
 #[path = "common/legacy.rs"]
 mod legacy;
+#[path = "common/pe.rs"]
+mod pe;
 #[path = "common/zip.rs"]
 mod zip;
 
@@ -77,12 +79,19 @@ fn compare(exe: &Path) -> io::Result<()> {
     let second = zip::zip(&[("second.txt", SECOND)], true, false, false)?;
     let cab = cabinet::cabinet(b"Reference cabinet notes", SECOND, 1)?;
     let outer = carrier(&[b"outer hash ", &first]);
+    let pe_child = pe::benign_pe();
+    let mut pe_parent = pe_child.clone();
+    pe_parent.extend_from_slice(&pe_child);
+    let mut pe_outer_match = pe_parent.clone();
+    pe_outer_match[512] ^= 1;
     let mut hashes = String::new();
     for (name, bytes) in [
         ("First", FIRST),
         ("Second", SECOND),
         ("Outer", &outer),
         ("CabSuffix", &cab),
+        ("PeChild", &pe_child),
+        ("PeParent", &pe_outer_match),
     ] {
         let digest: String = Md5::digest(bytes)
             .iter()
@@ -139,6 +148,8 @@ fn compare(exe: &Path) -> io::Result<()> {
                 ("ZIP before CAB", carrier(&[&first, &cab]), Some("First")),
                 ("CAB before ZIP", carrier(&[&cab, &first]), Some("Second")),
                 ("outer hash before embedded ZIP", outer, Some("Outer")),
+                ("PE resource suffix", pe_parent.clone(), Some("PeChild")),
+                ("outer PE before suffix", pe_outer_match, Some("PeParent")),
                 (
                     "reversed central directory",
                     carrier(&[&zipped]),
@@ -194,7 +205,37 @@ fn compare(exe: &Path) -> io::Result<()> {
         ),
         (
             "ScanArchive no",
-            vec![("disabled archive scanning", simple.clone(), None)],
+            vec![
+                ("disabled archive scanning", simple.clone(), None),
+                (
+                    "PE with archives disabled",
+                    pe_parent.clone(),
+                    Some("PeChild"),
+                ),
+            ],
+        ),
+        (
+            "ScanPE no",
+            vec![
+                ("disabled nested PE", pe_parent.clone(), None),
+                ("direct PE with parser disabled", pe_child, Some("PeChild")),
+            ],
+        ),
+        (
+            "MaxEmbeddedPE 1024",
+            vec![(
+                "exact embedded PE limit",
+                pe_parent.clone(),
+                Some("PeChild"),
+            )],
+        ),
+        (
+            "MaxEmbeddedPE 1023",
+            vec![("short embedded PE limit", pe_parent.clone(), None)],
+        ),
+        (
+            "MaxEmbeddedPE 0",
+            vec![("zero embedded PE limit", pe_parent.clone(), Some("PeChild"))],
         ),
         (
             "MaxFiles 1",

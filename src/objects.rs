@@ -8,7 +8,10 @@ mod classify;
 mod dmg;
 mod embedded;
 mod hfs;
+mod hwp3;
+mod installer;
 mod iso;
+mod macho;
 mod office;
 mod ole;
 mod onenote;
@@ -53,6 +56,7 @@ trait ChildSink {
     fn child_bytes(&mut self, bytes: &[u8], name: Option<&[u8]>) -> io::Result<bool>;
     fn embedded_archive(&mut self, kind: &'static str, bytes: &[u8]) -> io::Result<Handling>;
     fn embedded_xdp(&mut self, bytes: &[u8]) -> io::Result<Handling>;
+    fn installer_header(&mut self, bytes: &[u8]) -> io::Result<bool>;
     fn partition(&mut self, snapshot: Snapshot) -> io::Result<bool> {
         snapshot.with_bytes(|bytes| self.partition_bytes(bytes, None))
     }
@@ -77,10 +81,15 @@ pub struct Options {
     pub max_files: usize,
     pub max_partitions: usize,
     pub max_recursion: usize,
+    pub max_rec_hwp3: usize,
     pub alert_exceeds_max: bool,
     pub scan_archive: bool,
+    pub scan_pe: bool,
+    pub max_embedded_pe: u64,
+    pub scan_elf: bool,
     pub scan_pdf: bool,
     pub scan_ole2: bool,
+    pub scan_hwp3: bool,
     pub scan_xml_docs: bool,
     pub scan_swf: bool,
     pub scan_onenote: bool,
@@ -102,10 +111,15 @@ impl Default for Options {
             max_files: 10_000,
             max_partitions: 50,
             max_recursion: 17,
+            max_rec_hwp3: 16,
             alert_exceeds_max: false,
             scan_archive: true,
+            scan_pe: true,
+            max_embedded_pe: 40 << 20,
+            scan_elf: true,
             scan_pdf: true,
             scan_ole2: true,
+            scan_hwp3: true,
             scan_xml_docs: true,
             scan_swf: true,
             scan_onenote: true,
@@ -330,6 +344,7 @@ impl Traversal<'_> {
         if self.stopped.is_none() {
             let recognize = kind == InputKind::File
                 && (self.options.scan_archive
+                    || self.options.scan_pe && embedded::pe_carrier(file_type.name)
                     || self.options.scan_pdf && xdp::can_retype(file_type.name))
                 && (file_type.parser != classify::Parser::Html || !self.options.scan_html);
             if self.after_raw(bytes, &file_type, recognize)? == Handling::Incomplete {
@@ -373,7 +388,9 @@ impl Traversal<'_> {
                     self.options,
                     self,
                 )?;
-                if before == Handling::Incomplete || self.stopped.is_some() {
+                if matches!(before, Handling::Incomplete | Handling::Stopped)
+                    || self.stopped.is_some()
+                {
                     return Ok(before);
                 }
                 self.parents.last_mut().expect("current image").file_type = disk.name();
@@ -422,6 +439,34 @@ impl Traversal<'_> {
 }
 
 impl ChildSink for Traversal<'_> {
+    fn installer_header(&mut self, bytes: &[u8]) -> io::Result<bool> {
+        if !self.can_enter_child() || self.skip_declared_size(bytes.len() as u64) {
+            return Ok(false);
+        }
+        self.check()?;
+        let context = ObjectContext::typed(Target::Generic, bytes);
+        let layer = Layer {
+            file_type: "CL_TYPE_ANY",
+            target: Target::Generic,
+            name: None,
+            size: bytes.len(),
+        };
+        let object = Object {
+            bytes,
+            context: &context,
+            parents: &self.parents,
+            layer: &layer,
+            normalized: false,
+            body_only: false,
+            handled_format: true,
+        };
+        let verdict = (self.matcher)(object, self.check)?;
+        if verdict != Verdict::Miss {
+            self.stopped = Some(verdict);
+        }
+        Ok(self.stopped.is_some())
+    }
+
     fn embedded_xdp(&mut self, bytes: &[u8]) -> io::Result<Handling> {
         let layer = self.parents.last_mut().expect("XDP has an owning object");
         if !xdp::can_retype(layer.file_type) {
@@ -451,7 +496,11 @@ impl ChildSink for Traversal<'_> {
         // and pushes its type, then charges only the newly extracted children.
         self.parents.push(Layer {
             file_type: kind,
-            target: Target::Generic,
+            target: if kind == "CL_TYPE_MSEXE" {
+                Target::Pe
+            } else {
+                Target::Generic
+            },
             name: None,
             size: bytes.len(),
         });

@@ -3,6 +3,8 @@
 mod base64;
 #[path = "../examples/compat_oracle/daemon.rs"]
 mod daemon;
+#[path = "common/pe.rs"]
+mod pe;
 #[path = "common/zip.rs"]
 mod zip;
 
@@ -158,6 +160,13 @@ fn compare(exe: &Path, stock: bool) -> io::Result<()> {
             &deflate(SECOND)?,
         ),
     );
+    let mut pdf_resource = pe::benign_pe();
+    pdf_resource.extend_from_slice(&flate);
+    let mut late_pdf = b"Ordinary attachment collection\n".to_vec();
+    late_pdf.resize(2048, b' ');
+    late_pdf.extend_from_slice(&flate);
+    let early_pdf = [b"\n".as_slice(), &flate].concat();
+    let prefixed = |padding: usize, data: &[u8]| [vec![b' '; padding], data.to_vec()].concat();
     let ah = document(
         "notes",
         quiet(),
@@ -219,6 +228,28 @@ fn compare(exe: &Path, stock: bool) -> io::Result<()> {
     let mut truncated_chunk = xdp(&[&marked_pdf], 0);
     truncated_chunk.truncate(truncated_chunk.len() / 2);
     let cases = [
+        (
+            "PDF in resource section overlay",
+            pdf_resource.clone(),
+            None,
+        ),
+        ("PDF after a text preamble", late_pdf.clone(), None),
+        ("PDF after a leading newline", early_pdf, Some("Second")),
+        (
+            "early PDF raw target",
+            prefixed(80, &marked_pdf),
+            Some("Outer"),
+        ),
+        (
+            "PDF type ends at header boundary",
+            prefixed(1017, &flate),
+            Some("Second"),
+        ),
+        (
+            "PDF type crosses header boundary",
+            prefixed(1018, &flate),
+            None,
+        ),
         ("XDP child before form", marked_form.clone(), Some("Outer")),
         (
             "XDP raw form before late child",
@@ -279,6 +310,14 @@ fn compare(exe: &Path, stock: bool) -> io::Result<()> {
     drop(daemon);
     let unmarked_form = xdp(&[&marked_pdf], 1500);
     let (service, socket) = start("no-archives", "ScanArchive no")?;
+    for sample in [&pdf_resource, &late_pdf] {
+        let expected = if stock {
+            "stream: OK\0"
+        } else {
+            "stream: Incomplete scan: unsupported detection coverage. ERROR\0"
+        };
+        assert_eq!(unix_request(&socket, &stream_frame(sample)?)?, expected);
+    }
     assert_eq!(
         unix_request(&socket, &stream_frame(&unmarked_form)?)?,
         "stream: Pdf.Outer.UNOFFICIAL FOUND\0"

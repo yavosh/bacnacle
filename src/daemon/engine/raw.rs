@@ -36,7 +36,6 @@ pub(super) fn eligible(header: &[u8], file_type: &str) -> bool {
         b"Fo",
         b"Fr",
         b"GI",
-        b"HW",
         b"Hi",
         b"ID",
         b"II",

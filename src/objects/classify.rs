@@ -17,6 +17,8 @@ pub(super) enum Parser {
     Utf16Html,
     Pdf,
     Ole2,
+    HwpOle2,
+    Hwp3,
     Swf,
     OneNote,
     Image,
@@ -24,6 +26,10 @@ pub(super) enum Parser {
     Udf,
     Partition,
     HfsPlus,
+    UniversalMachO,
+    ThinMachO,
+    Pe { overlay: Option<usize> },
+    Elf { has_layout: bool },
     PartitionMap(&'static str),
     Xml(xml::Format),
     Xdp,
@@ -70,6 +76,12 @@ impl FileType {
                 Parser::Iso(layout),
             ));
         }
+        if bytes.get(4..12) == Some(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1") {
+            return Ok(Self::generic(bytes, "CL_TYPE_HWPOLE2", Parser::HwpOle2));
+        }
+        if bytes.starts_with(b"HWP Document File V3.00 \x1a\x01\x02\x03\x04\x05") {
+            return Ok(Self::generic(bytes, "CL_TYPE_HWP3", Parser::Hwp3));
+        }
         if onenote::recognizes(bytes) {
             return Ok(Self::generic(bytes, "CL_TYPE_ONENOTE", Parser::OneNote));
         }
@@ -91,7 +103,17 @@ impl FileType {
             return Ok(Self::generic(bytes, name, parser));
         }
         let context = ObjectContext::raw(bytes);
+        if context.target() == Target::MachO && super::macho::recognized(bytes) {
+            return Ok(Self {
+                name: "CL_TYPE_MACHO_UNIBIN",
+                context,
+                parser: Parser::UniversalMachO,
+            });
+        }
         if matches!(context.target(), Target::Generic | Target::Mail) {
+            if pdf::header_type(bytes) {
+                return Ok(Self::typed(bytes, Target::Pdf, Parser::Pdf));
+            }
             if super::xdp::recognizes(bytes) {
                 return Ok(Self::generic(bytes, "CL_TYPE_XDP", Parser::Xdp));
             }
@@ -117,6 +139,13 @@ impl FileType {
                 Parser::Udf
             }
             Target::Pdf => Parser::Pdf,
+            Target::Pe if context.is_valid_pe() => Parser::Pe {
+                overlay: context.pe_overlay(),
+            },
+            Target::MachO if context.has_executable_layout() => Parser::ThinMachO,
+            Target::Elf => Parser::Elf {
+                has_layout: context.has_executable_layout(),
+            },
             Target::Ole2 => Parser::Ole2,
             Target::Flash => Parser::Swf,
             Target::Graphics => Parser::Image,
@@ -215,6 +244,8 @@ impl Parser {
     ) -> io::Result<Handling> {
         match self {
             Self::Archive if options.scan_archive => archive::extract(bytes, sink),
+            Self::UniversalMachO => super::macho::extract(bytes, sink),
+            Self::Elf { has_layout: false } if options.scan_elf => Ok(Handling::Incomplete),
             Self::HfsPlus if options.scan_archive => super::hfs::extract(bytes, sink),
             Self::PartitionMap(name) if options.scan_archive => {
                 partition::extract(name, bytes, sink)
@@ -223,6 +254,10 @@ impl Parser {
             Self::Xdp if options.scan_pdf => super::xdp::extract(bytes, sink),
             Self::Rtf if options.scan_archive => rtf::extract(bytes, sink),
             Self::Ole2 if options.scan_ole2 => ole::extract(bytes, sink),
+            Self::HwpOle2 if options.scan_ole2 => ole::wrapped(bytes, sink),
+            Self::Hwp3 if options.scan_hwp3 => {
+                super::hwp3::extract(bytes, options.max_rec_hwp3, sink)
+            }
             Self::Swf if options.scan_swf => swf::extract(bytes, sink),
             Self::OneNote if options.scan_onenote => onenote::extract(bytes, sink),
             // A broken-media check can precede the raw winner. The default
@@ -235,8 +270,13 @@ impl Parser {
             Self::Uuencoded => text::before_raw(bytes, sink),
             // These formats use the ordinary raw matcher after any enabled parser.
             Self::Archive
+            | Self::ThinMachO
+            | Self::Pe { .. }
+            | Self::Elf { .. }
             | Self::Rtf
             | Self::Ole2
+            | Self::HwpOle2
+            | Self::Hwp3
             | Self::Swf
             | Self::OneNote
             | Self::Image
@@ -263,6 +303,9 @@ impl Parser {
         sink: &mut dyn ChildSink,
     ) -> io::Result<Handling> {
         match self {
+            Self::Pe {
+                overlay: Some(start),
+            } if options.scan_pe => super::installer::legacy(&bytes[start..], sink),
             Self::Pdf if options.scan_pdf => pdf::extract(bytes, sink),
             Self::Text if options.scan_html => text::after_raw(bytes, sink),
             _ => Ok(Handling::Unrecognized),

@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, Read};
 
 mod filters;
+mod object_stream;
 use filters::Filter;
 
 type Id = (usize, usize);
@@ -118,11 +119,14 @@ struct Object<'a> {
     filters: Vec<Filter>,
     image: bool,
     embedded: bool,
+    object_stream: bool,
+    directory: Option<object_stream::Directory>,
     unsupported: bool,
 }
 
 struct Pdf<'a> {
     objects: Vec<Object<'a>>,
+    count: usize,
     lengths: HashMap<Id, usize>,
     contents: HashSet<Id>,
 }
@@ -158,6 +162,7 @@ fn parse<'a>(data: &'a [u8], sink: &mut dyn ChildSink) -> io::Result<Option<Pdf<
     let mut input = Tokens { data, pos: 0 };
     let mut pdf = Pdf {
         objects: Vec::new(),
+        count: 0,
         lengths: HashMap::new(),
         contents: HashSet::new(),
     };
@@ -197,6 +202,7 @@ fn parse<'a>(data: &'a [u8], sink: &mut dyn ChildSink) -> io::Result<Option<Pdf<
             match tok {
                 b"endobj" => break,
                 b"stream" => {
+                    obj.directory = object_stream::Directory::read(&data[obj.start..input.pos]);
                     let Some(encoded) = read_stream(&mut input) else {
                         return Ok(None);
                     };
@@ -244,9 +250,8 @@ fn parse<'a>(data: &'a [u8], sink: &mut dyn ChildSink) -> io::Result<Option<Pdf<
                 }
                 b"/Image" => obj.image = true,
                 b"/EmbeddedFile" => obj.embedded = true,
-                b"/ObjStm" | b"/JS" | b"/JavaScript" | b"/OpenAction" | b"/Launch" => {
-                    obj.unsupported = true
-                }
+                b"/ObjStm" => obj.object_stream = true,
+                b"/JS" | b"/JavaScript" | b"/OpenAction" | b"/Launch" => obj.unsupported = true,
                 // The pinned Flate, ASCII and run-length decoders ignore filter parameters.
                 b"/DecodeParms" | b"/DP" => {
                     if !input.skip_value() {
@@ -263,17 +268,40 @@ fn parse<'a>(data: &'a [u8], sink: &mut dyn ChildSink) -> io::Result<Option<Pdf<
         }
         last = [None, None];
     }
+    pdf.count = count;
     Ok(Some(pdf))
 }
 
+pub(super) fn header_type(data: &[u8]) -> bool {
+    data[..data.len().min(1024)]
+        .windows(7)
+        .any(|w| (w.starts_with(b"%PDF-") || w.starts_with(b"%pdf-")) && w[6] == b'.')
+}
+
 pub(super) fn extract(data: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handling> {
-    if !data.starts_with(b"%PDF-") {
-        return Ok(Handling::Unrecognized);
-    }
-    let Some(pdf) = parse(data, sink)? else {
+    let Some(start) = data[..data.len().min(1032)]
+        .windows(5)
+        .position(|w| w == b"%PDF-")
+    else {
+        return Ok(Handling::Complete);
+    };
+    let data = &data[start..];
+    let Some(mut pdf) = parse(data, sink)? else {
         return Ok(Handling::Incomplete);
     };
     sink.check()?;
+    let mut packed = pdf
+        .objects
+        .iter()
+        .any(|obj| obj.directory.is_some())
+        .then(|| {
+            object_stream::Packed::new(
+                sink.temporary_directory(),
+                sink.remaining(),
+                pdf.count,
+                pdf.objects.iter().map(|obj| obj.id),
+            )
+        });
     'objects: for obj in pdf.objects {
         sink.check()?;
         if obj.unsupported {
@@ -310,12 +338,19 @@ pub(super) fn extract(data: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handl
         };
         let bytes = &bytes[..end];
         let mut decoded: Option<Snapshot> = None;
+        let mut directory = obj.directory;
         for filter in obj.filters {
             if filter == Filter::Jpeg {
                 break;
             }
+            let first_stage = decoded.is_none();
+            let limit = if obj.object_stream && filter == Filter::Flate {
+                // Stock inflates the first 256 KiB before checking its next allocation.
+                (sink.remaining() / (256 << 10)).max(1) * (256 << 10)
+            } else {
+                sink.remaining()
+            };
             let mut next = |data: &[u8]| -> io::Result<Option<Snapshot>> {
-                let limit = sink.remaining();
                 let dir = sink.temporary_directory().to_owned();
                 let mut source = filter.reader(data)?;
                 Snapshot::read_bounded(&mut *source, &dir, limit, || sink.check())
@@ -328,6 +363,10 @@ pub(super) fn extract(data: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handl
                 Ok(Some(output)) => decoded = Some(output),
                 Ok(None) => {
                     sink.skip_declared_size(sink.remaining().saturating_add(1));
+                    if obj.object_stream && filter == Filter::Flate && first_stage {
+                        directory = None;
+                        break;
+                    }
                     continue 'objects;
                 }
                 Err(e)
@@ -344,17 +383,17 @@ pub(super) fn extract(data: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handl
             }
         }
         let mut visit = |data: &[u8]| -> io::Result<bool> {
+            if let (Some(directory), Some(packed)) = (directory, packed.as_mut()) {
+                packed.inspect(directory, data, &mut pdf.lengths, &mut pdf.contents, sink)?;
+                if sink.skip_declared_size(data.len() as u64) {
+                    return Ok(false);
+                }
+            }
             if sink.child_bytes(data, None)? {
                 return Ok(true);
             }
             if content {
-                let mut text = ContentsText {
-                    input: data,
-                    at_line_start: true,
-                    array: false,
-                    literal: false,
-                    space: false,
-                };
+                let mut text = ContentsText::new(data);
                 if sink.child(&mut text, None, None)? {
                     return Ok(true);
                 }
@@ -369,7 +408,7 @@ pub(super) fn extract(data: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handl
             return Ok(Handling::Stopped);
         }
     }
-    Ok(Handling::Complete)
+    packed.map_or(Ok(Handling::Complete), |packed| packed.finish(sink))
 }
 
 // The pinned contents pass reads parenthesized strings from text arrays starting a line.
@@ -379,6 +418,17 @@ struct ContentsText<'a> {
     array: bool,
     literal: bool,
     space: bool,
+}
+impl<'a> ContentsText<'a> {
+    fn new(input: &'a [u8]) -> Self {
+        Self {
+            input,
+            at_line_start: true,
+            array: false,
+            literal: false,
+            space: false,
+        }
+    }
 }
 impl Read for ContentsText<'_> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {

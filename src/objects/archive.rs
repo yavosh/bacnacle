@@ -16,7 +16,7 @@ mod lha;
 mod sevenzip;
 mod sis;
 mod szdd;
-mod workspace;
+pub(super) mod workspace;
 mod xar;
 mod zip;
 pub(super) use zip::directory as zip_directory;

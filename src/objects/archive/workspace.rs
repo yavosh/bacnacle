@@ -107,12 +107,15 @@ impl Pool {
     }
 }
 
-pub(super) struct Lease {
+pub(in crate::objects) struct Lease {
     _decoder: Reservation,
     _model: Option<Reservation>,
 }
 
-pub(super) fn acquire(bytes: u64, check: impl FnMut() -> io::Result<()>) -> io::Result<Lease> {
+pub(in crate::objects) fn acquire(
+    bytes: u64,
+    check: impl FnMut() -> io::Result<()>,
+) -> io::Result<Lease> {
     acquire_with_ppmd(bytes, 0, check)
 }
 

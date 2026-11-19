@@ -201,6 +201,14 @@ impl ObjectContext {
         self.target == Target::Pe && self.exe.is_some()
     }
 
+    pub(crate) fn has_executable_layout(&self) -> bool {
+        self.exe.is_some()
+    }
+
+    pub(crate) fn pe_overlay(&self) -> Option<usize> {
+        self.exe.as_ref()?.pe_overlay
+    }
+
     pub fn accepts(&self, target: Target) -> bool {
         target == Target::Generic || target == self.target
     }
