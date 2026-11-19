@@ -12,7 +12,7 @@ The raw engine inventory lists individual submodules, including disabled entries
 | --- | --- | --- |
 | Archives and compressed streams | ZIP, gzip, bzip2, XZ, TAR, CPIO, 7z, RAR, ARJ, CAB, SZDD, CHM, BinHex, EGG, LHA, ALZ and SIS | Rust fixtures cover all listed families, including stored and compressed legacy SIS members. The RAR comparison checks the reference installation without UnRAR. [Archive comparisons](../tests/object_archives.rs) |
 | Disk images and partitions | ISO 9660, UDF, DMG, XAR, HFS+, MBR, GPT and APM | Tests cover optical images, XAR, DMG, three partition maps, and files inside HFS+ and HFSX. [ISO comparisons](../tests/object_iso.rs) · [DMG comparisons](../tests/object_dmg.rs) · [Partition comparisons](../tests/object_partition.rs) |
-| Installers and embedded files | NSIS, AutoIt, InstallShield and embedded file recognition | Tests exercise NSIS, InstallShield and embedded PE resources. AutoIt still needs a separate comparison. [Installer comparisons](../tests/object_installers.rs) · [Embedded comparisons](../tests/object_embedded.rs) |
+| Installers and embedded files | NSIS, AutoIt, InstallShield and embedded file recognition | Tests exercise NSIS, AutoIt EA06, InstallShield, and embedded PE resources. [AutoIt comparisons](../tests/object_autoit.rs) · [Installer comparisons](../tests/object_installers.rs) · [Embedded comparisons](../tests/object_embedded.rs) |
 | Documents | OLE2, OOXML, Word/Excel XML, HWP, OneNote, PDF, RTF and SWF | Tests cover ordinary PDF, Office, RTF and Flash documents, including competing child detections and scan limits. [PDF comparisons](../tests/object_pdf.rs) · [OLE comparisons](../tests/object_ole.rs) |
 | Text and mail | HTML, UTF-16 HTML, script normalization, JavaScript, script encoding, mbox/MIME, TNEF and uuencoding | Rust fixtures exercise ordinary scripts, HTML, MIME, TNEF, uuencoded files, and data URLs. [Text comparisons](../tests/object_text.rs) |
 | Executables and media | PE, ELF, Mach-O, universal Mach-O, Java, RIFF, GIF, PNG, JPEG and TIFF | Tests cover Mach-O slices, ELF sections, Java classes, WAVE audio, and five image formats. Image heuristics and executable unpacking remain open. [Executable comparisons](../tests/object_macho.rs) · [Media comparisons](../tests/object_images.rs) |
@@ -33,6 +33,36 @@ Disabling HTML scanning makes the worksheet win. Disabling archive scanning make
 HWPX assets under `BinData/` can trigger a central-directory lookup for `Contents/content.hpf`.
 Stock accepts a prefix in the first three local headers and requires the complete filename in the directory.
 Both daemons preserve the resulting HWPX or ZIP parent type. [HWPX comparisons](../tests/object_parents.rs)
+
+### Compiled AutoIt archives
+
+The EA06 inventory guide emits a 168-byte script, 50-byte notice, and 151,552-byte ledger in that order.
+Stock scans these objects before the raw A3X hash. The outer hash wins first when the same container appears inside a PE.
+Each extracted object has an unnamed layer under `CL_TYPE_AUTOIT`.
+`ScanArchive no` disables extraction. `ScanPE no` preserves extraction from an embedded container.
+
+The standalone script requires 311 scan bytes for its token stream. Its rendered bytes consume 168 bytes of the cumulative budget.
+A 50-byte remainder can exclude the script and still admit the notice.
+The reference checks the whole embedded region against the remaining budget before visiting its resources.
+Barnacle validates resources blocked by the recursion limit without retaining their decoded bytes.
+Legacy EA05 records and unsupported script tokens return incomplete coverage.
+The exact child bytes, competing signatures, raw hash, parent context, and scan limits have paired Rust checks.
+[Authored fixture](../tests/fixtures/autoit/README.md) · [Rust comparisons](../tests/object_autoit.rs)
+
+Four clients scanned the same guide with one MD5 rule and caching disabled. The median covers three fresh containers per daemon and rule.
+Each container used one pinned ARM64 CPU and 2 GiB of memory with swap disabled.
+Each batch sent one initial request and 128 warm requests per client. All 6,156 replies matched the expected signature.
+Cgroup peak memory includes the driver and charged file-backed pages. Stock was Debian clamd `1.4.3+dfsg-1`.
+
+| Signature | Barnacle scans/s | Stock scans/s | Barnacle p95 ms | Stock p95 ms | Barnacle peak MiB | Stock peak MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Notice | 20,459 | 9,187 | 0.32 | 0.88 | 3.91 | 5.06 |
+| Ledger | 1,758 | 1,562 | 4.01 | 5.61 | 4.13 | 6.28 |
+
+Use `guide.a3x` and select one rule per run. The notice rule is `af677c6a14892c998d7d7bd7cb1cba5b:50:Guide.Notice`.
+The ledger rule is `b9c7aad25d0ecb2818a7adc4452c66ab:151552:Guide.Ledger`.
+The Barnacle release executable had SHA-256 `9e1189b571503ce2c74b40bd1800836edf3570cb1b95be909b8c2df59159e5ea`.
+[Raw AutoIt measurements](benchmarks/object-autoit.csv)
 
 ### ZIP Deflate64 members
 

@@ -9,6 +9,7 @@ use std::io;
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) enum Parser {
     Archive,
+    AutoIt,
     Rtf,
     Mail,
     Tnef,
@@ -94,6 +95,9 @@ impl FileType {
         }
         if onenote::recognizes(bytes) {
             return Ok(Self::generic(bytes, "CL_TYPE_ONENOTE", Parser::OneNote));
+        }
+        if super::autoit::recognized(bytes) {
+            return Ok(Self::generic(bytes, "CL_TYPE_AUTOIT", Parser::AutoIt));
         }
         if let Some(mut name) = archive::file_type(bytes) {
             if name == "CL_TYPE_ZIP" {
@@ -257,6 +261,7 @@ impl Parser {
         sink: &mut dyn ChildSink,
     ) -> io::Result<Handling> {
         match self {
+            Self::AutoIt if options.scan_archive => super::autoit::extract(bytes, sink),
             Self::Archive if options.scan_archive => archive::extract(bytes, sink),
             Self::UniversalMachO => super::macho::extract(bytes, sink),
             Self::Elf { has_layout: false } if options.scan_elf => Ok(Handling::Incomplete),
@@ -286,6 +291,7 @@ impl Parser {
             Self::Uuencoded => text::before_raw(self, bytes, sink),
             // These formats use the ordinary raw matcher after any enabled parser.
             Self::Archive
+            | Self::AutoIt
             | Self::ThinMachO
             | Self::Pe { .. }
             | Self::Elf { .. }

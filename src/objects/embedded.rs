@@ -1,4 +1,4 @@
-use super::{ChildSink, Handling, Options, archive, installer, iso, xdp};
+use super::{ChildSink, Handling, Options, archive, autoit, installer, iso, xdp};
 use crate::body::ObjectContext;
 use aho_corasick::AhoCorasick;
 use std::io;
@@ -11,6 +11,7 @@ const MAGICS: &[(&[u8], &str)] = &[
     (b"\x60\xea", "CL_TYPE_ARJ"),
     (b"Rar!\x1a\x07\0", "CL_TYPE_RAR"),
     (iso::PVD, "CL_TYPE_ISO9660"),
+    (autoit::MAGIC, "CL_TYPE_AUTOIT"),
     (xdp::MAGIC, "CL_TYPE_XDP"),
     (installer::NSIS_MAGIC, "CL_TYPE_NULSFT"),
     (installer::ISHIELD_MAGIC, "CL_TYPE_ISHIELD_MSI"),
@@ -22,6 +23,7 @@ static FINDER: LazyLock<AhoCorasick> = LazyLock::new(|| {
 
 pub(super) fn contents(bytes: &[u8], kind: &str, sink: &mut dyn ChildSink) -> io::Result<Handling> {
     match kind {
+        "CL_TYPE_AUTOIT" => autoit::extract(bytes, sink),
         "CL_TYPE_ZIP" => archive::zip_single(bytes, sink),
         "CL_TYPE_NULSFT" | "CL_TYPE_ISHIELD_MSI" => installer::extract(kind, bytes, sink),
         "CL_TYPE_MSEXE" => Ok(if sink.child_bytes(bytes, None)? {
@@ -49,7 +51,11 @@ pub(super) fn possible_text_map(bytes: &[u8], sink: &mut dyn ChildSink) -> io::R
             }
             !matches!(
                 kind,
-                "CL_TYPE_MSEXE" | "CL_TYPE_ISHIELD_MSI" | "CL_TYPE_NULSFT" | "CL_TYPE_RAR"
+                "CL_TYPE_MSEXE"
+                    | "CL_TYPE_ISHIELD_MSI"
+                    | "CL_TYPE_NULSFT"
+                    | "CL_TYPE_RAR"
+                    | "CL_TYPE_AUTOIT"
             )
         }) {
             return Ok(true);
@@ -119,6 +125,9 @@ pub(super) fn extract(
                 continue;
             }
             let mut suffix = &bytes[at..];
+            if kind == "CL_TYPE_AUTOIT" && !autoit::recognized(suffix) {
+                continue;
+            }
             if kind == "CL_TYPE_ISHIELD_MSI" && !installer::is_ishield(suffix) {
                 continue;
             }
@@ -146,6 +155,7 @@ pub(super) fn extract(
                 continue;
             }
             match kind {
+                "CL_TYPE_AUTOIT" if carrier != "CL_TYPE_MSEXE" => continue,
                 "CL_TYPE_NULSFT" if carrier == "CL_TYPE_MSEXE" && at > 4 => {
                     suffix = &bytes[at - 4..]
                 }

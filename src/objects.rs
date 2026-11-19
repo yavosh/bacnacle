@@ -4,6 +4,7 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 
 mod archive;
+mod autoit;
 mod classify;
 mod dmg;
 mod embedded;
@@ -75,6 +76,7 @@ trait ChildSink {
     fn at_root(&self) -> bool;
     fn child_limit(&self) -> Option<Limit>;
     fn can_enter_child(&mut self) -> bool;
+    fn autoit_child_stop(&mut self, size: u64) -> bool;
     fn remaining(&self) -> u64;
     fn max_file_size(&self) -> u64;
     fn max_files(&self) -> usize;
@@ -495,6 +497,20 @@ impl ChildSink for Traversal<'_> {
         }
         true
     }
+    fn autoit_child_stop(&mut self, size: u64) -> bool {
+        let Some(limit) = self.size_limit(size).or_else(|| self.child_limit()) else {
+            return false;
+        };
+        let limit = self.first_limit.get_or_insert(limit);
+        self.stopped = Some(if self.options.alert_exceeds_max {
+            Verdict::Found(limit.signature())
+        } else {
+            // The pinned daemon reports a finding without a signature name here.
+            Verdict::Incomplete
+        });
+        true
+    }
+
     fn child_limit(&self) -> Option<Limit> {
         if self.options.max_files != 0 && self.files_scanned >= self.options.max_files {
             Some(Limit::MaxFiles)
