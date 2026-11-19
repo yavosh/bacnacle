@@ -248,11 +248,18 @@ Document names come from the winning signature. [End-to-end fixtures](../tests/o
 | Nested inputs | ZIP containing a PDF and a PDF with competing raw and child rules. |
 | Policies and truncated input | Parser disabled, recursion and expanded-size alerts, a missing final trailer, and a truncated stream. |
 | Packed indirect objects | Stored and Flate object streams, packed page dictionaries, content arrays, indirect lengths, and physical stream order. [Object-stream comparisons](../tests/object_pdf_streams.rs) |
-| Additional PDF stages | Encryption, JavaScript actions and other stream filters require further comparisons. |
+| Standard encryption | Classic xref tables and qpdf AES-128 (R4) or AES-256 (R5/R6). An empty user password must authenticate and allow extraction. |
+| Additional PDF stages | Other encryption layouts, JavaScript actions and other stream filters require further comparisons. |
 
 For physical objects, both daemons scan the referenced page dictionary for an explicit catalog opening destination.
 An inline local GoTo exposes the catalog. An indirect local action exposes the referenced object at its physical position.
 The child contains the bytes between `obj` and `endobj`, including surrounding line endings.
+Both daemons detect the Flate-compressed plaintext attachment after the outer PDF hash. They scan competing attachments in physical order.
+Both scan stored attachments as ciphertext. A Flate filter after the first closing dictionary also preserves the ciphertext.
+Direct embedded-file MIME subtypes can encode the slash as `#2f` or `#2F`.
+Barnacle bounds security metadata to 16 KiB. It decrypts and inflates in 8 KiB blocks. Excluded children need no scratch file.
+Encrypted packed objects, unsupported filters, and documents requiring credentials yield incomplete coverage. [Security comparisons](../tests/object_pdf_security.rs)
+
 Barnacle indexes only the requested object IDs. The PDF parser admits at most 65,536 physical objects.
 The tests cover all eight explicit destination modes, local named destinations, sparse IDs, backward references, and ZIP attachments.
 Chained actions and unresolved or ambiguous destinations remain incomplete.

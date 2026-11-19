@@ -6,6 +6,7 @@ use std::io::{self, Write};
 mod destination;
 mod filters;
 mod object_stream;
+mod security;
 use filters::{Filter, Output};
 
 type Id = (usize, usize);
@@ -238,6 +239,7 @@ struct Pdf<'a> {
     count: usize,
     lengths: HashMap<Id, usize>,
     contents: HashSet<Id>,
+    security: Option<security::Security>,
 }
 
 fn stream_start(input: &mut Tokens<'_>) -> Option<usize> {
@@ -251,12 +253,28 @@ fn stream_start(input: &mut Tokens<'_>) -> Option<usize> {
     }
 }
 
-fn read_stream<'a>(input: &mut Tokens<'a>) -> Option<&'a [u8]> {
-    let start = stream_start(input)?;
+fn read_stream<'a>(
+    input: &mut Tokens<'a>,
+    check: &mut impl FnMut() -> io::Result<()>,
+) -> io::Result<Option<&'a [u8]>> {
+    let Some(start) = stream_start(input) else {
+        return Ok(None);
+    };
     let rest = &input.data[start..];
-    let size = rest.windows(9).position(|word| word == b"endstream")?;
-    input.pos = start + size + 9;
-    Some(&rest[..size])
+    let marker = b"endstream";
+    let finder = memchr::memmem::Finder::new(marker);
+    for at in (0..rest.len()).step_by(TOKEN_BLOCK) {
+        check()?;
+        let end = rest
+            .len()
+            .min(at.saturating_add(TOKEN_BLOCK + marker.len() - 1));
+        if let Some(offset) = finder.find(&rest[at..end]) {
+            let position = at + offset;
+            input.pos = start + position + marker.len();
+            return Ok(Some(&rest[..position]));
+        }
+    }
+    Ok(None)
 }
 
 fn trim_eol(bytes: &[u8]) -> &[u8] {
@@ -275,13 +293,23 @@ fn parse<'a>(data: &'a [u8], sink: &mut dyn ChildSink) -> io::Result<Option<Pdf<
         count: 0,
         lengths: HashMap::new(),
         contents: HashSet::new(),
+        security: None,
     };
+    let mut trailer = None;
+    let mut standard = None;
+    let mut encrypted = false;
+    let mut ambiguous = false;
     let mut requests = Vec::new();
     let mut count = 0usize;
     let mut last = [None, None];
     while let Some(tok) = input.next_checked(&mut token_budget, sink)? {
-        if tok == b"/Encrypt" {
-            return Ok(None);
+        if tok == b"trailer" {
+            ambiguous |= trailer.replace(input.pos).is_some();
+        } else if tok == b"/Encrypt" {
+            if trailer.is_none() || encrypted {
+                return Ok(None);
+            }
+            encrypted = true;
         }
         if tok != b"obj" {
             last = [last[1], number(tok)];
@@ -301,6 +329,8 @@ fn parse<'a>(data: &'a [u8], sink: &mut dyn ChildSink) -> io::Result<Option<Pdf<
             ..Object::default()
         };
         let mut has_opening = false;
+        let mut standard_filter = false;
+        let mut escaped_name = None;
         let mut copy = input.clone();
         if let Some(n) = copy.next_checked(&mut token_budget, sink)?.and_then(number)
             && copy.next_checked(&mut token_budget, sink)? == Some(b"endobj".as_slice())
@@ -313,6 +343,14 @@ fn parse<'a>(data: &'a [u8], sink: &mut dyn ChildSink) -> io::Result<Option<Pdf<
             };
             match tok {
                 b"endobj" => {
+                    if let Some(name) = escaped_name {
+                        obj.unsupported |= obj.encoded.is_none()
+                            || !security::embedded_mime(&data[obj.start..input.pos], name);
+                    }
+                    if standard_filter {
+                        let body = &data[obj.start..input.pos - 6];
+                        ambiguous |= standard.replace((obj.id, body)).is_some();
+                    }
                     if has_opening {
                         let body = &data[obj.start..input.pos - 6];
                         match destination::catalog(body, &mut || sink.check())? {
@@ -330,7 +368,7 @@ fn parse<'a>(data: &'a [u8], sink: &mut dyn ChildSink) -> io::Result<Option<Pdf<
                 }
                 b"stream" => {
                     obj.directory = object_stream::Directory::read(&data[obj.start..input.pos]);
-                    let Some(encoded) = read_stream(&mut input) else {
+                    let Some(encoded) = read_stream(&mut input, &mut || sink.check())? else {
                         return Ok(None);
                     };
                     obj.encoded = Some(encoded);
@@ -358,6 +396,7 @@ fn parse<'a>(data: &'a [u8], sink: &mut dyn ChildSink) -> io::Result<Option<Pdf<
                     let Some(first) = input.next() else {
                         return Ok(None);
                     };
+                    standard_filter |= first == b"/Standard";
                     if first == b"[" {
                         loop {
                             let Some(name) = input.next() else {
@@ -390,7 +429,9 @@ fn parse<'a>(data: &'a [u8], sink: &mut dyn ChildSink) -> io::Result<Option<Pdf<
                     }
                 }
                 b"/Encrypt" => return Ok(None),
-                n if n.first() == Some(&b'/') && n.contains(&b'#') => obj.unsupported = true,
+                n if n.first() == Some(&b'/') && n.contains(&b'#') => {
+                    obj.unsupported |= escaped_name.replace(n).is_some();
+                }
                 _ => (),
             }
         }
@@ -398,6 +439,25 @@ fn parse<'a>(data: &'a [u8], sink: &mut dyn ChildSink) -> io::Result<Option<Pdf<
             pdf.objects.push(obj);
         }
         last = [None, None];
+    }
+    if encrypted {
+        let (Some(at), Some((id, dict))) = (trailer, standard) else {
+            return Ok(None);
+        };
+        if ambiguous
+            || dict.len() > security::MAX_METADATA
+            || !requests.is_empty()
+            || pdf
+                .objects
+                .iter()
+                .any(|o| o.object_stream || o.raw_destination)
+        {
+            return Ok(None);
+        }
+        let Some(handler) = security::Security::open(id, dict, &data[at..]) else {
+            return Ok(None);
+        };
+        pdf.security = Some(handler);
     }
     if !destination::resolve(data, &mut pdf.objects, &requests, sink)? {
         return Ok(None);
@@ -442,7 +502,7 @@ pub(super) fn extract(data: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handl
                 .map(|obj| obj.id),
         )
     });
-    'objects: for obj in pdf.objects {
+    'objects: for mut obj in pdf.objects {
         sink.check()?;
         if obj.unsupported {
             return Ok(Handling::Incomplete);
@@ -488,7 +548,28 @@ pub(super) fn extract(data: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handl
         } else {
             length
         };
-        let bytes = &bytes[..end];
+        let mut encrypted_flate = None;
+        let input_bytes = if let Some(handler) = &pdf.security {
+            let Some((cipher, filter_visible)) =
+                security::ciphertext(&data[obj.start..], bytes, &pdf.lengths)
+            else {
+                return Ok(Handling::Incomplete);
+            };
+            // Stock stops reading filter names at the first closing dictionary.
+            if !filter_visible && obj.filters == [Filter::Flate] {
+                obj.filters.clear();
+            }
+            match obj.filters.as_slice() {
+                [] => ObjectBytes::Borrowed(cipher),
+                [Filter::Flate] => {
+                    encrypted_flate = Some(handler);
+                    ObjectBytes::Borrowed(cipher)
+                }
+                _ => return Ok(Handling::Incomplete),
+            }
+        } else {
+            ObjectBytes::Borrowed(&bytes[..end])
+        };
         let mut decoded: Option<Snapshot> = None;
         let mut directory = obj.directory;
         let mut filters = obj
@@ -508,7 +589,10 @@ pub(super) fn extract(data: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handl
             };
             let mut input_verdict = None;
             let mut next = |data: &[u8]| {
-                let result = filter.decode(data, limit, retain, sink)?;
+                let result = match encrypted_flate.take() {
+                    Some(handler) => handler.inflate(obj.id, data, retain, sink)?,
+                    None => filter.decode(data, limit, retain, sink)?,
+                };
                 if let Output::UseInput = result {
                     // The current stage still owns this borrowed input, including earlier filters' output.
                     input_verdict = Some(visit_stream(data, content, sink)?);
@@ -517,7 +601,7 @@ pub(super) fn extract(data: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handl
             };
             let result = match decoded.take() {
                 Some(last) => last.with_bytes(next),
-                None => next(bytes),
+                None => next(input_bytes.as_ref()),
             };
             match result? {
                 Output::Counted(size) => {
@@ -544,7 +628,7 @@ pub(super) fn extract(data: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handl
         }
         let source = match decoded {
             Some(s) => s.into_bytes()?,
-            None => ObjectBytes::Borrowed(bytes),
+            None => input_bytes,
         };
         let data = source.as_ref();
         let (retain, skipped) =
@@ -671,6 +755,42 @@ fn page_text(
 #[cfg(test)]
 mod token_tests {
     use super::*;
+
+    #[test]
+    fn stream_terminator_across_chunks_and_cancellation() -> io::Result<()> {
+        for size in TOKEN_BLOCK - 9..TOKEN_BLOCK + 2 {
+            let mut stream = vec![b'x'; size + 1];
+            stream[0] = b'\n';
+            stream.extend_from_slice(b"endstream endobj");
+            let mut tokens = Tokens {
+                data: &stream,
+                pos: 0,
+            };
+            assert_eq!(
+                read_stream(&mut tokens, &mut || Ok(()))?,
+                Some(&stream[1..size + 1])
+            );
+            assert_eq!(tokens.next(), Some(b"endobj".as_slice()));
+        }
+        let mut stream = vec![0; 16 << 20];
+        stream[0] = b'\n';
+        let mut tokens = Tokens {
+            data: &stream,
+            pos: 0,
+        };
+        let mut checks = 0;
+        let error = read_stream(&mut tokens, &mut || {
+            checks += 1;
+            if checks == 3 {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "cancel stream"));
+            }
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(checks, 3);
+        Ok(())
+    }
 
     #[test]
     fn literal_escapes_across_chunks() -> io::Result<()> {
