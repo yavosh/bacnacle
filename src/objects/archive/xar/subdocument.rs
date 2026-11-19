@@ -355,10 +355,15 @@ fn serialize(
             {
                 out.write_all(text.as_bytes())?
             }
-            Event::GeneralRef(entity) if matches!(entity.as_ref(), "amp" | "lt" | "gt") => {
-                out.write_all(b"&")?;
-                out.write_all(entity.as_ref().as_bytes())?;
-                out.write_all(b";")?;
+            Event::GeneralRef(name) if name.len() <= 30 => {
+                match crate::objects::xml::entity(&name) {
+                    Some('&') => out.write_all(b"&amp;")?,
+                    Some('<') => out.write_all(b"&lt;")?,
+                    Some('>') => out.write_all(b"&gt;")?,
+                    Some('\r') => out.write_all(b"&#13;")?,
+                    Some(ch) => out.write_all(ch.encode_utf8(&mut [0; 4]).as_bytes())?,
+                    None => return Ok(false),
+                }
             }
             Event::CData(text) => {
                 if cdata.is_none() {

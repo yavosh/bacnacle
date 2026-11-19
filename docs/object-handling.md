@@ -370,6 +370,9 @@ Stock preserves XML comments, processing instructions, and CDATA in this subdocu
 Comments and processing instructions use LF line endings. CDATA keeps its original line endings.
 Attribute serialization escapes ampersands, quotes, and angle brackets. Literal attribute whitespace becomes spaces, while referenced whitespace keeps decimal character references.
 With an explicit UTF-8 declaration, accented letters stay UTF-8. Without a declared encoding, attribute values use uppercase hexadecimal character references.
+Element text, names, CDATA, comments, and processing instructions retain UTF-8 without a declared encoding.
+A US-ASCII declaration accepts numeric character references. A literal non-ASCII byte interrupts catalog decoding.
+Complete earlier subdocuments and heap entries remain eligible before the outer archive hash.
 The size check precedes the file-count check. Without inherited bindings, six times the remaining source length bounds the output.
 If that bound fits, Barnacle serializes once. Otherwise it counts the output before spilling an admitted subdocument larger than 64 KiB.
 It supports up to 256 live namespace bindings and 256 attributes per element. Names beyond 1,024 bytes, prefixes beyond 256 bytes,

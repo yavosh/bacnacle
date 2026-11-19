@@ -85,6 +85,38 @@ fn integer(text: &str) -> Option<usize> {
     text.get(..n)?.parse::<isize>().ok()?.try_into().ok()
 }
 
+// Stock's ASCII decoder exposes all bytes before its first conversion error.
+fn ascii_prefix<'a>(bytes: &'a [u8], sink: &mut dyn ChildSink) -> io::Result<&'a [u8]> {
+    let mut pos = 0;
+    for part in bytes.chunks(64 * 1024) {
+        sink.check()?;
+        if !part.is_ascii() {
+            let first = part.iter().position(|b| !b.is_ascii()).unwrap();
+            return Ok(&bytes[..pos + first]);
+        }
+        pos += part.len();
+    }
+    Ok(bytes)
+}
+
+// An interrupted subdocument produces no partial child. Earlier complete children survive.
+fn complete_subdocument(mut reader: Reader<&[u8]>, sink: &mut dyn ChildSink) -> io::Result<bool> {
+    let mut depth = 0;
+    loop {
+        sink.check()?;
+        match reader.read_event() {
+            Ok(Event::Start(_)) if depth < MAX_DEPTH => depth += 1,
+            Ok(Event::End(_)) if depth == 0 => return Ok(true),
+            Ok(Event::End(_)) => depth -= 1,
+            Ok(Event::Eof) => return Ok(false),
+            Err(quick_xml::Error::Syntax(_)) => return Ok(false),
+            Err(_) => return Ok(true), // The normal parser reports earlier malformed XML.
+            Ok(Event::Start(_)) => return Ok(true), // Let the normal depth check report this.
+            _ => {}
+        }
+    }
+}
+
 fn parse(toc: &[u8], heap: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handling> {
     if sink.child_bytes(toc, None)? {
         return Ok(Handling::Stopped);
@@ -94,12 +126,16 @@ fn parse(toc: &[u8], heap: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handli
     let mut in_toc = false;
     let mut scope = subdocument::Namespaces::default();
     let mut skip_next = false;
+    let mut interrupted = false;
     let mut active = None::<(usize, Extent)>;
     let mut number = None;
     loop {
         sink.check()?;
-        let Ok(event) = reader.read_event() else {
-            return Ok(Handling::Incomplete);
+        let offset = reader.buffer_position();
+        let event = match reader.read_event() {
+            Ok(event) => event,
+            Err(quick_xml::Error::Syntax(_)) if interrupted => return Ok(Handling::Complete),
+            Err(_) => return Ok(Handling::Incomplete),
         };
         let skip = std::mem::take(&mut skip_next);
         match event {
@@ -121,6 +157,9 @@ fn parse(toc: &[u8], heap: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handli
                 if !in_toc {
                     if name.as_ref() == "subdoc" {
                         if !empty {
+                            if interrupted && !complete_subdocument(reader.clone(), sink)? {
+                                return Ok(Handling::Complete);
+                            }
                             let outcome = subdocument::scan(&mut reader, &mut scope, depth, sink)?;
                             if outcome != Handling::Complete {
                                 return Ok(outcome);
@@ -188,15 +227,27 @@ fn parse(toc: &[u8], heap: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handli
                 depth = d;
             }
             Event::Decl(decl) => {
-                if let Some(label) = decl.encoding()
-                    && !label.is_ok_and(|label| scope.encoding.set(&label))
-                {
+                if offset != 0 {
                     return Ok(Handling::Incomplete);
+                }
+                if let Some(label) = decl.encoding() {
+                    let Ok(label) = label else {
+                        return Ok(Handling::Incomplete);
+                    };
+                    if !scope.encoding.set(&label) {
+                        return Ok(Handling::Incomplete);
+                    }
+                    if label.eq_ignore_ascii_case("US-ASCII") {
+                        let bytes = *reader.get_ref();
+                        let prefix = ascii_prefix(bytes, sink)?;
+                        interrupted = prefix.len() < bytes.len();
+                        *reader.get_mut() = prefix;
+                    }
                 }
             }
             Event::DocType(_) => return Ok(Handling::Incomplete),
             Event::Eof => {
-                return Ok(if depth == 0 {
+                return Ok(if depth == 0 || interrupted {
                     Handling::Complete
                 } else {
                     Handling::Incomplete

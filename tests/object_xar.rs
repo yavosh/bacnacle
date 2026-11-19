@@ -375,6 +375,63 @@ fn namespace_cases(stock: bool) -> io::Result<()> {
     let receipt = b"Ordinary inventory receipt for 42 paper folders.\n";
     let rendered = b"\n  <inv:catalog xmlns:u=\"urn:warehouse:units\" xmlns:inv=\"urn:warehouse:inventory\">\n   <inv:part id=\"P-042\" u:unit=\"box\">Paper folders</inv:part>\n  </inv:catalog>\n ";
     let mut cases = Vec::new();
+    let mut interrupted = Vec::new();
+    let member = extent(
+        "data",
+        0,
+        receipt.len(),
+        receipt.len(),
+        "application/octet-stream",
+    );
+    let escaped = "<Item note='A &amp; B'>";
+    let canonical = "<Item note=\"A &amp; B\">";
+    for (source, output) in [
+        ("Café 📦", "Café 📦"),
+        ("<Café étiquette='a'/>", "<Café étiquette=\"a\"/>"),
+        (
+            "<m:Pièce xmlns:m='urn:café'/>",
+            "<m:Pièce xmlns:m=\"urn:café\"/>",
+        ),
+        ("<![CDATA[Café 📦]]>", "<![CDATA[Café 📦]]>"),
+        ("<!--Café 📦-->", "<!--Café 📦-->"),
+        ("<?réserve Café 📦?>", "<?réserve Café 📦?>"),
+        (
+            "Caf&#233; &#x1F4E6; &lt; &#62; &amp; &apos; &quot; &#9;&#10;&#13;",
+            "Café 📦 &lt; &gt; &amp; ' \" \t\n&#13;",
+        ),
+    ] {
+        let doc = format!("<subdoc>{escaped}{source}</Item></subdoc>");
+        let xml = toc(&doc, &member);
+        let rendered = format!("{canonical}{output}</Item>");
+        for declared in ["", " encoding=\"UTF-8\"", " encoding=\"US-ASCII\""] {
+            let catalog = xml.replace(" encoding=\"UTF-8\"", declared);
+            let archive = build(&catalog, receipt)?;
+            if declared.contains("US-ASCII") && !source.is_ascii() {
+                interrupted.push((archive, "Archive", "Archive"));
+            } else {
+                cases.push((archive, rendered.clone()));
+            }
+        }
+    }
+    let encoded_count = cases.len();
+    let office = format!("{escaped}Office</Item>");
+    let complete = format!("<subdoc>{office}</subdoc>");
+    let prefix = format!("{canonical}Office</Item>");
+    for (source, sub_winner, heap_winner) in [
+        (
+            format!("<subdoc>{office}<!--Café--></subdoc>"),
+            "Archive",
+            "Archive",
+        ),
+        (format!("{complete}\n<!--Café-->"), "Subdocument", "Archive"),
+        (complete.clone(), "Subdocument", "Receipt"),
+    ] {
+        let mut catalog = toc(&source, &member).replace("UTF-8", "US-ASCII");
+        if source == complete {
+            catalog = catalog.replace("</toc>", "</toc><!--Café-->");
+        }
+        interrupted.push((build(&catalog, receipt)?, sub_winner, heap_winner));
+    }
     for (root, sub, markup, expected) in [
         (
             " xmlns:inv='urn:inventory' xmlns:u='urn:unit'",
@@ -622,8 +679,13 @@ fn namespace_cases(stock: bool) -> io::Result<()> {
     let expanded = build(&expanded_xml, &[])?;
     let expanded_rule = rule("Expanded", expanded_rendering.as_bytes());
     let expanded_total = expanded.len() + expanded_xml.len() + expanded_rendering.len();
-    let archive_rule = rule("Archive", archive) + &rule("Archive", descriptions);
-    let subdoc = rule("Subdocument", rendered) + &rule("Subdocument", described.as_bytes());
+    let mut archive_rule = rule("Archive", archive) + &rule("Archive", descriptions);
+    for (bytes, ..) in &interrupted {
+        archive_rule += &rule("Archive", bytes);
+    }
+    let subdoc = rule("Subdocument", rendered)
+        + &rule("Subdocument", described.as_bytes())
+        + &rule("Subdocument", prefix.as_bytes());
     let mut all = subdoc.clone() + &receipt_rule + &archive_rule;
     for (_, artifact) in cases.iter().chain(&over_bounds) {
         all += &rule("Subdocument", artifact.as_bytes())
@@ -730,6 +792,25 @@ fn namespace_cases(stock: bool) -> io::Result<()> {
         assert_eq!(reply(archive)?, expected, "{label}");
         if matches!(label, "competing" | "heap" | "outer" | "disabled") {
             assert_eq!(reply(descriptions)?, expected, "Apple inventory: {label}");
+        }
+        if label == "heap" {
+            for (bytes, rendered) in &cases[..encoded_count] {
+                assert_eq!(reply(bytes)?, expected, "heap after {rendered}");
+            }
+        }
+        if matches!(label, "competing" | "heap" | "outer") {
+            for (i, (bytes, sub, heap)) in interrupted.iter().enumerate() {
+                let winner = match label {
+                    "competing" => sub,
+                    "heap" => heap,
+                    _ => &"Archive",
+                };
+                assert_eq!(
+                    reply(bytes)?,
+                    format!("stream: Xar.{winner}.UNOFFICIAL FOUND\0"),
+                    "interrupted ASCII: {label} {i}"
+                );
+            }
         }
         if label == "competing" {
             for (bytes, artifact) in &cases {

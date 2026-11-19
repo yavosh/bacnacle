@@ -54,6 +54,8 @@ impl Encoding {
         while pos < bytes.len() {
             if pos >= next_check {
                 sink.check()?;
+                out.write_all(&bytes[start..pos])?;
+                start = pos;
                 next_check = pos + CHECK_INTERVAL;
             }
             if plain_byte(bytes[pos]) {
