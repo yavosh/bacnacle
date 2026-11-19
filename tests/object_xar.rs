@@ -367,3 +367,458 @@ fn catalog_and_extent_receive_fresh_unnamed_contexts() -> io::Result<()> {
     assert_eq!(objects, [false, true]);
     Ok(())
 }
+
+fn namespace_cases(stock: bool) -> io::Result<()> {
+    let archive = include_bytes!("fixtures/xar/inventory.xar");
+    let receipt = b"Ordinary inventory receipt for 42 paper folders.\n";
+    let rendered = b"\n  <inv:catalog xmlns:u=\"urn:warehouse:units\" xmlns:inv=\"urn:warehouse:inventory\">\n   <inv:part id=\"P-042\" u:unit=\"box\">Paper folders</inv:part>\n  </inv:catalog>\n ";
+    let mut cases = Vec::new();
+    for (root, sub, markup, expected) in [
+        (
+            "",
+            "",
+            "<u:Part xmlns:u='urn:unit'/>",
+            "<u:Part xmlns:u=\"urn:unit\"/>",
+        ),
+        (
+            " xmlns:u='urn:unit'",
+            "",
+            "<Box><Count u:qty='2'/></Box>",
+            "<Box xmlns:u=\"urn:unit\"><Count u:qty=\"2\"/></Box>",
+        ),
+        (
+            "",
+            " xmlns:u='urn:one'",
+            "<Item u:qty='2'/> <u:Box/>",
+            "<Item xmlns:u=\"urn:one\" u:qty=\"2\"/> <u:Box xmlns:u=\"urn:one\"/>",
+        ),
+        (
+            " xmlns:u='urn:unused'",
+            "",
+            "<Item serial='12'/>",
+            "<Item serial=\"12\"/>",
+        ),
+        (
+            "",
+            "",
+            "<Item serial='12' xmlns:u='urn:u' u:qty='2' xmlns:c='urn:c' c:key='box'/>",
+            "<Item xmlns:u=\"urn:u\" xmlns:c=\"urn:c\" serial=\"12\" u:qty=\"2\" c:key=\"box\"/>",
+        ),
+        (
+            " xmlns:e='urn:e' xmlns:f='urn:f'",
+            "",
+            "<e:Item first='1' xmlns:u='urn:u' f:measure='2'><u:Note/></e:Item>",
+            "<e:Item xmlns:u=\"urn:u\" xmlns:e=\"urn:e\" xmlns:f=\"urn:f\" first=\"1\" f:measure=\"2\"><u:Note/></e:Item>",
+        ),
+        (
+            " xmlns:u='urn:one'",
+            "",
+            "<Item><u:Box xmlns:u='urn:two'/><u:Label/></Item>",
+            "<Item xmlns:u=\"urn:one\"><u:Box xmlns:u=\"urn:two\"/><u:Label/></Item>",
+        ),
+        (
+            " xmlns='urn:one'",
+            "",
+            "<Item><Box xmlns=''><Label/></Box></Item>",
+            "<Item xmlns=\"urn:one\"><Box xmlns=\"\"><Label/></Box></Item>",
+        ),
+        (
+            " xmlns='urn:one' xmlns:u='urn:two'",
+            "",
+            "<u:Item><Box/></u:Item>",
+            "<u:Item xmlns:u=\"urn:two\" xmlns=\"urn:one\"><Box/></u:Item>",
+        ),
+        (
+            "",
+            "",
+            "<Item xml:lang='en'>Paper</Item>",
+            "<Item xml:lang=\"en\">Paper</Item>",
+        ),
+        (
+            " xmlns:s='urn:stock'",
+            "",
+            "<s:Item><?stockroom  slots='12' ?><!-- Shelf A\r\nShelf B --><![CDATA[Blue & <Green>]]></s:Item>",
+            "<s:Item xmlns:s=\"urn:stock\"><?stockroom slots='12' ?><!-- Shelf A\nShelf B --><![CDATA[Blue & <Green>]]></s:Item>",
+        ),
+        (
+            "",
+            "",
+            "<!-- shelf B --><Item><![CDATA[shelf]]><![CDATA[]]><![CDATA[ number]]>2</Item><?next?>",
+            "<!-- shelf B --><Item><![CDATA[shelf number]]>2</Item><?next?>",
+        ),
+        (
+            "",
+            "",
+            "<Item><![CDATA[labels ]]]><![CDATA[]> next]]></Item>",
+            "<Item><![CDATA[labels ]]]]><![CDATA[> next]]></Item>",
+        ),
+        (
+            "",
+            "",
+            "<Item><![CDATA[]]><?data\rbox\r\nbag\rcart?><?done  ?></Item>",
+            "<Item><![CDATA[]]><?data box\nbag\ncart?><?done ?></Item>",
+        ),
+        (
+            "",
+            "",
+            "<Item><?office:notes  shelf = 'B' ?>Folders</Item>",
+            "<Item><?office:notes shelf = 'B' ?>Folders</Item>",
+        ),
+    ] {
+        let catalog = format!(
+            "<?xml version=\"1.0\"?>\n<xar{root}>\n<subdoc{sub}>{markup}</subdoc>\n<toc><file><name>receipt</name><type>file</type>{}</file></toc>\n</xar>",
+            extent(
+                "data",
+                0,
+                receipt.len(),
+                receipt.len(),
+                "application/octet-stream"
+            )
+        );
+        cases.push((build(&catalog, receipt)?, expected.to_owned()));
+    }
+    let archive_with = |parents: &str, subdocs: &str| {
+        build(
+            &format!(
+                "<?xml version=\"1.0\"?>\n<xar{parents}>\n{subdocs}\n<toc><file>{}</file></toc>\n</xar>",
+                extent(
+                    "data",
+                    0,
+                    receipt.len(),
+                    receipt.len(),
+                    "application/octet-stream"
+                )
+            ),
+            receipt,
+        )
+    };
+    // Keep a UTF-8 character before a CRLF split across output blocks.
+    let label = format!("{}é", "a".repeat(65533));
+    let source = format!(
+        "<Item><!--{label}\r\nbox--><?s {label}\r\nqty?><![CDATA[{label}\r\nnote]]></Item>"
+    );
+    let expected =
+        format!("<Item><!--{label}\nbox--><?s {label}\nqty?><![CDATA[{label}\r\nnote]]></Item>");
+    cases.push((
+        archive_with("", &format!("<subdoc>{source}</subdoc>"))?,
+        expected,
+    ));
+    for (outer, documents, expected) in [
+        // One sibling shadows the outer binding. The next sibling must recover it.
+        (
+            " xmlns:p='urn:outer'",
+            "<subdoc><One xmlns:p='urn:one'><p:Child/></One> <p:Two/></subdoc>",
+            "<One xmlns:p=\"urn:one\"><p:Child/></One> <p:Two xmlns:p=\"urn:outer\"/>",
+        ),
+        // An empty default declaration lasts only until the closing tag.
+        (
+            " xmlns='urn:outer'",
+            "<subdoc><One xmlns=''><Child/></One> <Two/></subdoc>",
+            "<One xmlns=\"\"><Child/></One> <Two xmlns=\"urn:outer\"/>",
+        ),
+        // Locally declared bindings survive even if unused. Ancestor bindings do not.
+        (
+            " xmlns:p='urn:unused'",
+            "<subdoc><One id='7' xmlns:u='urn:local'><Two/></One></subdoc>",
+            "<One xmlns:u=\"urn:local\" id=\"7\"><Two/></One>",
+        ),
+        // Removing the first subdocument's scope must reveal the enclosing binding.
+        (
+            " xmlns:p='urn:outer'",
+            "<subdoc xmlns:p='urn:first'><p:One/></subdoc>\n<subdoc><p:Two/></subdoc>",
+            "<p:Two xmlns:p=\"urn:outer\"/>",
+        ),
+        // A default namespace never applies to an attribute without a prefix.
+        (
+            " xmlns='urn:a' xmlns:p='urn:a'",
+            "<subdoc><Box id='1' p:id='2'/></subdoc>",
+            "<Box xmlns=\"urn:a\" xmlns:p=\"urn:a\" id=\"1\" p:id=\"2\"/>",
+        ),
+    ] {
+        cases.push((archive_with(outer, documents)?, expected.into()));
+    }
+    let mut over_bounds = Vec::new();
+    for count in [256, 257] {
+        // Split declarations across levels to exercise the live-binding limit independently.
+        let declarations = |range: std::ops::Range<usize>| {
+            range
+                .map(|i| format!(" xmlns:p{i}='urn:scope:{i}'"))
+                .collect::<String>()
+        };
+        let outer = declarations(0..128);
+        let last = count - 1;
+        let documents = format!(
+            "<subdoc{}><p0:Box><p{last}:Item/></p0:Box></subdoc>",
+            declarations(128..count)
+        );
+        let rendering = format!(
+            "<p0:Box xmlns:p0=\"urn:scope:0\" xmlns:p{last}=\"urn:scope:{last}\"><p{last}:Item/></p0:Box>"
+        );
+        let binding_case = (archive_with(&outer, &documents)?, rendering);
+        let attrs = (0..count)
+            .map(|n| format!(" n{n}=\"1\""))
+            .collect::<String>();
+        let rendering = format!("<Box{attrs}/>");
+        let attribute_case = (
+            archive_with("", &format!("<subdoc>{rendering}</subdoc>"))?,
+            rendering,
+        );
+        if count == 256 {
+            cases.extend([binding_case, attribute_case]);
+        } else {
+            over_bounds.extend([binding_case, attribute_case]);
+        }
+    }
+    let tmp = tempfile::tempdir_in("/tmp")?;
+    let root = tmp.path();
+    let db = root.join("db");
+    fs::create_dir(&db)?;
+    let rule = |name: &str, b: &[u8]| {
+        let md5 = Md5::digest(b)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        format!("{md5}:{}:Xar.{name}\n", b.len())
+    };
+    let receipt_rule = rule("Receipt", receipt);
+    let archive_rule = rule("Archive", archive);
+    let subdoc = rule("Subdocument", rendered);
+    let mut all = subdoc.clone() + &receipt_rule + &archive_rule;
+    for (_, artifact) in cases.iter().chain(&over_bounds) {
+        all += &rule("Subdocument", artifact.as_bytes())
+    }
+    let toc_size = u64::from_be_bytes(archive[16..24].try_into().unwrap());
+    let mut decoded = Vec::new();
+    std::io::Read::read_to_end(
+        &mut flate2::read::ZlibDecoder::new(&archive[28..]),
+        &mut decoded,
+    )?;
+    for (label, options, rules, want) in [
+        ("competing", "".to_string(), all.clone(), "Subdocument"),
+        (
+            "heap",
+            "".to_string(),
+            receipt_rule.clone() + &archive_rule,
+            "Receipt",
+        ),
+        ("outer", "".to_string(), archive_rule.clone(), "Archive"),
+        (
+            "toc",
+            "".to_string(),
+            all.clone() + &rule("Toc", &decoded),
+            "Toc",
+        ),
+        ("disabled", "ScanArchive no".into(), all.clone(), "Archive"),
+        (
+            "size-exact",
+            format!(
+                "MaxScanSize {}\nAlertExceedsMax yes",
+                archive.len() as u64 + toc_size + rendered.len() as u64
+            ),
+            subdoc.clone(),
+            "Subdocument",
+        ),
+        (
+            "size-below",
+            format!(
+                "MaxScanSize {}\nAlertExceedsMax yes",
+                archive.len() as u64 + toc_size + rendered.len() as u64 - 1
+            ),
+            subdoc.clone(),
+            "Heuristics.Limits.Exceeded.MaxScanSize",
+        ),
+        (
+            "count-and-size",
+            format!(
+                "MaxFiles 2\nMaxScanSize {}\nAlertExceedsMax yes",
+                archive.len() as u64 + toc_size + rendered.len() as u64 - 1
+            ),
+            subdoc.clone(),
+            "Heuristics.Limits.Exceeded.MaxScanSize",
+        ),
+        (
+            "count",
+            "MaxFiles 2\nAlertExceedsMax yes".into(),
+            subdoc.clone(),
+            "Heuristics.Limits.Exceeded.MaxFiles",
+        ),
+    ] {
+        fs::write(db.join("note.hdb"), rules)?;
+        let conf = root.join(format!("{label}.conf"));
+        let socket = root.join(format!("{label}.sock"));
+        fs::write(
+            &conf,
+            format!(
+                "Foreground yes\nDisableCache yes\nDatabaseDirectory {}\nLocalSocket {}\nTemporaryDirectory {}\n{options}\n",
+                db.display(),
+                socket.display(),
+                root.display()
+            ),
+        )?;
+        let exe = if stock {
+            "/usr/sbin/clamd"
+        } else {
+            env!("CARGO_BIN_EXE_barnacle")
+        };
+        let _service = Daemon::start(Path::new(exe), &conf, &socket)?;
+        let reply = |b: &[u8]| unix_request(&socket, &stream_frame(b)?);
+        let expected = if want.starts_with("Heuristics.") {
+            format!("stream: {want} FOUND\0")
+        } else {
+            format!("stream: Xar.{want}.UNOFFICIAL FOUND\0")
+        };
+        assert_eq!(reply(archive)?, expected, "{label}");
+        if label == "competing" {
+            for (bytes, artifact) in &cases {
+                assert_eq!(reply(bytes)?, expected, "{artifact}")
+            }
+            for (bytes, artifact) in &over_bounds {
+                let want = if stock {
+                    expected.as_str()
+                } else {
+                    "stream: Incomplete scan: unsupported detection coverage. ERROR\0"
+                };
+                assert_eq!(
+                    reply(bytes)?,
+                    want,
+                    "over supported XAR namespace limit, {artifact}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+#[test]
+fn inventory_namespaces() -> io::Result<()> {
+    namespace_cases(false)
+}
+#[test]
+#[ignore = "requires pinned Debian clamd"]
+fn stock_inventory_namespaces() -> io::Result<()> {
+    namespace_cases(true)
+}
+
+#[test]
+fn subdocument_scratch_follows_admission() -> io::Result<()> {
+    use barnacle::objects::{Options, Verdict, scan};
+    let uri = format!("urn:{}", "ordinary-stationery-".repeat(50));
+    let siblings = "<u:Box/>".repeat(128);
+    let rendered = format!("<u:Box xmlns:u=\"{uri}\"/>").repeat(128);
+    assert!(rendered.len() > 64 * 1024);
+    let xml = toc(&format!("<subdoc xmlns:u='{uri}'>{siblings}</subdoc>"), "");
+    assert!(xml.len() < 64 * 1024);
+    let archive = build(&xml, &[])?;
+    let tmp = tempfile::tempdir()?;
+    let missing = tmp.path().join("missing");
+    for (options, path, expected) in [
+        (Options::default(), tmp.path(), true),
+        (
+            Options {
+                max_files: 2,
+                ..Options::default()
+            },
+            missing.as_path(),
+            false,
+        ),
+        (
+            Options {
+                max_file_size: 32 * 1024,
+                ..Options::default()
+            },
+            missing.as_path(),
+            false,
+        ),
+    ] {
+        let mut found = false;
+        scan(
+            &archive,
+            &options,
+            path,
+            |object, _| {
+                if object.bytes == rendered.as_bytes() {
+                    found = true;
+                    Ok(Verdict::Found("subdoc".into()))
+                } else {
+                    Ok(Verdict::Miss)
+                }
+            },
+            || Ok(()),
+        )?;
+        assert_eq!(found, expected);
+    }
+    Ok(())
+}
+
+#[test]
+fn unsupported_namespace_forms_keep_an_uncertain_member_ahead_of_the_heap() -> io::Result<()> {
+    use barnacle::objects::{Options, Verdict, scan};
+    let tmp = tempfile::tempdir()?;
+    for markup in [
+        "<u:Part/>",
+        "<a:Part xmlns:a='urn:a&amp;b'/>",
+        "<Item xmlns:a='urn:u' xmlns:b='urn:u' a:id='1' b:id='2'/>",
+    ] {
+        let archive = build(
+            &toc(
+                &format!("<subdoc>{markup}</subdoc>"),
+                &extent(
+                    "data",
+                    0,
+                    FIRST.len(),
+                    FIRST.len(),
+                    "application/octet-stream",
+                ),
+            ),
+            FIRST,
+        )?;
+        let result = scan(
+            &archive,
+            &Options::default(),
+            tmp.path(),
+            |object, _| {
+                Ok(if object.bytes == FIRST {
+                    Verdict::Found("heap".into())
+                } else {
+                    Verdict::Miss
+                })
+            },
+            || Ok(()),
+        )?;
+        assert_eq!(result, Verdict::Incomplete, "{markup}");
+    }
+    Ok(())
+}
+
+#[test]
+fn canonical_subdocument_borrows_the_catalog_and_a_late_change_keeps_the_prefix() -> io::Result<()>
+{
+    use barnacle::objects::{Options, Verdict, scan};
+    let note = "Issued paper folders. ".repeat(5000);
+    let tmp = tempfile::tempdir()?;
+    for (element, borrowed) in [("<Leaf id=\"1\"/>", true), ("<Leaf id='1'></Leaf>", false)] {
+        let source = format!("<List><Note>{note}</Note>{element}</List>");
+        let expected = format!("<List><Note>{note}</Note><Leaf id=\"1\"/></List>");
+        let catalog = toc(&format!("<subdoc>{source}</subdoc>"), "");
+        let archive = build(&catalog, &[])?;
+        let mut owner = None;
+        let result = scan(
+            &archive,
+            &Options::default(),
+            tmp.path(),
+            |object, _| {
+                if object.bytes == catalog.as_bytes() {
+                    let at = object.bytes.as_ptr() as usize;
+                    owner = Some(at..at + object.bytes.len());
+                } else if object.bytes == expected.as_bytes() {
+                    let at = object.bytes.as_ptr() as usize;
+                    assert_eq!(owner.as_ref().unwrap().contains(&at), borrowed);
+                    return Ok(Verdict::Found("inventory".into()));
+                }
+                Ok(Verdict::Miss)
+            },
+            || Ok(()),
+        )?;
+        assert_eq!(result, Verdict::Found("inventory".into()));
+    }
+    Ok(())
+}

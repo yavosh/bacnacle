@@ -1,4 +1,5 @@
 //! Scan the catalog, subdocuments and heap extents in the order used by XAR.
+mod subdocument;
 use super::{ChildSink, Handling, decoded};
 use crate::objects::Snapshot;
 use flate2::read::ZlibDecoder;
@@ -84,101 +85,6 @@ fn integer(text: &str) -> Option<usize> {
     text.get(..n)?.parse::<isize>().ok()?.try_into().ok()
 }
 
-// libxml serializes the subdocument's inner XML before scanning it. Normalize empty
-// elements and attribute quotes without expanding DTDs, namespaces or external entities.
-fn subdoc(reader: &mut Reader<&[u8]>, sink: &mut dyn ChildSink) -> io::Result<Handling> {
-    let mut spool = Snapshot::new(sink.temporary_directory());
-    let mut depth = 0usize;
-    let mut open = false;
-    {
-        let mut out = io::BufWriter::new(&mut spool);
-        loop {
-            sink.check()?;
-            let Ok(event) = reader.read_event() else {
-                return Ok(Handling::Incomplete);
-            };
-            if let Event::End(end) = &event
-                && depth == 0
-                && end.local_name().as_ref() == "subdoc"
-            {
-                break;
-            }
-            if depth > MAX_DEPTH {
-                return Ok(Handling::Incomplete);
-            }
-            if open && !matches!(event, Event::End(_)) {
-                out.write_all(b">")?;
-                open = false;
-            }
-            match event {
-                Event::Start(ref tag) | Event::Empty(ref tag) => {
-                    let name = tag.name();
-                    if name.as_ref().contains(':') {
-                        return Ok(Handling::Incomplete);
-                    }
-                    out.write_all(b"<")?;
-                    out.write_all(name.as_ref().as_bytes())?;
-                    for attribute in tag.attributes() {
-                        let Ok(a) = attribute else {
-                            return Ok(Handling::Incomplete);
-                        };
-                        if a.key.as_ref().starts_with("xmlns")
-                            || a.key.as_ref().contains(':')
-                            || a.value
-                                .bytes()
-                                .any(|b| matches!(b, b'&' | b'<' | b'"' | b'\r' | b'\n' | b'\t'))
-                        {
-                            return Ok(Handling::Incomplete);
-                        }
-                        out.write_all(b" ")?;
-                        out.write_all(a.key.as_ref().as_bytes())?;
-                        out.write_all(b"=\"")?;
-                        out.write_all(a.value.as_bytes())?;
-                        out.write_all(b"\"")?;
-                    }
-                    if matches!(event, Event::Empty(_)) {
-                        out.write_all(b"/>")?;
-                    } else {
-                        open = true;
-                        depth += 1;
-                    }
-                }
-                Event::End(ref tag) => {
-                    let Some(d) = depth.checked_sub(1) else {
-                        return Ok(Handling::Incomplete);
-                    };
-                    depth = d;
-                    if open {
-                        out.write_all(b"/>")?;
-                        open = false;
-                    } else {
-                        out.write_all(b"</")?;
-                        out.write_all(tag.name().as_ref().as_bytes())?;
-                        out.write_all(b">")?;
-                    }
-                }
-                Event::Text(text) if !text.contains('\r') && !text.contains('>') => {
-                    out.write_all(text.as_ref().as_bytes())?;
-                }
-                Event::GeneralRef(entity) if matches!(entity.as_ref(), "amp" | "lt" | "gt") => {
-                    out.write_all(b"&")?;
-                    out.write_all(entity.as_ref().as_bytes())?;
-                    out.write_all(b";")?;
-                }
-                _ => return Ok(Handling::Incomplete),
-            }
-        }
-        out.flush()?;
-    }
-    spool.with_bytes(|bytes| {
-        Ok(if sink.child_bytes(bytes, None)? {
-            Handling::Stopped
-        } else {
-            Handling::Complete
-        })
-    })
-}
-
 fn parse(toc: &[u8], heap: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handling> {
     if sink.child_bytes(toc, None)? {
         return Ok(Handling::Stopped);
@@ -186,7 +92,7 @@ fn parse(toc: &[u8], heap: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handli
     let mut reader = Reader::from_reader(toc);
     let mut depth = 0usize;
     let mut in_toc = false;
-    let mut namespace_depth = None;
+    let mut scope = subdocument::Namespaces::default();
     let mut skip_next = false;
     let mut active = None::<(usize, Extent)>;
     let mut number = None;
@@ -205,28 +111,21 @@ fn parse(toc: &[u8], heap: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handli
                         return Ok(Handling::Incomplete);
                     }
                 }
+                if !in_toc && !empty && !scope.enter(start, depth) {
+                    return Ok(Handling::Incomplete);
+                }
                 if skip {
                     continue;
                 }
                 let name = start.local_name();
                 if !in_toc {
-                    let namespaced = start.attributes().any(|a| {
-                        a.is_ok_and(|a| {
-                            a.key.as_ref() == "xmlns" || a.key.as_ref().starts_with("xmlns:")
-                        })
-                    });
-                    if namespaced && !empty {
-                        namespace_depth.get_or_insert(depth);
-                    }
                     if name.as_ref() == "subdoc" {
-                        if namespace_depth.is_some() {
-                            return Ok(Handling::Incomplete);
-                        }
                         if !empty {
-                            let outcome = subdoc(&mut reader, sink)?;
+                            let outcome = subdocument::scan(&mut reader, &mut scope, depth, sink)?;
                             if outcome != Handling::Complete {
                                 return Ok(outcome);
                             }
+                            scope.leave(depth);
                             depth -= 1;
                         }
                         // xmlTextReaderNext moves to the next sibling before the reference read loop resumes.
@@ -279,9 +178,7 @@ fn parse(toc: &[u8], heap: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handli
                         return Ok(result);
                     }
                 }
-                if namespace_depth == Some(depth) {
-                    namespace_depth = None;
-                }
+                scope.leave(depth);
                 if end.local_name().as_ref() == "xar" {
                     return Ok(Handling::Complete);
                 }

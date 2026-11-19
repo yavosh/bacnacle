@@ -214,6 +214,12 @@ impl Write for Snapshot {
     }
 }
 
+impl std::io::Seek for Snapshot {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> io::Result<u64> {
+        self.0.seek(pos)
+    }
+}
+
 impl Snapshot {
     const MEMORY_LIMIT: usize = 64 * 1024;
 

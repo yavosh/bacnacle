@@ -350,7 +350,15 @@ An incorrect entry checksum does not suppress a detection. A damaged zlib member
 An oversized catalog prevents scanning its heap. Byte, file count, and recursion limits use the daemon configuration.
 
 Catalog decoding spills to a private file after 64 KiB. The pinned allocation ceiling is one GiB, including the terminating byte.
-LZMA dictionary estimates above 64 MiB and subdocuments needing namespace or extended XML serialization still return incomplete coverage.
+Both daemons detect the namespace-bearing inventory subdocument from Apple xar before its heap receipt or archive hash.
+Each subtree keeps local namespace declarations first. It adds inherited declarations in first-use order, including uses by descendants.
+Stock preserves XML comments, processing instructions, and CDATA in this subdocument. It merges adjacent CDATA sections where possible.
+Comments and processing instructions use LF line endings. CDATA keeps its original line endings.
+The size check precedes the file-count check. Without inherited bindings, the source length bounds the output.
+If that bound fits, Barnacle serializes once. Otherwise it counts the output before spilling an admitted subdocument larger than 64 KiB.
+It supports up to 256 live namespace bindings and 256 attributes per element. Names beyond 1,024 bytes, prefixes beyond 256 bytes,
+namespace URIs beyond 2,048 bytes, escaped attribute values, and extended XML serialization return incomplete coverage.
+LZMA dictionary estimates above 64 MiB also return incomplete coverage. [Apple fixture](../tests/fixtures/xar/README.md)
 
 ### OLE compound documents
 
