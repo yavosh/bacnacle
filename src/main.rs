@@ -1,4 +1,6 @@
-//! Offline compiler and matcher for whole-file hash databases.
+//! Barnacle daemon, index compiler, validator, and offline matcher.
+
+mod daemon;
 
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -11,7 +13,9 @@ use barnacle::index::{self, Index};
 use barnacle::{Algorithm, Feed, PINNED_FLEVEL, hash_reader};
 
 const USAGE: &str = "usage:
+  barnacle serve [clamd options]
   barnacle build INDEX [--official] [--flevel LEVEL] DATABASE...
+  barnacle validate INDEX
   barnacle scan BACKEND INDEX FILE
   barnacle lookup BACKEND INDEX ALGORITHM HEX SIZE
 BACKEND: memory, pread, mmap. ALGORITHM: md5, sha1, sha256.
@@ -106,7 +110,19 @@ fn lookup(index: &Index, alg: &OsStr, hex: &OsStr, size: &OsStr) -> io::Result<O
 
 fn run(args: &[OsString]) -> io::Result<()> {
     let result = match args {
+        [] => return daemon::run(args),
+        [flag] if flag == "--help" || flag == "-h" => {
+            println!("{USAGE}\n");
+            return daemon::run(args);
+        }
+        [cmd, ..] if cmd.as_encoded_bytes().starts_with(b"-") => return daemon::run(args),
+        [cmd, options @ ..] if cmd == "serve" => return daemon::run(options),
         [cmd, path, inputs @ ..] if cmd == "build" => return build(Path::new(path), inputs),
+        [cmd, path] if cmd == "validate" => {
+            Index::open_pread(Path::new(path))?;
+            println!("valid");
+            return Ok(());
+        }
         [cmd, backend, path, input] if cmd == "scan" => {
             let index = open(backend, Path::new(path))?;
             if input == "-" {

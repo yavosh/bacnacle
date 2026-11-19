@@ -73,6 +73,16 @@ pub fn hash_reader(mut input: impl Read) -> io::Result<FileHashes> {
 }
 
 impl FileHashes {
+    /// Format the whole-file MD5 reported by clamd's ExtendedDetectionInfo log.
+    pub fn md5_hex(&self) -> String {
+        use std::fmt::Write;
+        let mut hex = String::with_capacity(32);
+        for byte in &self.digests[Algorithm::Md5 as usize][..16] {
+            write!(hex, "{byte:02x}").expect("writing a String cannot fail");
+        }
+        hex
+    }
+
     /// Apply the pinned engine's algorithm order and prefer exact sizes within each algorithm.
     pub fn lookup(
         &self,

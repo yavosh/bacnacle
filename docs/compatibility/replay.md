@@ -27,6 +27,17 @@ For a candidate daemon, replace `/usr/sbin/clamd` in the last command with its e
 The runner passes the same `clamd.conf` and uses the unmodified reference client. It compares exact replies, signatures, client output, and exit codes.
 A difference exits unsuccessfully and identifies the first differing JSON field.
 
+Use the following command to verify the partial daemon milestone.
+
+```sh
+"$oracle" check-partial "$snapshot_dir" target/release/barnacle docs/compat-reference.json > /tmp/barnacle.json
+```
+
+The two profiles contain 38 wire and client observations. At this milestone, 20 match stock exactly.
+The other 18 require specific incomplete-scan replies or client errors. These include nested detection and ordinary unmatched files.
+The runner also checks the input hashes, configuration, version, signature names, framing, and client exit codes.
+Use `check` for full equivalence.
+
 ## Observe the current offline matcher
 
 Build the pinned index using the [matcher guide](../whole-file-hashes.md). Set `index` to that immutable index path.
