@@ -2,7 +2,26 @@
 
 A 48,161-byte PDF contains a physical receipt and a 1,048,617-byte catalog inside a compressed object stream.
 One exact MD5 rule selects the receipt. A separate run selects the catalog using a second database.
-All 17,280 requests returned the expected signature. Each run used one ARM64 CPU, 2 GiB RAM, and disabled scan caching.
+All 24,960 requests across both experiments returned the expected signature. Each run used one ARM64 CPU, 2 GiB RAM, and disabled scan caching.
+
+## Retained carrier with bulk ASCII normalization
+
+On four clients the physical receipt reached 454 scans/s at 8.88 MiB. The preceding build reached 347 scans/s at 8.79 MiB.
+Barnacle scans printable ASCII blocks for consecutive spaces. When normalization preserves their length, it lowercases them in the caller's buffer.
+This improves the later text scan of the expanded carrier. The scanner still checks the catalog and receipt in stock order.
+
+| Object selected | Clients | Barnacle scans/s | Stock scans/s | Barnacle p95 ms | Stock p95 ms | Barnacle peak MiB | Stock peak MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Receipt | 1 | 437 | 280 | 2.52 | 3.81 | 4.19 | 8.48 |
+| Receipt | 4 | 454 | 284 | 18.83 | 21.35 | 8.88 | 18.65 |
+| Catalog | 1 | 290 | 182 | 3.52 | 5.58 | 4.20 | 8.18 |
+| Catalog | 4 | 288 | 180 | 22.71 | 30.65 | 8.72 | 18.70 |
+
+Each value is the median of three rotated batches. Each client submitted 64 requests to a fresh daemon.
+The raw data identify commit `9544ac5` as `bulk`, the preceding commit `5a3ba8c` as `retained`, and commit `0d39dc1` as `tokenizer`.
+Stock used Debian clamd 1.4.3. Peaks include the driver and file-backed pages. [Normalization measurements](object-pdf-catalog-normalization.csv)
+
+## Initial carrier retention
 
 Barnacle commit `0d39dc1` wrote selected catalog bytes into a second spool. Commit `16d8a1c` retains the decoded carrier.
 The four-client receipt workload used 3.29 MiB less peak cgroup memory with retention. Throughput fell from 339 to 320 scans/s.
