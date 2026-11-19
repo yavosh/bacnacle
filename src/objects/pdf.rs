@@ -90,24 +90,29 @@ impl<'a> Tokens<'a> {
         match b {
             b'(' => {
                 let mut depth = 1usize;
-                let mut escaped = false;
-                self.skip_while(
-                    |c| {
-                        if escaped {
-                            escaped = false;
-                        } else {
-                            match c {
-                                b'\\' => escaped = true,
-                                b'(' => depth += 1,
-                                b')' => depth -= 1,
-                                _ => (),
+                let mut escaped_at = None;
+                'literal: for chunk in self.data[self.pos..].chunks(TOKEN_BLOCK) {
+                    for i in memchr::memchr3_iter(b'(', b')', b'\\', chunk) {
+                        let at = self.pos + i;
+                        if escaped_at == Some(at) {
+                            continue;
+                        }
+                        match chunk[i] {
+                            b'\\' => escaped_at = Some(at + 1),
+                            b'(' => depth += 1,
+                            _ => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    self.pos = at + 1;
+                                    charge(i + 1)?;
+                                    break 'literal;
+                                }
                             }
                         }
-                        depth != 0
-                    },
-                    charge,
-                )?;
-                self.pos += usize::from(self.pos < self.data.len());
+                    }
+                    self.pos += chunk.len();
+                    charge(chunk.len())?;
+                }
             }
             b'<' | b'>' if self.data.get(self.pos) == Some(&b) => self.pos += 1,
             b'<' => {
@@ -647,4 +652,43 @@ fn page_text(
         file.write_all(&out[..used])?;
     }
     Ok(written + used as u64)
+}
+
+#[cfg(test)]
+mod token_tests {
+    use super::*;
+
+    #[test]
+    fn literal_escapes_across_chunks() -> io::Result<()> {
+        for prefix in [0, 3, TOKEN_BLOCK - 2, TOKEN_BLOCK - 1, TOKEN_BLOCK] {
+            let mut data = vec![b'('];
+            data.resize(1 + prefix, b'a');
+            data.extend_from_slice(br"\)\(\\(nested) tail)");
+            let end = data.len();
+            data.extend_from_slice(b" /Next");
+            let mut tokens = Tokens {
+                data: &data,
+                pos: 0,
+            };
+            assert_eq!(tokens.next(), Some(&data[..end]));
+            assert_eq!(tokens.next(), Some(b"/Next".as_slice()));
+        }
+        // Report a cancellation from the middle of a single large string.
+        let mut data = vec![b'x'; 4 * TOKEN_BLOCK];
+        data[0] = b'(';
+        *data.last_mut().unwrap() = b')';
+        let mut tokens = Tokens {
+            data: &data,
+            pos: 0,
+        };
+        let mut budget = TokenBudget::default();
+        let error = tokens
+            .next_with(&mut |n| {
+                budget.charge(n, &mut || Err(io::Error::other("receipt scan cancelled")))
+            })
+            .unwrap_err();
+        assert_eq!(error.to_string(), "receipt scan cancelled");
+        assert_eq!(tokens.pos, 1 + TOKEN_BLOCK);
+        Ok(())
+    }
 }

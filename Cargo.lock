@@ -46,6 +46,7 @@ dependencies = [
  "lzma-rust2",
  "lzxd",
  "md-5",
+ "memchr",
  "memmap2",
  "nix",
  "nsis",
