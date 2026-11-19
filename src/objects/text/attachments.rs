@@ -122,26 +122,35 @@ struct Uu<'a> {
     len: usize,
 }
 
+fn uu_length(line: &[u8]) -> io::Result<usize> {
+    if line.is_empty() || line.eq_ignore_ascii_case(b"end") {
+        return Ok(0);
+    }
+    let len = usize::from(line[0].wrapping_sub(b' ') & 63);
+    if len == 0 || len > 62 {
+        return Ok(0);
+    }
+    let body = &line[1..];
+    if body.len() < (len * 8).div_ceil(6) || !body.iter().all(|b| (32..=96).contains(b)) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid uuencoded line",
+        ));
+    }
+    Ok(len)
+}
+
 impl Read for Uu<'_> {
     fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
         if self.start == self.len {
             let (line, next) = row(self.input);
             self.input = next;
-            if line.is_empty() || line.eq_ignore_ascii_case(b"end") {
-                return Ok(0);
-            }
-            let len = usize::from(line[0].wrapping_sub(b' ') & 63);
-            if len == 0 || len > 62 {
+            let len = uu_length(line)?;
+            if len == 0 {
                 return Ok(0);
             }
             // The line length byte names the decoded length, including any short final group.
             let body = &line[1..];
-            if body.len() < (len * 8).div_ceil(6) || !body.iter().all(|b| (32..=96).contains(b)) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid uuencoded line",
-                ));
-            }
             let mut acc = 0u16;
             let mut bits = 0;
             let mut pos = 0;
@@ -167,25 +176,80 @@ impl Read for Uu<'_> {
     }
 }
 
-pub(super) fn uu(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handling> {
+fn uu_reader(bytes: &[u8]) -> Option<(Uu<'_>, &[u8])> {
     let (head, input) = row(bytes);
     let mut fields = head.split(|&c| c == b' ').filter(|s| !s.is_empty());
     let (Some(b"begin"), Some(mode), Some(name)) = (fields.next(), fields.next(), fields.next())
     else {
-        return Ok(Handling::Incomplete);
+        return None;
     };
     if mode.len() != 3 || !mode.iter().all(|b| (b'0'..=b'7').contains(b)) || name.len() > 255 {
-        return Ok(Handling::Incomplete);
+        return None;
     }
-    let mut reader = Uu {
+    let reader = Uu {
         input,
         decoded: [0; 63],
         start: 0,
         len: 0,
+    };
+    Some((reader, name))
+}
+
+pub(super) fn uu(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handling> {
+    let Some((mut reader, name)) = uu_reader(bytes) else {
+        return Ok(Handling::Incomplete);
     };
     Ok(if sink.child(&mut reader, None, Some(name))? {
         Handling::Stopped
     } else {
         Handling::Complete
     })
+}
+
+pub(super) struct RecoveredNote<'a> {
+    reader: Uu<'a>,
+    size: u64,
+    pub(super) tail: &'a [u8],
+}
+
+pub(super) fn recovered_note<'a>(
+    bytes: &'a [u8],
+    sink: &mut dyn ChildSink,
+) -> io::Result<Option<RecoveredNote<'a>>> {
+    let Some((reader, _)) = uu_reader(bytes) else {
+        return Ok(None);
+    };
+    let mut size = 0;
+    let mut lines = reader.input;
+    let tail = loop {
+        sink.check()?;
+        let (line, rest) = row(lines);
+        match uu_length(line) {
+            Ok(0) => {
+                if !matches!(line, b"`" | b" ") || row(rest).0 != b"end" {
+                    return Ok(None);
+                }
+                break rest;
+            }
+            Ok(n) => size += n as u64,
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => return Ok(None),
+            Err(e) => return Err(e),
+        }
+        lines = rest;
+    };
+    Ok(Some(RecoveredNote { reader, size, tail }))
+}
+
+impl RecoveredNote<'_> {
+    pub(super) fn submit(mut self, sink: &mut dyn ChildSink) -> io::Result<Handling> {
+        if self.size <= 5 || sink.skip_declared_size(self.size) {
+            return Ok(Handling::Complete);
+        }
+        // Stock assigns a private temporary filename, not the name in the begin line.
+        Ok(if sink.child(&mut self.reader, None, None)? {
+            Handling::Stopped
+        } else {
+            Handling::Complete
+        })
+    }
 }

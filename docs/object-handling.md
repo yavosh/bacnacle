@@ -24,9 +24,37 @@ The reference applies format settings and limits individually. [Effective clamd 
 `ScanXMLDOCS no` leaves ZIP member scanning enabled in packaged Word, Excel, PowerPoint, and HWP documents.
 Both daemons detect the same member hash with this setting. [Office container comparisons](../tests/object_parents.rs)
 
+In the authored Word and PowerPoint packages, the document XML signature wins over the picture and package hashes.
+In the spreadsheet, stock classifies the stylesheet as HTML at the `<tableStyles` element.
+Its 879-byte normalized markup wins over the worksheet, picture, and package hashes.
+Disabling HTML scanning makes the worksheet win. Disabling archive scanning makes each package hash win.
+[Office package comparisons](../tests/object_office_packages.rs) · [Fixture provenance](../tests/fixtures/ooxml/README.md) · [Throughput and memory](benchmarks/object-office-packages.md)
+
 HWPX assets under `BinData/` can trigger a central-directory lookup for `Contents/content.hpf`.
 Stock accepts a prefix in the first three local headers and requires the complete filename in the directory.
 Both daemons preserve the resulting HWPX or ZIP parent type. [HWPX comparisons](../tests/object_parents.rs)
+
+### ZIP Deflate64 members
+
+Both daemons detect the first member of a 7-Zip archive containing an 81,000-byte ledger and a later text file.
+The ledger hash wins over the archive hash. Stock metadata preserves both filenames in local-header order.
+At file limits of 16,383 and 16,384 bytes, the scanned prefixes contain 8,192 and 16,384 bytes respectively.
+The comparisons also cover nested ZIPs, streaming descriptors, a short final block, and count, recursion, and scan-size limits.
+[Rust comparisons](../tests/object_zip_deflate64.rs) · [Fixture provenance](../tests/fixtures/zip/README.md)
+
+Barnacle limits each decoder call to 8 KiB of input and output. It releases the fixed dictionary before scanning the child.
+Stock checks the file count first. Outputs through five bytes bypass the scan-size and recursion limits.
+For larger outputs, the scan-size limit precedes recursion. If available scan bytes might run out, Barnacle counts past 64 KiB before using disk.
+A member that fits can then be decoded again. Unconstrained members need one pass.
+An invalid Deflate64 stream that the decoder rejects returns incomplete coverage. Encrypted entries and ZIP64 layouts remain outside these comparisons.
+The Rust decoder uses the MIT license. [deflate64 0.1.12](https://docs.rs/crate/deflate64/0.1.12)
+
+Four clients scanned the ledger ZIP at 4,489 scans/s with Barnacle `be9927b` and 3,541 scans/s with stock.
+Median p95 latency was 1.52 ms and 2.47 ms respectively. Median peak cgroup memory was 3.74 MiB and 5.50 MiB.
+All 15,360 requests across both concurrency levels returned the ledger signature.
+Use the Office benchmark's container settings with 512 requests per client and `ledger-deflate64.zip` as the input.
+The sole rule was `40e674895de36362c65153f79fa06d45:81000:Workspace.Reference`.
+[Raw ZIP measurements](benchmarks/object-zip-deflate64.csv) · [Benchmark procedure](benchmarks/object-office-packages.md#reproduction)
 
 ### Executable containers
 
@@ -68,6 +96,26 @@ After a second space run, stock truncates the captured URL and retains subsequen
 Pending multibyte text can resume in the next attribute, even across tags.
 Certain combinations of literal controls and tag delimiters in quoted attributes remain incomplete. Entity coverage outside the WHATWG list remains unverified.
 [HTML character reference comparisons](../tests/object_html_entities.rs)
+
+### Forwarded email
+
+Barnacle and pinned clamd scan Base64 and quoted-printable `message/rfc822` multipart attachments as child mail objects.
+A decoded `forward.eml` can match its receipt before a later contact card.
+An oversized forward leaves the contact eligible. At the size boundary, the forwarded file can match its own hash.
+A plain forward without a transfer marker or a uuencoded attachment is skipped, including one containing a raw PNG.
+Stock recovers a uuencoded note as a direct child of the enclosing mail. A contact attachment wins before the note.
+The note wins before a raw body signature or the mail hash. Stock assigns the note a private temporary filename.
+Notes of five bytes or fewer are skipped before checking file count. Larger notes check decoded size before count and depth.
+For an 8bit or binary forward with one note and a transfer marker, stock retains the `end` line.
+It scans that revised forward immediately. A following contact remains eligible before the deferred note.
+Multiple notes and mixed forwards with an absent or 7bit declaration remain incomplete after direct attachments miss.
+The marker is a case-insensitive line prefix, `Content-Transfer-Encoding`, including in prose. A lowercase `7bit` anywhere on that line suppresses it. With a marker, 8bit or binary members are scanned immediately.
+An absent or 7bit declaration defers the saved forward until after ordinary attachments.
+Multiple deferred forwards and the extra recovery file produced by explicit 7bit remain incomplete after direct attachments miss.
+
+A standalone `message/rfc822` uses the literal embedded headers. A Base64 body without headers produced no mail child.
+A simple quoted-printable-wrapped text message retained its literal body. More complex standalone quoted-printable layouts remain incomplete.
+[Forwarded mail comparisons](../tests/object_mail_forward.rs)
 
 ### Binary HWP documents
 
@@ -147,6 +195,14 @@ Document names come from the winning signature. [End-to-end fixtures](../tests/o
 | Policies and truncated input | Parser disabled, recursion and expanded-size alerts, a missing final trailer, and a truncated stream. |
 | Packed indirect objects | Stored and Flate object streams, packed page dictionaries, content arrays, indirect lengths, and physical stream order. [Object-stream comparisons](../tests/object_pdf_streams.rs) |
 | Additional PDF stages | Encryption, JavaScript actions and other stream filters require further comparisons. |
+
+Both daemons scan the referenced page dictionary for an explicit catalog opening destination.
+An inline local GoTo exposes the catalog. An indirect local action exposes the referenced object at its physical position.
+The child contains the bytes between `obj` and `endobj`, including surrounding line endings.
+Barnacle indexes only the requested object IDs. The PDF parser admits at most 65,536 physical objects.
+The tests cover all eight explicit destination modes, local named destinations, sparse IDs, backward references, and ZIP attachments.
+Packed catalogs, chained actions, and unresolved or ambiguous destinations remain incomplete.
+[Destination comparisons](../tests/object_pdf_destinations.rs) · [PDF 1.7 sections 12.3.2 and 12.6.4.2](https://opensource.adobe.com/dc-acrobat-sdk-docs/standards/pdfstandards/pdf/PDF32000_2008.pdf)
 
 Stock uses early LZW code-width changes for both `/LZWDecode` and `/LZW`, even with `/EarlyChange 0`.
 Both daemons matched the same 2,724 output bytes from a 7,500-byte late-change attachment. qpdf 12.4.2 decoded all 7,500 original bytes.
