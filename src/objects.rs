@@ -62,7 +62,7 @@ trait ChildSink {
         snapshot.with_bytes(|bytes| self.partition_bytes(bytes, None))
     }
     fn partition_bytes(&mut self, bytes: &[u8], name: Option<&[u8]>) -> io::Result<bool>;
-    fn view(&mut self, data: &mut dyn Read, target: Target) -> io::Result<bool>;
+    fn script_view(&mut self, source: &[u8]) -> io::Result<bool>;
 
     fn check(&mut self) -> io::Result<()>;
     fn at_root(&self) -> bool;
@@ -595,61 +595,49 @@ impl ChildSink for Traversal<'_> {
         Ok(self.stopped.is_some())
     }
 
-    fn view(&mut self, data: &mut dyn Read, target: Target) -> io::Result<bool> {
-        let layer = self.parents.last().expect("view has an owning object");
-        let mapped = target == Target::Ascii && self.options.map_normalized_script;
-        // Text normalization contracts the input. The mail view preserves its length.
-        let snapshot = Snapshot::read_bounded(
-            data,
-            self.temporary_directory,
-            layer.size as u64,
-            &mut *self.check,
-        )?
-        .ok_or_else(|| io::Error::other("normalized view exceeds its source size"))?;
-        snapshot.with_bytes(|bytes| {
-            if mapped {
-                if self.skip_declared_size(bytes.len() as u64) {
-                    return Ok(false);
-                }
-                if self.options.max_files != 0 && self.files_scanned >= self.options.max_files {
-                    self.first_limit.get_or_insert(Limit::MaxFiles);
-                    return Ok(false);
-                }
-                if self.parents.len() + self.normalized_depth >= self.recursion_limit() {
-                    self.first_limit.get_or_insert(Limit::MaxRecursion);
+    fn script_view(&mut self, source: &[u8]) -> io::Result<bool> {
+        let mapped = self.options.map_normalized_script;
+        if mapped {
+            // Normalization can only contract the input. Stock checks the resulting
+            // size before count and recursion, without charging a second file.
+            if source.len() as u64 > self.remaining() {
+                let size = text::NormalizedText::new(source).size(self.check)?;
+                if self.skip_declared_size(size) {
                     return Ok(false);
                 }
             }
-            let (owner, parents) = self
-                .parents
-                .split_last()
-                .expect("view has an owning object");
-            let context = ObjectContext::typed(target, bytes);
-            let layer = Layer {
-                target,
-                file_type: if target == Target::Ascii {
-                    "CL_TYPE_TEXT_ASCII"
-                } else {
-                    "CL_TYPE_MAIL"
-                },
-                size: bytes.len(),
-                name: owner.name.clone(),
-            };
-            let object = Object {
-                bytes,
-                context: &context,
-                layer: &layer,
-                parents: if mapped { &self.parents } else { parents },
-                normalized: true,
-                body_only: target == Target::Ascii && !mapped,
-                handled_format: true,
-            };
-            let verdict = (self.matcher)(object, self.check)?;
-            if verdict != Verdict::Miss {
-                self.stopped = Some(verdict);
+            if !self.can_enter_child() {
+                return Ok(false);
             }
-            Ok(self.stopped.is_some())
-        })
+        }
+        let view =
+            text::NormalizedText::new(source).into_bytes(self.temporary_directory, self.check)?;
+        let bytes = view.as_ref();
+        let (owner, parents) = self
+            .parents
+            .split_last()
+            .expect("view has an owning object");
+        let context = ObjectContext::typed(Target::Ascii, bytes);
+        let layer = Layer {
+            target: Target::Ascii,
+            file_type: "CL_TYPE_TEXT_ASCII",
+            size: bytes.len(),
+            name: owner.name.clone(),
+        };
+        let object = Object {
+            bytes,
+            context: &context,
+            layer: &layer,
+            parents: if mapped { &self.parents } else { parents },
+            normalized: true,
+            body_only: !mapped,
+            handled_format: true,
+        };
+        let verdict = (self.matcher)(object, self.check)?;
+        if verdict != Verdict::Miss {
+            self.stopped = Some(verdict);
+        }
+        Ok(self.stopped.is_some())
     }
 
     fn check(&mut self) -> io::Result<()> {

@@ -1,7 +1,8 @@
 //! Typed streams produced by the stock HTML, script, and mail parsers.
-use super::{ChildSink, Handling, classify::Parser};
+use super::{ChildSink, Handling, ObjectBytes, Snapshot, classify::Parser};
 use crate::body::Target;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
+use std::path::Path;
 
 mod attachments;
 mod html;
@@ -152,16 +153,28 @@ pub(super) fn unicode_html(
     spool.with_bytes(|data| html::extract(data, sink, size, false))
 }
 
-struct NormalizedText<'a> {
+pub(super) struct NormalizedText<'a> {
     bytes: &'a [u8],
     space: bool,
 }
 
-impl Read for NormalizedText<'_> {
-    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+impl<'a> NormalizedText<'a> {
+    pub(super) fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            bytes,
+            space: false,
+        }
+    }
+
+    // Bound consumed input even if a whole block normalizes to zero bytes.
+    fn next_block(&mut self, output: &mut [u8]) -> Option<usize> {
+        if self.bytes.is_empty() || output.is_empty() {
+            return None;
+        }
         // Printable text with single spaces keeps its length. Lowercase it in bulk.
         let n = self.bytes.len().min(output.len());
-        let input = &self.bytes[..n];
+        let (input, rest) = self.bytes.split_at(n);
+        self.bytes = rest;
         if n >= 64
             && !(self.space && input[0] == b' ')
             && input.iter().all(|b| (0x20..=0x7f).contains(b))
@@ -169,16 +182,11 @@ impl Read for NormalizedText<'_> {
         {
             output[..n].copy_from_slice(input);
             output[..n].make_ascii_lowercase();
-            self.bytes = &self.bytes[n..];
             self.space = input[n - 1] == b' ';
-            return Ok(n);
+            return Some(n);
         }
         let mut written = 0;
-        while written < output.len() {
-            let Some((&b, rest)) = self.bytes.split_first() else {
-                break;
-            };
-            self.bytes = rest;
+        for &b in input {
             let b = match b {
                 9..=13 | b' ' if !self.space => b' ',
                 0x21..=0x7f => b.to_ascii_lowercase(),
@@ -188,7 +196,52 @@ impl Read for NormalizedText<'_> {
             output[written] = b;
             written += 1;
         }
-        Ok(written)
+        Some(written)
+    }
+
+    pub(super) fn size(mut self, check: &mut dyn FnMut() -> io::Result<()>) -> io::Result<u64> {
+        let mut total = 0;
+        let mut buf = [0; 8192];
+        while let Some(n) = self.next_block(&mut buf) {
+            check()?;
+            total += n as u64;
+        }
+        Ok(total)
+    }
+
+    pub(super) fn into_bytes(
+        mut self,
+        directory: &Path,
+        check: &mut dyn FnMut() -> io::Result<()>,
+    ) -> io::Result<ObjectBytes<'a>> {
+        let source = self.bytes;
+        let mut prefix = 0;
+        let mut spool = None;
+        let mut buf = [0; 8192];
+        while let Some(n) = self.next_block(&mut buf) {
+            check()?;
+            let part = &buf[..n];
+            let file = match &mut spool {
+                Some(file) => file,
+                None if source[prefix..].starts_with(part) => {
+                    prefix += n;
+                    continue;
+                }
+                None => {
+                    let mut file = Snapshot::new(directory);
+                    for bytes in source[..prefix].chunks(64 * 1024) {
+                        check()?;
+                        file.write_all(bytes)?;
+                    }
+                    spool.insert(file)
+                }
+            };
+            file.write_all(part)?;
+        }
+        match spool {
+            Some(file) => file.into_bytes(),
+            None => Ok(ObjectBytes::Borrowed(&source[..prefix])),
+        }
     }
 }
 
@@ -196,12 +249,8 @@ pub(super) fn after_raw(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Ha
     if !plain(bytes) || parser(bytes).is_some() {
         return Ok(Handling::Unrecognized);
     }
-    let mut reader = NormalizedText {
-        bytes,
-        space: false,
-    };
     Ok(
-        if bytes.len() as u64 <= sink.text_limits().2 && sink.view(&mut reader, Target::Ascii)? {
+        if bytes.len() as u64 <= sink.text_limits().2 && sink.script_view(bytes)? {
             Handling::Stopped
         } else {
             Handling::Complete
@@ -229,22 +278,46 @@ mod normalized_text_tests {
             }
         }
         for size in [1, 2, 63, 64, 65, 257, 8191, 8192] {
-            let mut reader = NormalizedText {
-                bytes: &source,
-                space: false,
-            };
+            let mut reader = NormalizedText::new(&source);
             let mut actual = Vec::new();
             let mut buf = vec![0; size];
-            loop {
-                assert_eq!(reader.read(&mut [])?, 0);
-                let n = reader.read(&mut buf)?;
-                if n == 0 {
-                    break;
-                }
+            while let Some(n) = reader.next_block(&mut buf) {
                 actual.extend_from_slice(&buf[..n]);
             }
             assert_eq!(actual, expected, "read size {size}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn sparse_normalization_checks_input_and_preserves_a_late_change() -> io::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let input = vec![b' '; 128 * 1024];
+        for count_only in [false, true] {
+            let mut polls = 0;
+            let mut interrupt = || {
+                polls += 1;
+                if polls == 3 {
+                    Err(io::Error::other("cancelled"))
+                } else {
+                    Ok(())
+                }
+            };
+            let text = NormalizedText::new(&input);
+            let result = if count_only {
+                text.size(&mut interrupt).map(|_| ())
+            } else {
+                text.into_bytes(tmp.path(), &mut interrupt).map(|_| ())
+            };
+            assert_eq!(result.unwrap_err().to_string(), "cancelled");
+        }
+        let mut input = b"paper order ".repeat(12_000);
+        input.extend_from_slice(b"BOX\r\n");
+        let bytes = NormalizedText::new(&input).into_bytes(tmp.path(), &mut || Ok(()))?;
+        assert!(matches!(bytes, ObjectBytes::Mapped(_)));
+        let prefix = input.len() - 5;
+        assert_eq!(&bytes.as_ref()[..prefix], &input[..prefix]);
+        assert_eq!(&bytes.as_ref()[prefix..], b"box ");
         Ok(())
     }
 }

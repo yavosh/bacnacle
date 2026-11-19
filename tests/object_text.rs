@@ -366,3 +366,68 @@ fn spilled_normalized_receipt_matches() -> io::Result<()> {
 fn stock_spilled_normalized_receipt_matches() -> io::Result<()> {
     long_script_hash(Path::new("/usr/sbin/clamd"), true)
 }
+
+#[test]
+fn normalized_views_borrow_input_and_admit_scratch_by_output_size() -> io::Result<()> {
+    use barnacle::objects::{Options, Verdict, scan};
+    let tmp = tempfile::tempdir()?;
+    let missing = tmp.path().join("unused-spool");
+    let mut source = b"inventory receipt ".repeat(8192);
+    let original = source.len();
+    source.extend_from_slice(b"   \t\n");
+    for mapped in [false, true] {
+        let options = Options {
+            map_normalized_script: mapped,
+            ..Options::default()
+        };
+        let result = scan(
+            &source,
+            &options,
+            &missing,
+            |object, _| {
+                if object.normalized {
+                    assert_eq!(object.bytes, &source[..original]);
+                    assert_eq!(object.bytes.as_ptr(), source.as_ptr());
+                    assert_eq!(object.body_only, !mapped);
+                    assert_eq!(object.parents.len(), usize::from(mapped));
+                    return Ok(Verdict::Found("inventory".into()));
+                }
+                Ok(Verdict::Miss)
+            },
+            || Ok(()),
+        )?;
+        assert_eq!(result, Verdict::Found("inventory".into()));
+    }
+    source.make_ascii_uppercase();
+    let total = (source.len() + original) as u64;
+    for (max_scan_size, max_files, max_recursion, expected) in [
+        (total - 1, 1, 1, "MaxScanSize"),
+        (total, 1, 1, "MaxFiles"),
+        (total, 2, 1, "MaxRecursion"),
+        (0, 1, 1, "MaxFiles"),
+    ] {
+        let options = Options {
+            max_scan_size,
+            max_files,
+            max_recursion,
+            map_normalized_script: true,
+            alert_exceeds_max: true,
+            ..Options::default()
+        };
+        let result = scan(
+            &source,
+            &options,
+            &missing,
+            |object, _| {
+                assert!(!object.normalized);
+                Ok(Verdict::Miss)
+            },
+            || Ok(()),
+        )?;
+        assert_eq!(
+            result,
+            Verdict::Found(format!("Heuristics.Limits.Exceeded.{expected}"))
+        );
+    }
+    Ok(())
+}
