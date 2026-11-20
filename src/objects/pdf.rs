@@ -229,6 +229,7 @@ struct Object<'a> {
     filters: Vec<Filter>,
     image: bool,
     embedded: bool,
+    metadata: bool,
     object_stream: bool,
     directory: Option<object_stream::Directory>,
     unsupported: bool,
@@ -415,6 +416,7 @@ fn parse<'a>(data: &'a [u8], sink: &mut dyn ChildSink) -> io::Result<Option<Pdf<
                     }
                 }
                 b"/Image" => obj.image = true,
+                b"/Metadata" => obj.metadata = true,
                 b"/EmbeddedFile" => obj.embedded = true,
                 b"/ObjStm" => obj.object_stream = true,
                 b"/OpenAction" => {
@@ -534,6 +536,18 @@ pub(super) fn extract(data: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handl
         if obj.filters.contains(&Filter::Unsupported) {
             return Ok(Handling::Incomplete);
         }
+        let encrypted = if let Some(handler) = &pdf.security {
+            let Some(stream) = security::ciphertext(&data[obj.start..], bytes, &pdf.lengths) else {
+                return Ok(Handling::Incomplete);
+            };
+            // The pinned stream parser stops collecting filters at the first closing dictionary.
+            if !stream.filters_visible {
+                obj.filters.clear();
+            }
+            Some((handler, stream))
+        } else {
+            None
+        };
         let length = obj
             .length_ref
             .and_then(|id| pdf.lengths.get(&id).copied())
@@ -541,35 +555,78 @@ pub(super) fn extract(data: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handl
             .unwrap_or(0)
             .min(bytes.len());
         // The pinned fallback determines EOL width relative to the indirect object header.
-        let end = if length == 0 && !obj.filters.contains(&Filter::Flate) {
+        let visible_flate =
+            obj.filters.first() != Some(&Filter::Crypt) && obj.filters.contains(&Filter::Flate);
+        let end = if length == 0 && !visible_flate {
             trim_eol(&data[obj.start..obj.start + bytes.len()]).len()
         } else if bytes.len().saturating_sub(length) > 2 {
             bytes.len()
         } else {
             length
         };
-        let mut encrypted_flate = None;
-        let input_bytes = if let Some(handler) = &pdf.security {
-            let Some((cipher, filter_visible)) =
-                security::ciphertext(&data[obj.start..], bytes, &pdf.lengths)
-            else {
-                return Ok(Handling::Incomplete);
-            };
-            // Stock stops reading filter names at the first closing dictionary.
-            if !filter_visible && obj.filters == [Filter::Flate] {
+        if let Some((handler, stream)) = encrypted {
+            let mut name = None;
+            if obj.filters.first() == Some(&Filter::Crypt) {
+                // Stock's explicit Crypt stage consumes the stream without running subsequent filters.
                 obj.filters.clear();
+                name = stream.explicit.filter(|v| *v != b"Identity");
             }
-            match obj.filters.as_slice() {
-                [] => ObjectBytes::Borrowed(cipher),
-                [Filter::Flate] => {
-                    encrypted_flate = Some(handler);
-                    ObjectBytes::Borrowed(cipher)
+            if obj.filters.is_empty() && name.is_none() {
+                if physical_stream(&bytes[..end], content, sink)? {
+                    return Ok(Handling::Stopped);
                 }
-                _ => return Ok(Handling::Incomplete),
+                continue;
             }
-        } else {
-            ObjectBytes::Borrowed(&bytes[..end])
-        };
+            if !obj.filters.iter().all(|f| {
+                matches!(
+                    f,
+                    Filter::Flate | Filter::Hex | Filter::Ascii85 | Filter::RunLength
+                )
+            }) {
+                return Ok(Handling::Incomplete);
+            }
+            let mut retain = if sink.child_limit().is_some() {
+                filters::Retain::Count
+            } else {
+                filters::Retain::Verify
+            };
+            loop {
+                match handler.decode(&obj, name, stream.bytes, retain, sink)? {
+                    Output::Decoded(file) => {
+                        if file.with_bytes(|b| visit_stream(b, content, sink))? {
+                            return Ok(Handling::Stopped);
+                        }
+                    }
+                    Output::Counted(_) if retain == filters::Retain::Verify => {
+                        retain = filters::Retain::Keep;
+                        continue;
+                    }
+                    Output::Counted(size) => record_child_limit(size, sink),
+                    Output::TooLarge(size) => {
+                        sink.skip_declared_size(size);
+                    }
+                    Output::StageLimit(index, required) => {
+                        sink.skip_declared_size(required);
+                        if index == 0 {
+                            if physical_stream(&bytes[..end], content, sink)? {
+                                return Ok(Handling::Stopped);
+                            }
+                        } else {
+                            // The last successful filter output becomes the child on an allocation failure.
+                            obj.filters.truncate(index);
+                            continue;
+                        }
+                    }
+                    Output::Malformed | Output::UseInput => return Ok(Handling::Incomplete),
+                }
+                break;
+            }
+            continue;
+        }
+        if obj.filters.contains(&Filter::Crypt) {
+            return Ok(Handling::Incomplete);
+        }
+        let input_bytes = ObjectBytes::Borrowed(&bytes[..end]);
         let mut decoded: Option<Snapshot> = None;
         let mut directory = obj.directory;
         let mut filters = obj
@@ -589,10 +646,7 @@ pub(super) fn extract(data: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handl
             };
             let mut input_verdict = None;
             let mut next = |data: &[u8]| {
-                let result = match encrypted_flate.take() {
-                    Some(handler) => handler.inflate(obj.id, data, retain, sink)?,
-                    None => filter.decode(data, limit, retain, sink)?,
-                };
+                let result = filter.decode(data, limit, retain, sink)?;
                 if let Output::UseInput = result {
                     // The current stage still owns this borrowed input, including earlier filters' output.
                     input_verdict = Some(visit_stream(data, content, sink)?);
@@ -608,7 +662,7 @@ pub(super) fn extract(data: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handl
                     record_child_limit(size, sink);
                     continue 'objects;
                 }
-                Output::Malformed => return Ok(Handling::Incomplete),
+                Output::Malformed | Output::StageLimit(_, _) => return Ok(Handling::Incomplete),
                 Output::Decoded(output) => decoded = Some(output),
                 Output::UseInput => {
                     if input_verdict.expect("fallback visited the input") {
@@ -655,6 +709,13 @@ pub(super) fn extract(data: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handl
     packed.map_or(Ok(Handling::Complete), |packed| {
         packed.finish(retained.as_ref().map(AsRef::as_ref), sink)
     })
+}
+
+fn physical_stream(data: &[u8], content: bool, sink: &mut dyn ChildSink) -> io::Result<bool> {
+    if sink.skip_declared_size(data.len() as u64) {
+        return Ok(false);
+    }
+    visit_stream(data, content, sink)
 }
 
 fn record_child_limit(size: u64, sink: &mut dyn ChildSink) {

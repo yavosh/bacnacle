@@ -11,6 +11,21 @@ const FILES: &[(&str, &[u8])] = &[
     ("r4", include_bytes!("fixtures/pdf/open/r4.pdf")),
     ("r5", include_bytes!("fixtures/pdf/open/r5.pdf")),
     ("r6", include_bytes!("fixtures/pdf/open/r6.pdf")),
+    ("r2-rc4", include_bytes!("fixtures/pdf/open/r2-rc4.pdf")),
+    ("r3-rc4", include_bytes!("fixtures/pdf/open/r3-rc4.pdf")),
+    ("r4-rc4", include_bytes!("fixtures/pdf/open/r4-rc4.pdf")),
+    (
+        "r4-clear-metadata",
+        include_bytes!("fixtures/pdf/open/r4-clear-metadata.pdf"),
+    ),
+    (
+        "r6-clear-metadata",
+        include_bytes!("fixtures/pdf/open/r6-clear-metadata.pdf"),
+    ),
+    (
+        "r6-flate-hex",
+        include_bytes!("fixtures/pdf/open/r6-flate-hex.pdf"),
+    ),
 ];
 
 fn shipment_table() -> String {
@@ -30,6 +45,13 @@ fn hash(data: &[u8], name: &str) -> io::Result<String> {
         barnacle::hash_reader(data)?.md5_hex(),
         data.len()
     ))
+}
+
+fn physical_stream<'a>(bytes: &'a [u8], object: &[u8]) -> &'a [u8] {
+    let start = memchr::memmem::find(bytes, object).unwrap();
+    let start = start + memchr::memmem::find(&bytes[start..], b"stream\n").unwrap() + 7;
+    let end = start + memchr::memmem::find(&bytes[start..], b"endstream").unwrap();
+    &bytes[start..end]
 }
 
 fn check(exe: &Path, stock: bool) -> io::Result<()> {
@@ -128,6 +150,75 @@ fn check(exe: &Path, stock: bool) -> io::Result<()> {
             "Heuristics.Limits.Exceeded.MaxScanSize",
         )?;
     }
+    let original = include_bytes!("fixtures/pdf/open/r6.pdf");
+    let mut renamed = original.to_vec();
+    for offset in memchr::memmem::find_iter(original, b"/StdCF") {
+        renamed[offset..offset + 6].copy_from_slice(b"/AltCF");
+    }
+    check(&renamed, &note, "", "", "Note")?;
+    let eff = include_bytes!("fixtures/pdf/open/r6-explicit-eff.pdf");
+    let receipt = hash(
+        b"November warehouse delivery receipt, six notebooks.\n",
+        "Receipt",
+    )?;
+    check(eff, &receipt, "", "", "Receipt")?;
+    check(eff, &(receipt + &hash(eff, "Outer")?), "", "", "Outer")?;
+    let stored_mime = include_bytes!("fixtures/pdf/open/r6-stored-mime.pdf");
+    let physical = physical_stream(stored_mime, b"\n5 0 obj\n");
+    let declared = physical.strip_suffix(b"\n").unwrap();
+    assert_eq!((physical.len(), declared.len()), (81, 80));
+    let declared_rule = hash(declared, "DeclaredLength")?;
+    check(stored_mime, &declared_rule, "", "", "Miss")?;
+    check(
+        stored_mime,
+        &(declared_rule + &hash(physical, "PhysicalStream")?),
+        "",
+        "",
+        "PhysicalStream",
+    )?;
+    let explicit = include_bytes!("fixtures/pdf/open/r6-identity.pdf");
+    let with_eol = [NOTE, b"\n"].concat();
+    let identity = hash(&with_eol, "Identity")?;
+    check(explicit, &note, "", "", "Miss")?;
+    check(explicit, &(identity.clone() + &note), "", "", "Identity")?;
+    for (adjustment, expected) in [
+        (0, "Identity"),
+        (1, "Heuristics.Limits.Exceeded.MaxScanSize"),
+    ] {
+        check(
+            explicit,
+            &identity,
+            "",
+            &format!(
+                "MaxScanSize {}\nAlertExceedsMax yes",
+                explicit.len() + with_eol.len() - adjustment
+            ),
+            expected,
+        )?;
+    }
+    check(
+        explicit,
+        &identity,
+        "",
+        &format!(
+            "MaxScanSize {}\nMaxRecursion 1\nAlertExceedsMax yes",
+            explicit.len() + 1
+        ),
+        "Heuristics.Limits.Exceeded.MaxScanSize",
+    )?;
+    let named = include_bytes!("fixtures/pdf/open/r6-explicit-name.pdf");
+    let physical = physical_stream(named, b"\n7 0 obj\n");
+    let page = physical.strip_suffix(b"\n").unwrap();
+    assert_eq!((physical.len(), page.len()), (97, 96));
+    let with_eol = hash(physical, "PageWithEol")?;
+    check(named, &with_eol, "", "", "Miss")?;
+    check(
+        named,
+        &(with_eol + &hash(page, "PageBytes")?),
+        "",
+        "",
+        "PageBytes",
+    )?;
     let two = include_bytes!("fixtures/pdf/open/two.pdf");
     check(
         two,
@@ -212,13 +303,26 @@ fn check(exe: &Path, stock: bool) -> io::Result<()> {
         "Heuristics.Limits.Exceeded.MaxFiles",
     )?;
     let restricted = include_bytes!("fixtures/pdf/open/restricted.pdf");
+    check(restricted, &note, "", "", "Note")?;
     check(
         restricted,
-        &note,
+        &(note.clone() + &hash(restricted, "Outer")?),
         "",
         "",
-        if stock { "Note" } else { "Miss" },
+        "Outer",
     )?;
+    for (adjustment, expected) in [(0, "Note"), (1, "Heuristics.Limits.Exceeded.MaxScanSize")] {
+        check(
+            restricted,
+            &note,
+            "",
+            &format!(
+                "MaxScanSize {}\nAlertExceedsMax yes",
+                restricted.len() + NOTE.len() - adjustment
+            ),
+            expected,
+        )?;
+    }
     let locked = include_bytes!("fixtures/pdf/open/locked.pdf");
     check(locked, &note, "", "", "Miss")?;
     check(locked, &(note + &hash(locked, "Outer")?), "", "", "Outer")?;
@@ -283,6 +387,22 @@ fn denied_large_attachment_counts_without_creating_scratch() -> io::Result<()> {
     assert_eq!(
         result,
         Verdict::Found("Heuristics.Limits.Exceeded.MaxFiles".into())
+    );
+    let denied_size = Options {
+        max_scan_size: (bytes.len() + shipment_table().len() - 1) as u64,
+        alert_exceeds_max: true,
+        ..Options::default()
+    };
+    let result = scan(
+        bytes,
+        &denied_size,
+        &missing,
+        |_, _| Ok(Verdict::Miss),
+        || Ok(()),
+    )?;
+    assert_eq!(
+        result,
+        Verdict::Found("Heuristics.Limits.Exceeded.MaxScanSize".into())
     );
     let error = scan(
         bytes,

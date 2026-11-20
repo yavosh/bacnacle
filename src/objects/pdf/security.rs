@@ -1,9 +1,12 @@
 //! Open standard-security PDF streams using the empty user credential.
-use super::{ChildSink, Id, Output, Snapshot, Tokens};
+use super::filters::Retain;
+use super::{ChildSink, Filter, Id, Output, Snapshot, Tokens};
 use aes::cipher::{Block, BlockModeDecrypt, KeyIvInit, block_padding::Pkcs7, consts::U16};
 use flate2::{Decompress, FlushDecompress, Status};
+use lopdf::encryption::crypt_filters::{CryptFilter, IdentityCryptFilter, Rc4CryptFilter};
 use lopdf::{Dictionary, Document, EncryptionState, Object, ObjectId, StringFormat};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
+use std::sync::Arc;
 
 pub(super) const MAX_METADATA: usize = 16 * 1024;
 
@@ -148,11 +151,17 @@ fn mime_name(token: &[u8]) -> bool {
     })
 }
 
+pub(super) struct Stream<'a> {
+    pub bytes: &'a [u8],
+    pub filters_visible: bool,
+    pub explicit: Option<&'a [u8]>,
+}
+
 pub(super) fn ciphertext<'a>(
-    header: &[u8],
+    header: &'a [u8],
     stream: &'a [u8],
     lengths: &std::collections::HashMap<Id, usize>,
-) -> Option<(&'a [u8], bool)> {
+) -> Option<Stream<'a>> {
     let mut input = Tokens {
         data: &header[..header.len().min(MAX_METADATA)],
         pos: 0,
@@ -162,6 +171,7 @@ pub(super) fn ciphertext<'a>(
     }
     let mut depth = 1;
     let mut length = None;
+    let mut explicit = None;
     let mut filter_visible = false;
     let mut closed_dictionary = false;
     while depth != 0 {
@@ -174,6 +184,16 @@ pub(super) fn ciphertext<'a>(
             b"]" => depth -= 1,
             b"/Filter" if depth == 1 => filter_visible = !closed_dictionary,
             b"/Filter" => return None,
+            b"/DecodeParms" if depth == 1 => {
+                let rest = &input.data[input.pos..];
+                let dict = rest.strip_prefix(b"[").unwrap_or(rest);
+                if let Some(val) = dict.strip_prefix(b"<</Name/") {
+                    let n = val
+                        .iter()
+                        .position(|&b| super::white(b) || b"<>/[]()".contains(&b))?;
+                    explicit = Some(&val[..n]);
+                }
+            }
             b"/Length" if depth == 1 => {
                 if length.is_some() {
                     return None;
@@ -187,10 +207,18 @@ pub(super) fn ciphertext<'a>(
         }
     }
     let (cipher, rest) = stream.split_at_checked(length?)?;
-    matches!(rest, b"" | b"\n" | b"\r" | b"\r\n").then_some((cipher, filter_visible))
+    matches!(rest, b"" | b"\n" | b"\r" | b"\r\n").then_some(Stream {
+        bytes: cipher,
+        filters_visible: filter_visible,
+        explicit,
+    })
 }
 
-pub(super) struct Security(EncryptionState);
+pub(super) struct Security {
+    state: EncryptionState,
+    streams: Arc<dyn CryptFilter>,
+    attachments: Arc<dyn CryptFilter>,
+}
 
 impl Security {
     pub(super) fn open(id: Id, metadata: &[u8], trailer: &[u8]) -> Option<Self> {
@@ -204,24 +232,19 @@ impl Security {
         }
         let dict = dictionary(metadata)?;
         let revision = dict.get(b"R").ok()?.as_i64().ok()?;
-        let (method, version, length) = match revision {
-            4 => (b"AESV2", 4, 128),
-            5 | 6 => (b"AESV3", 5, 256),
-            _ => return None,
-        };
-        let cf = dict.get(b"CF").ok()?.as_dict().ok()?;
-        let std_cf = cf.get(b"StdCF").ok()?.as_dict().ok()?;
+        let version = dict.get(b"V").ok()?.as_i64().ok()?;
+        let length = dict
+            .get(b"Length")
+            .ok()
+            .map(Object::as_i64)
+            .transpose()
+            .ok()?
+            .unwrap_or(40);
         if dict.get(b"Filter").ok()?.as_name().ok()? != b"Standard"
-            || dict.get(b"V").ok()?.as_i64().ok()? != version
-            || dict.get(b"Length").ok()?.as_i64().ok()? != length
-            || std_cf.get(b"Length").ok()?.as_i64().ok()? != length / 8
-            || dict.get(b"StmF").ok()?.as_name().ok()? != b"StdCF"
-            || dict.get(b"StrF").ok()?.as_name().ok()? != b"StdCF"
-            || std_cf.get(b"CFM").ok()?.as_name().ok()? != method
-            || std_cf.get(b"AuthEvent").ok()?.as_name().ok()? != b"DocOpen"
-            || dict.get(b"P").ok()?.as_i64().ok()? & 0x10 == 0
-            || dict.has(b"EFF")
-            || dict.has(b"EncryptMetadata")
+            || !matches!(
+                (revision, version, length),
+                (2, 1, 40) | (3, 2, 128) | (4, 4, 128) | (5 | 6, 5, 256)
+            )
         {
             return None;
         }
@@ -231,41 +254,181 @@ impl Security {
         doc.objects.insert(id, Object::Dictionary(dict));
         doc.authenticate_raw_user_password(b"").ok()?;
         let state = EncryptionState::decode(&doc, b"").ok()?;
-        (state.get_stream_filter().method() == method).then_some(Self(state))
+        let dict = doc.get_encrypted().ok()?;
+        let selected = |name: &[u8]| -> Option<Arc<dyn CryptFilter>> {
+            if revision < 4 {
+                return Some(Arc::new(Rc4CryptFilter));
+            }
+            if name == b"Identity" || name.is_empty() {
+                return Some(Arc::new(IdentityCryptFilter));
+            }
+            let cf = dict
+                .get(b"CF")
+                .ok()?
+                .as_dict()
+                .ok()?
+                .get(name)
+                .ok()?
+                .as_dict()
+                .ok()?;
+            let method = cf.get(b"CFM").ok()?.as_name().ok()?;
+            if !matches!(
+                (revision, method),
+                (4, b"AESV2" | b"V2") | (5 | 6, b"AESV3")
+            ) || cf
+                .get(b"Length")
+                .is_ok_and(|n| n.as_i64().ok() != Some(length / 8))
+                || cf
+                    .get(b"AuthEvent")
+                    .is_ok_and(|v| !matches!(v.as_name(), Ok(b"DocOpen" | b"EFOpen")))
+            {
+                return None;
+            }
+            state
+                .crypt_filters()
+                .get(name)
+                .filter(|f| f.method() == method)
+                .cloned()
+        };
+        let stream_name = dict
+            .get(b"StmF")
+            .ok()
+            .map(Object::as_name)
+            .transpose()
+            .ok()?
+            .unwrap_or(b"Identity");
+        let streams = selected(stream_name)?;
+        let attachments = match dict.get(b"EFF") {
+            Ok(name) => selected(name.as_name().ok()?)?,
+            Err(_) => streams.clone(),
+        };
+        Some(Self {
+            state,
+            streams,
+            attachments,
+        })
     }
 
-    pub(super) fn inflate(
+    pub(super) fn decode(
         &self,
-        id: Id,
+        obj: &super::Object,
+        explicit: Option<&[u8]>,
         bytes: &[u8],
-        retain: bool,
+        retain: Retain,
         sink: &mut dyn ChildSink,
     ) -> io::Result<Output> {
-        if bytes.len() < 32 || !bytes.len().is_multiple_of(16) {
-            return Ok(Output::Malformed);
+        let filters = &obj.filters;
+        let id = obj.id;
+        let filter = if let Some(name) = explicit {
+            let Some(filter) = self.state.crypt_filters().get(name) else {
+                return Ok(Output::Malformed);
+            };
+            filter
+        } else if obj.embedded {
+            &self.attachments
+        } else {
+            &self.streams
+        };
+        if filter.method() == b"Identity" || obj.metadata && !self.state.encrypt_metadata() {
+            return super::filters::chain(bytes, filters, retain, sink);
         }
         let (Ok(n), Ok(generation)) = (id.0.try_into(), id.1.try_into()) else {
             return Ok(Output::Malformed);
         };
-        let filter = self.0.get_stream_filter();
-        let Ok(key) = filter.compute_key(self.0.file_encryption_key(), (n, generation)) else {
+        let Ok(key) = filter.compute_key(self.state.file_encryption_key(), (n, generation)) else {
             return Ok(Output::Malformed);
         };
-        if filter.method() == b"AESV2" {
-            inflate::<cbc::Decryptor<aes::Aes128>>(&key, bytes, retain, sink)
-        } else {
-            inflate::<cbc::Decryptor<aes::Aes256>>(&key, bytes, retain, sink)
+        match filter.method() {
+            b"AESV2" => {
+                aes_filters::<cbc::Decryptor<aes::Aes128>>(&key, bytes, filters, retain, sink)
+            }
+            b"AESV3" => {
+                aes_filters::<cbc::Decryptor<aes::Aes256>>(&key, bytes, filters, retain, sink)
+            }
+            b"V2" => super::filters::chain(Rc4Input::new(bytes, &key), filters, retain, sink),
+            _ => Ok(Output::Malformed),
         }
     }
 }
 
+struct Rc4Input<'a> {
+    data: &'a [u8],
+    state: [u8; 256],
+    i: u8,
+    j: u8,
+}
+impl<'a> Rc4Input<'a> {
+    fn new(data: &'a [u8], key: &[u8]) -> Self {
+        let mut state = std::array::from_fn(|i| i as u8);
+        let mut j = 0u8;
+        for i in 0..256 {
+            j = j.wrapping_add(state[i]).wrapping_add(key[i % key.len()]);
+            state.swap(i, usize::from(j));
+        }
+        Self {
+            data,
+            state,
+            i: 0,
+            j: 0,
+        }
+    }
+}
+impl Read for Rc4Input<'_> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        let len = self.data.len().min(out.len()).min(8192);
+        for (plain, &cipher) in out[..len].iter_mut().zip(self.data) {
+            self.i = self.i.wrapping_add(1);
+            self.j = self.j.wrapping_add(self.state[usize::from(self.i)]);
+            self.state.swap(usize::from(self.i), usize::from(self.j));
+            let t = self.state[usize::from(self.i)].wrapping_add(self.state[usize::from(self.j)]);
+            *plain = cipher ^ self.state[usize::from(t)];
+        }
+        self.data = &self.data[len..];
+        Ok(len)
+    }
+}
+
+struct AesInput<'a, D> {
+    decoder: D,
+    data: &'a [u8],
+    buf: [u8; 8192],
+    start: usize,
+    end: usize,
+    padding: usize,
+}
+impl<D: BlockModeDecrypt<BlockSize = U16>> Read for AesInput<'_, D> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if self.start == self.end {
+            let n = self.data.len().min(self.buf.len());
+            if n == 0 {
+                return Ok(0);
+            }
+            let (chunk, rest) = self.data.split_at(n);
+            self.data = rest;
+            self.buf[..n].copy_from_slice(chunk);
+            self.decoder
+                .decrypt_blocks(Block::<D>::slice_as_chunks_mut(&mut self.buf[..n]).0);
+            self.start = 0;
+            self.end = if rest.is_empty() { n - self.padding } else { n };
+        }
+        let n = (self.end - self.start).min(out.len());
+        out[..n].copy_from_slice(&self.buf[self.start..self.start + n]);
+        self.start += n;
+        Ok(n)
+    }
+}
+
 // Verify the final padding before accepting a zlib member that ends early.
-fn inflate<D: BlockModeDecrypt<BlockSize = U16> + KeyIvInit>(
+fn aes_filters<D: BlockModeDecrypt<BlockSize = U16> + KeyIvInit>(
     key: &[u8],
     bytes: &[u8],
-    retain: bool,
+    filters: &[Filter],
+    retain: Retain,
     sink: &mut dyn ChildSink,
 ) -> io::Result<Output> {
+    if bytes.len() < 32 || !bytes.len().is_multiple_of(16) {
+        return Ok(Output::Malformed);
+    }
     let end = bytes.len();
     let Ok(last) = D::new_from_slices(key, &bytes[end - 32..end - 16]) else {
         return Ok(Output::Malformed);
@@ -276,11 +439,27 @@ fn inflate<D: BlockModeDecrypt<BlockSize = U16> + KeyIvInit>(
     };
     let padding = 16 - tail.len();
     let mut decoder = D::new_from_slices(key, &bytes[..16]).expect("validated key and IV");
+    if filters != [Filter::Flate] {
+        return super::filters::chain(
+            AesInput {
+                decoder,
+                data: &bytes[16..],
+                buf: [0; 8192],
+                start: 0,
+                end: 0,
+                padding,
+            },
+            filters,
+            retain,
+            sink,
+        );
+    }
     let mut zlib = Decompress::new(true);
     let mut compressed = [0; 8192];
     let mut plain = [0; 8192];
     let limit = sink.remaining();
-    let mut output = retain.then(|| Snapshot::new(sink.temporary_directory()));
+    let mut output = (retain != Retain::Count).then(|| Snapshot::new(sink.temporary_directory()));
+    let capacity = super::filters::flate_capacity(limit);
     let mut chunks = bytes[16..].chunks(compressed.len()).peekable();
     while let Some(chunk) = chunks.next() {
         let final_chunk = chunks.peek().is_none();
@@ -300,14 +479,30 @@ fn inflate<D: BlockModeDecrypt<BlockSize = U16> + KeyIvInit>(
             let Ok(status) = zlib.decompress(input, &mut plain, flush) else {
                 return Ok(Output::Malformed);
             };
+            if zlib.total_out() > capacity {
+                return Ok(Output::StageLimit(0, capacity.saturating_add(256 * 1024)));
+            }
             if zlib.total_out() > limit {
-                return Ok(Output::TooLarge(limit.saturating_add(1)));
+                output = None;
+            }
+            if retain == Retain::Verify && zlib.total_out() > Snapshot::MEMORY_LIMIT as u64 {
+                // Each remaining DEFLATE bit can produce at most 129 bytes. Include a pending match.
+                let upper = zlib
+                    .total_out()
+                    .saturating_add(258)
+                    .saturating_add((bytes.len() as u64 - zlib.total_in()).saturating_mul(1032));
+                if upper > limit {
+                    output = None;
+                }
             }
             let written = (zlib.total_out() - before_out) as usize;
             if let Some(output) = &mut output {
                 output.write_all(&plain[..written])?;
             }
             if status == Status::StreamEnd {
+                if zlib.total_out() > limit {
+                    return Ok(Output::TooLarge(zlib.total_out()));
+                }
                 return Ok(output.map_or(Output::Counted(zlib.total_out()), Output::Decoded));
             }
             let used = (zlib.total_in() - before_in) as usize;

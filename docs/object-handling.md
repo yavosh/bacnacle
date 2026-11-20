@@ -318,8 +318,8 @@ Document names come from the winning signature. [End-to-end fixtures](../tests/o
 | Nested inputs | ZIP containing a PDF and a PDF with competing raw and child rules. |
 | Policies and truncated input | Parser disabled, recursion and expanded-size alerts, a missing final trailer, and a truncated stream. |
 | Packed indirect objects | Stored and Flate object streams, packed page dictionaries, content arrays, indirect lengths, and physical stream order. [Object-stream comparisons](../tests/object_pdf_streams.rs) |
-| Standard encryption | Classic xref tables and qpdf AES-128 (R4) or AES-256 (R5/R6). An empty user password must authenticate and allow extraction. |
-| Additional PDF stages | Other encryption layouts, JavaScript actions and other stream filters require further comparisons. |
+| Standard encryption | Classic xref tables, qpdf RC4 (R2–R4), AES-128 (R4), and AES-256 (R5/R6). The empty user password must authenticate. |
+| Additional PDF stages | Encrypted packed objects, JavaScript actions, and other stream filters require further comparisons. |
 
 For physical objects, both daemons scan the referenced page dictionary for an explicit catalog opening destination.
 An inline local GoTo exposes the catalog. An indirect local action exposes the referenced object at its physical position.
@@ -328,7 +328,30 @@ Both daemons detect the Flate-compressed plaintext attachment after the outer PD
 Both scan stored attachments as ciphertext. A Flate filter after the first closing dictionary also preserves the ciphertext.
 Direct embedded-file MIME subtypes can encode the slash as `#2f` or `#2F`.
 Barnacle bounds security metadata to 16 KiB. It decrypts and inflates in 8 KiB blocks. Excluded children need no scratch file.
+The comparisons cover restricted copy permissions, named stream filters, explicit embedded-file defaults, and cleartext metadata flags.
+Stock scans physical bytes for the sampled explicit `Crypt` records. That range can include the line ending before `endstream`.
+Flate and ASCIIHex can decode in sequence. The final attachment can fit its scan budget even when its intermediate is larger.
+A Flate stage that cannot grow past its allowed block leaves its input eligible for matching.
+When the output could exceed the byte limit, Barnacle counts it before writing large decoded attachments to disk.
 Encrypted packed objects, unsupported filters, and documents requiring credentials yield incomplete coverage. [Security comparisons](../tests/object_pdf_security.rs)
+
+Four clients scanned a 117,423-byte PDF with restricted copy permissions and a 221,880-byte CSV attachment.
+Each engine used three fresh containers on one pinned ARM64 CPU with 2 GiB of RAM and scan caching disabled.
+Barnacle reached 463 scans/s at 19.42 ms p95. Stock clamd reached 250 scans/s at 21.66 ms p95.
+Median peak cgroup memory was 3.55 MiB for Barnacle and 8.20 MiB for stock.
+It includes the driver and charged file-backed pages. All 3,078 replies matched the local attachment hash rule.
+The Barnacle release binary SHA-256 was `7b6f168146b251574e80a1aa9463dbd2bd2656fa2ad621af7193174ba9f14b7f`.
+[Raw measurements](benchmarks/object-pdf-restricted.csv)
+
+To create the workload, use qpdf 12.4.2 with the shipment fixture and omit object streams.
+
+```sh
+qpdf --object-streams=disable --decrypt tests/fixtures/pdf/open/shipments.pdf shipments-plain.pdf
+qpdf --object-streams=disable --encrypt '' '' 256 --allow-insecure --extract=n -- \
+  shipments-plain.pdf shipments-restricted.pdf
+```
+
+Load `6df41fb06ea3f20d42a7fd3cf48b1aad:221880:PdfQa.Shipments` as the only rule.
 
 Barnacle indexes only the requested object IDs. The PDF parser admits at most 65,536 physical objects.
 The tests cover all eight explicit destination modes, local named destinations, sparse IDs, backward references, and ZIP attachments.
