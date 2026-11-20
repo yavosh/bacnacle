@@ -80,7 +80,9 @@ fn compound(entries: &[(&str, &[u8])]) -> io::Result<Vec<u8>> {
     let mut doc =
         cfb::CompoundFile::create_with_version(cfb::Version::V3, Cursor::new(Vec::new()))?;
     for (name, data) in entries {
-        doc.create_stream(name)?.write_all(data)?;
+        let path = Path::new(name);
+        doc.create_storage_all(path.parent().unwrap())?;
+        doc.create_stream(path)?.write_all(data)?;
     }
     Ok(doc.into_inner().into_inner())
 }
@@ -493,26 +495,29 @@ fn stock_excel_pictures() -> io::Result<()> {
 #[test]
 fn picture_parent_and_filename() -> io::Result<()> {
     let temp = tempfile::tempdir()?;
-    let mut count = 0;
-    scan(
-        EXCEL,
-        &Options::default(),
-        temp.path(),
-        |obj, _| {
-            if obj.bytes == DOTS {
-                assert_eq!(
-                    obj.parents.iter().map(|p| p.file_type).collect::<Vec<_>>(),
-                    ["CL_TYPE_MSOLE2"]
-                );
-                assert_eq!(obj.layer.file_type, "CL_TYPE_PNG");
-                assert!(obj.layer.name.is_none());
-                count += 1;
-            }
-            Ok(Verdict::Miss)
-        },
-        || Ok(()),
-    )?;
-    assert_eq!(count, 1);
+    let nested = compound(&[("Sheet/Workbook", &authored_drawing()?)])?;
+    for file in [EXCEL, &nested] {
+        let mut count = 0;
+        scan(
+            file,
+            &Options::default(),
+            temp.path(),
+            |obj, _| {
+                if obj.bytes == DOTS {
+                    assert_eq!(
+                        obj.parents.iter().map(|p| p.file_type).collect::<Vec<_>>(),
+                        ["CL_TYPE_MSOLE2"]
+                    );
+                    assert_eq!(obj.layer.file_type, "CL_TYPE_PNG");
+                    assert!(obj.layer.name.is_none());
+                    count += 1;
+                }
+                Ok(Verdict::Miss)
+            },
+            || Ok(()),
+        )?;
+        assert_eq!(count, 1);
+    }
     Ok(())
 }
 
@@ -523,6 +528,7 @@ fn stock_picture_parent_and_filename() -> io::Result<()> {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect::<String>();
+    let nested = compound(&[("Sheet/Workbook", &authored_drawing()?)])?;
     for (parent, expected) in [("CL_TYPE_MSOLE2", Some("Parent")), ("CL_TYPE_MSXL", None)] {
         let rules = format!(
             "Xls.Parent;Engine:81-255,Target:0,Container:{parent},FileSize:{0}-{0};0;{needle}\n",
@@ -530,6 +536,7 @@ fn stock_picture_parent_and_filename() -> io::Result<()> {
         );
         let s = Server::start(true, "", "", "", &rules)?;
         s.check(parent, EXCEL, expected)?;
+        s.check(parent, &nested, expected)?;
         s.check("direct PNG", DOTS, None)?;
     }
     let s = Server::start(
@@ -563,34 +570,226 @@ fn stock_picture_parent_and_filename() -> io::Result<()> {
     Ok(())
 }
 
+fn delayed_png(size: usize, offset: u32, name: &[u8]) -> Vec<u8> {
+    let mut reference = vec![0; 36];
+    reference[..2].fill(6);
+    reference[20..24].copy_from_slice(&(size as u32).to_le_bytes());
+    reference[24] = 1;
+    reference[28..32].copy_from_slice(&offset.to_le_bytes());
+    reference[33] = name.len() as u8;
+    reference.extend(name);
+    art(0xf007, 0x62, &reference)
+}
+
+fn compare_delayed_and_multiple_workbooks(stock: bool) -> io::Result<()> {
+    let raw_png = picture(0xf01e, 0x6e0, DOTS, false);
+    let png = picture(0xf01e, 0x6e0, DOTS, true);
+    let jpg = picture(0xf01d, 0x46a, JPEG, true);
+    let delayed = delayed_png(raw_png.len(), 8, b"P\0i\0c\0\0\0");
+    let delayed_only = workbook(std::slice::from_ref(&delayed), &[], 0x3c);
+    let delayed_then_inline = workbook(&[delayed, jpg.clone()], &[], 0x3c);
+    let trailing = single(&[delayed_then_inline.as_slice(), raw_png.as_slice()].concat())?;
+    let padded = single(&[delayed_then_inline.as_slice(), &[0; 4096]].concat())?;
+    let mut padded_authored = Vec::new();
+    cfb::CompoundFile::open(Cursor::new(EXCEL))?
+        .open_stream("Workbook")?
+        .read_to_end(&mut padded_authored)?;
+    padded_authored.resize(padded_authored.len() + 512, 0);
+    let padded_authored = single(&padded_authored)?;
+    let adjacent = single(&workbook(
+        &[
+            delayed_png(raw_png.len(), 0, &[]),
+            raw_png.clone(),
+            jpg.clone(),
+        ],
+        &[],
+        0x3c,
+    ))?;
+    let delay_stream = [&[0; 8][..], raw_png.as_slice()].concat();
+    let in_data = compound(&[("Workbook", &delayed_then_inline), ("Data", &delay_stream)])?;
+    let in_pictures = compound(&[
+        ("Workbook", &delayed_then_inline),
+        ("Sheet/Pictures", &delay_stream),
+    ])?;
+    let png_book = workbook(&[png], &[], 0x3c);
+    let jpg_book = workbook(&[jpg], &[], 0x3c);
+    let root_book = compound(&[("Workbook", &png_book), ("Book", &jpg_book)])?;
+    let reversed_book = compound(&[("Book", &jpg_book), ("Workbook", &png_book)])?;
+    let nested = compound(&[("Sheet/Workbook", &jpg_book)])?;
+    let root_and_nested = compound(&[("Workbook", &png_book), ("Sheet/Workbook", &jpg_book)])?;
+    let delayed_and_nested =
+        compound(&[("Workbook", &delayed_only), ("Sheet/Workbook", &jpg_book)])?;
+    let empty = biff(0xa, &[]);
+    let drawing_free_root = compound(&[("Workbook", &empty), ("Sheet/Workbook", &jpg_book)])?;
+    let shadowed_book = compound(&[("Book", &jpg_book), ("Workbook", &empty)])?;
+
+    let png_rule = hash("Dots", DOTS)?;
+    let jpg_rule = hash("Jpeg", JPEG)?;
+    let image_rules = png_rule.clone() + &jpg_rule;
+    let outer = hash("Outer", &delayed_and_nested)? + &hash("Outer", &shadowed_book)?;
+    let server = Server::start(stock, "", &(image_rules.clone() + &outer), "", "")?;
+    for (name, file, expected) in [
+        ("delayed Data followed by inline picture", &in_data, "Jpeg"),
+        (
+            "delayed Pictures followed by inline picture",
+            &in_pictures,
+            "Jpeg",
+        ),
+        ("delayed entry followed by a bare PNG", &adjacent, "Dots"),
+        ("zero-padded Workbook", &padded, "Jpeg"),
+        ("Workbook before Book", &root_book, "Dots"),
+        ("Workbook before earlier Book", &reversed_book, "Dots"),
+        ("nested Workbook", &nested, "Jpeg"),
+        ("root before nested Workbook", &root_and_nested, "Dots"),
+        (
+            "delayed-only root stops nested drawing pass",
+            &delayed_and_nested,
+            "Outer",
+        ),
+        (
+            "drawing-free root permits nested Workbook",
+            &drawing_free_root,
+            "Jpeg",
+        ),
+        (
+            "drawing-free Workbook shadows root Book",
+            &shadowed_book,
+            "Outer",
+        ),
+    ] {
+        server.check(name, file, Some(expected))?;
+    }
+    let png_only = Server::start(stock, "", &png_rule, "", "")?;
+    png_only.check("Data delay image remains unscanned", &in_data, None)?;
+    png_only.check("Pictures delay image remains unscanned", &in_pictures, None)?;
+    Server::start(stock, "", &jpg_rule, "", "")?.check(
+        "root picture miss permits nested Workbook",
+        &root_and_nested,
+        Some("Jpeg"),
+    )?;
+    for (count, expected) in [(2, "Heuristics.Limits.Exceeded.MaxFiles"), (3, "Jpeg")] {
+        let config = format!("MaxFiles {count}\nAlertExceedsMax yes");
+        Server::start(stock, &config, &jpg_rule, "", "")?.check(
+            "root picture miss consumes one slot before the nested picture",
+            &root_and_nested,
+            Some(expected),
+        )?;
+    }
+    let report = hash("Report", REPORT)?;
+    let reports = Server::start(
+        stock,
+        "",
+        &(image_rules.clone() + &report + &hash("Outer", &trailing)?),
+        "",
+        "",
+    )?;
+    reports.check(
+        "report precedes the later inline picture",
+        &in_data,
+        Some("Report"),
+    )?;
+    reports.check(
+        "bare OfficeArt after EOF leaves the outer hash eligible",
+        &trailing,
+        Some("Outer"),
+    )?;
+    reports.check(
+        "zero padding changes the report hash",
+        &padded,
+        Some("Jpeg"),
+    )?;
+    reports.check(
+        "authored padded Workbook keeps the picture eligible",
+        &padded_authored,
+        Some("Dots"),
+    )?;
+    let padded_report = "4135b615fd510e9d7a93ba8d19fbb979:4213:Xls.PaddedReport\n";
+    Server::start(stock, "", &(image_rules.clone() + padded_report), "", "")?.check(
+        "exact padded report precedes the picture",
+        &padded_authored,
+        Some("PaddedReport"),
+    )?;
+    for (options, expected) in [
+        ("ScanOLE2 no".to_owned(), None),
+        (
+            "MaxFiles 1\nAlertExceedsMax yes".into(),
+            Some("Heuristics.Limits.Exceeded.MaxFiles"),
+        ),
+        ("MaxFiles 2\nAlertExceedsMax yes".into(), Some("Jpeg")),
+        (
+            "MaxRecursion 1\nAlertExceedsMax yes".into(),
+            Some("Heuristics.Limits.Exceeded.MaxRecursion"),
+        ),
+        (
+            format!(
+                "MaxScanSize {}\nAlertExceedsMax yes",
+                in_data.len() + JPEG.len()
+            ),
+            Some("Jpeg"),
+        ),
+        (
+            format!(
+                "MaxScanSize {}\nAlertExceedsMax yes",
+                in_data.len() + JPEG.len() - 1
+            ),
+            Some("Heuristics.Limits.Exceeded.MaxScanSize"),
+        ),
+    ] {
+        Server::start(stock, &options, &image_rules, "", "")?
+            .check(&options, &in_data, expected)?;
+    }
+    Ok(())
+}
+
 #[test]
-fn unsupported_drawings_and_report_layouts_are_incomplete() -> io::Result<()> {
+fn barnacle_delayed_and_multiple_workbooks() -> io::Result<()> {
+    compare_delayed_and_multiple_workbooks(false)
+}
+
+#[test]
+#[ignore = "requires pinned Debian clamd"]
+fn stock_delayed_and_multiple_workbooks() -> io::Result<()> {
+    compare_delayed_and_multiple_workbooks(true)?;
+    let png = workbook(&[picture(0xf01e, 0x6e0, DOTS, true)], &[], 0x3c);
+    let jpg = workbook(&[picture(0xf01d, 0x46a, JPEG, true)], &[], 0x3c);
+    let rules = hash("Dots", DOTS)? + &hash("Jpeg", JPEG)?;
+    let stock = Server::start(true, "", &rules, "", "")?;
+    let barnacle = Server::start(false, "", &rules, "", "")?;
+    let left = ("Notes/Workbook", png.as_slice());
+    let right = ("Inventory/Workbook", jpg.as_slice());
+    for order in [[left, right], [right, left]] {
+        let frame = stream_frame(&compound(&order)?)?;
+        let expected = unix_request(&stock.sock, &frame)?;
+        assert!(matches!(
+            expected.as_str(),
+            "stream: Xls.Dots.UNOFFICIAL FOUND\0" | "stream: Xls.Jpeg.UNOFFICIAL FOUND\0"
+        ));
+        assert_eq!(unix_request(&barnacle.sock, &frame)?, expected);
+    }
+    Ok(())
+}
+
+#[test]
+fn unsupported_report_layout_is_incomplete() -> io::Result<()> {
     let tmp = tempfile::tempdir()?;
     let png = picture(0xf01e, 0x6e0, DOTS, true);
     let ordinary = workbook(std::slice::from_ref(&png), &[], 0x3c);
     let mut long = biff(0x7777, &[]).repeat(300);
     long.extend_from_slice(&ordinary);
-    let both = compound(&[("Workbook", &ordinary), ("Book", &ordinary)])?;
-    let mut delayed_header = vec![0; 36];
-    delayed_header[0] = 6;
-    delayed_header[28..32].copy_from_slice(&500u32.to_le_bytes());
-    let delayed = workbook(&[art(0xf007, 0x62, &delayed_header)], &[], 0x3c);
-    for image in [single(&long)?, both, single(&delayed)?] {
-        let verdict = scan(
-            &image,
-            &Options::default(),
-            tmp.path(),
-            |obj, _| {
-                Ok(if obj.bytes == DOTS {
-                    Verdict::Found("early picture".into())
-                } else {
-                    Verdict::Miss
-                })
-            },
-            || Ok(()),
-        )?;
-        assert_eq!(verdict, Verdict::Incomplete);
-    }
+    let verdict = scan(
+        &single(&long)?,
+        &Options::default(),
+        tmp.path(),
+        |obj, _| {
+            Ok(if obj.bytes == DOTS {
+                Verdict::Found("early picture".into())
+            } else {
+                Verdict::Miss
+            })
+        },
+        || Ok(()),
+    )?;
+    assert_eq!(verdict, Verdict::Incomplete);
     Ok(())
 }
 

@@ -120,7 +120,7 @@ fn label(code: u16) -> Option<&'static str> {
         0x0029 => "BOTTOMMARGIN : Bottom Margin Measurement",
         0x002a => "PRINTHEADERS : Print Row/Column Labels",
         0x002b => "PRINTGRIDLINES : Print Gridlines Flag",
-        0x0031 => "<unknown>",
+        0x0000 | 0x0031 => "<unknown>",
         0x003d => "WINDOW1 : Window Information",
         0x0040 => "BACKUP : Save Backup Version of the File",
         0x0042 => "CODEPAGE : Default Code Page",

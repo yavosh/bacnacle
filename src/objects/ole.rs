@@ -140,27 +140,16 @@ fn visit(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handling> {
         return hwp::scan(&mut doc, &directory, flags, sink);
     }
     if !temporary_pass {
-        let mut pictures = None;
-        let mut workbooks = 0;
+        let mut pictures = false;
         for entry in &directory.streams {
-            if named(entry, &["workbook", "book"]) {
-                workbooks += 1;
-            }
             match office::kind(&mut doc, &directory, entry, sink)? {
                 office::Kind::Ordinary => {}
-                office::Kind::Pictures if entry.depth == 1 => pictures = Some(entry),
+                office::Kind::Pictures => pictures = true,
                 _ => return Ok(Handling::Incomplete),
             }
         }
-        if let Some(entry) = pictures {
-            if workbooks != 1 {
-                return Ok(Handling::Incomplete);
-            }
-            if entry.name.eq_ignore_ascii_case("book") {
-                // This name selects the picture pass, but stock opens only the Workbook stream.
-                return Ok(Handling::Complete);
-            }
-            return drawing::scan(Input::open(&mut doc, &directory, entry)?, sink);
+        if pictures {
+            return temporary::workbooks(&mut doc, &directory, sink);
         }
         for (preceding, entry) in directory.streams.iter().enumerate() {
             sink.check()?;

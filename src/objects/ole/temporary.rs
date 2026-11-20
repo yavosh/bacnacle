@@ -153,3 +153,87 @@ pub(super) fn scan(
         .visit(scratch.path(), 0, doc, directory, sink)?
         .unwrap_or(Handling::Complete))
 }
+
+fn workbook(
+    doc: &mut Document,
+    directory: &Inventory,
+    id: usize,
+    sink: &mut dyn ChildSink,
+) -> io::Result<Option<Handling>> {
+    super::drawing::scan(
+        super::Input::open(doc, directory, &directory.streams[id])?,
+        sink,
+    )
+}
+
+impl Layout {
+    fn workbook_children(
+        &self,
+        path: &Path,
+        entries: &HashMap<usize, usize>,
+        doc: &mut Document,
+        directory: &Inventory,
+        sink: &mut dyn ChildSink,
+    ) -> io::Result<Option<Handling>> {
+        for entry in fs::read_dir(path)? {
+            sink.check()?;
+            let file = entry?;
+            if !file.file_type()?.is_dir() {
+                continue;
+            }
+            let name = file.file_name();
+            let Some(folder) = name.to_str().and_then(|n| self.folders.get(n)) else {
+                continue;
+            };
+            if let Some(&id) = entries.get(folder)
+                && let Some(result) = workbook(doc, directory, id, sink)?
+            {
+                return Ok(Some(result));
+            }
+            if let Some(result) =
+                self.workbook_children(&file.path(), entries, doc, directory, sink)?
+            {
+                return Ok(Some(result));
+            }
+        }
+        Ok(None)
+    }
+}
+
+pub(super) fn workbooks(
+    doc: &mut Document,
+    directory: &Inventory,
+    sink: &mut dyn ChildSink,
+) -> io::Result<Handling> {
+    if sink.remaining() == 0 {
+        return Ok(Handling::Complete);
+    }
+    // Either Book or Workbook can enable the pass. Only streams named Workbook are opened.
+    let books = directory
+        .streams
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.name.eq_ignore_ascii_case("workbook"));
+    if let Some((id, _)) = books.clone().find(|(_, entry)| entry.depth == 1)
+        && let Some(result) = workbook(doc, directory, id, sink)?
+    {
+        return Ok(result);
+    }
+    let mut nested = books.filter(|(_, entry)| entry.depth > 1);
+    let Some((first, storage)) = nested.next() else {
+        return Ok(Handling::Complete);
+    };
+    let Some((second, other)) = nested.next() else {
+        return Ok(workbook(doc, directory, first, sink)?.unwrap_or(Handling::Complete));
+    };
+    let mut entries: HashMap<_, _> = nested.map(|(id, entry)| (entry.parent, id)).collect();
+    entries.insert(storage.parent, first);
+    entries.insert(other.parent, second);
+    let scratch = tempfile::tempdir_in(sink.temporary_directory())?;
+    let Some(layout) = Layout::create(scratch.path(), directory, sink)? else {
+        return Ok(Handling::Incomplete);
+    };
+    Ok(layout
+        .workbook_children(scratch.path(), &entries, doc, directory, sink)?
+        .unwrap_or(Handling::Complete))
+}

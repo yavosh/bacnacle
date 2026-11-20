@@ -14,7 +14,7 @@ const REPORT_HEADER: &[u8] = b"-- BIFF content extracted and disassembled from C
 fn report_line_bound(opcode: u16) -> Option<usize> {
     Some(match opcode {
         0x0018 | 0x0207 => return None, // Name and String have variable listings.
-        0x0031 => 24,                   // FONT has no label in the reference listing.
+        0x0000 | 0x0031 => 24,          // Padding and FONT have no label in the reference listing.
         0x000a => 32,                   // EOF
         0x00e0 => 35,                   // XF
         0x0809 | 0x0022 | 0x00a1 | 0x00fc | 0x0293 => 40,
@@ -54,12 +54,13 @@ fn formula_bound(data: &[u8]) -> Option<usize> {
     Some(bound)
 }
 
-pub(super) fn scan(mut input: Input<'_>, sink: &mut dyn ChildSink) -> io::Result<Handling> {
+pub(super) fn scan(mut input: Input<'_>, sink: &mut dyn ChildSink) -> io::Result<Option<Handling>> {
     let mut group = sink
         .child_limit()
         .is_none()
         .then(|| Snapshot::new(sink.temporary_directory()));
     let mut previous_group = false;
+    let mut after_eof = false;
     let report_can_fit = REPORT_HEADER.len() as u64 <= sink.remaining();
     let mut report_bound = 0u64;
     let mut large_report = false;
@@ -73,8 +74,12 @@ pub(super) fn scan(mut input: Input<'_>, sink: &mut dyn ChildSink) -> io::Result
         let opcode = u16::from_le_bytes([header[0], header[1]]);
         let size = u16::from_le_bytes([header[2], header[3]]) as usize;
         if size > MAX_RECORD || size as u64 > remaining - 4 {
-            return Ok(Handling::Incomplete);
+            if after_eof && trailing_blips(&mut input, header, remaining, sink)? {
+                return Ok(Some(Handling::Complete));
+            }
+            return Ok(Some(Handling::Incomplete));
         }
+        after_eof = opcode == 0x000a && size == 0;
         if report_can_fit {
             let line = if opcode == 0x0006 {
                 input.read_exact(&mut buf[..size])?;
@@ -106,7 +111,7 @@ pub(super) fn scan(mut input: Input<'_>, sink: &mut dyn ChildSink) -> io::Result
         if previous_group && let Some(group) = &mut group {
             group_len += size as u64;
             if group_len >= 1 << 30 {
-                return Ok(Handling::Incomplete);
+                return Ok(Some(Handling::Incomplete));
             }
             input.read_exact(&mut buf[..size])?;
             group.write_all(&buf[..size])?;
@@ -118,28 +123,62 @@ pub(super) fn scan(mut input: Input<'_>, sink: &mut dyn ChildSink) -> io::Result
     let Some(group) = group else {
         let preamble = REPORT_HEADER.len() as u64;
         if sink.skip_declared_size(preamble) {
-            return Ok(Handling::Complete);
+            return Ok(Some(Handling::Complete));
         }
         let maximum = preamble.saturating_add(report_bound / 4096 * 4096);
         if maximum > sink.remaining() {
-            return report::scan(&mut input, sink, false);
+            return report::scan(&mut input, sink, false).map(Some);
         }
         sink.can_enter_child();
-        return Ok(Handling::Complete);
+        return Ok(Some(Handling::Complete));
     };
     if large_report {
         let maximum = (REPORT_HEADER.len() as u64).saturating_add(report_bound / 4096 * 4096);
         let retain = maximum <= sink.remaining();
         let result = report::scan(&mut input, sink, retain)?;
         if result != Handling::Complete {
-            return Ok(result);
+            return Ok(Some(result));
         }
     } else if !sink.skip_declared_size(REPORT_HEADER.len() as u64)
         && sink.match_generic_view(REPORT_HEADER)?
     {
-        return Ok(Handling::Stopped);
+        return Ok(Some(Handling::Stopped));
+    }
+    if group_len == 0 {
+        return Ok(None);
     }
     group.with_bytes(|data| pictures(data, sink))
+}
+
+// A bare OfficeArt delay stream after BIFF EOF makes stock abandon this pass before
+// publishing the report or pictures. Verify every record without copying its payload.
+fn trailing_blips(
+    input: &mut Input<'_>,
+    mut header: [u8; 4],
+    mut remaining: u64,
+    sink: &mut dyn ChildSink,
+) -> io::Result<bool> {
+    while remaining >= 8 {
+        sink.check()?;
+        let flags = u16::from_le_bytes([header[0], header[1]]);
+        let kind = u16::from_le_bytes([header[2], header[3]]);
+        let Some(prefix) = image_prefix(flags & 15, flags >> 4, kind) else {
+            return Ok(false);
+        };
+        let mut len = [0; 4];
+        input.read_exact(&mut len)?;
+        let len = u64::from(u32::from_le_bytes(len));
+        if len < prefix as u64 || len > remaining - 8 {
+            return Ok(false);
+        }
+        remaining -= 8 + len;
+        if remaining < 8 {
+            return Ok(remaining == 0);
+        }
+        input.seek(SeekFrom::Current(len as i64))?;
+        input.read_exact(&mut header)?;
+    }
+    Ok(false)
 }
 
 struct Record<'a> {
@@ -147,68 +186,95 @@ struct Record<'a> {
     instance: u16,
     kind: u16,
     body: &'a [u8],
+    len: usize,
 }
 
-fn record<'a>(data: &mut &'a [u8]) -> Option<Record<'a>> {
+fn record_header(data: &[u8]) -> Option<Record<'_>> {
     let (head, tail) = data.split_at_checked(8)?;
     let flags = u16::from_le_bytes([head[0], head[1]]);
     let len = u32::from_le_bytes(head[4..8].try_into().ok()?) as usize;
-    let (body, rest) = tail.split_at_checked(len)?;
-    *data = rest;
+    let body = &tail[..len.min(tail.len())];
     Some(Record {
         version: flags & 15,
         instance: flags >> 4,
         kind: u16::from_le_bytes([head[2], head[3]]),
         body,
+        len,
     })
 }
 
-fn pictures(mut data: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handling> {
+fn record<'a>(data: &mut &'a [u8]) -> Option<Record<'a>> {
+    let record = record_header(data)?;
+    *data = data.get(8..)?.get(record.len..)?;
+    Some(record)
+}
+
+fn pictures(mut data: &[u8], sink: &mut dyn ChildSink) -> io::Result<Option<Handling>> {
     let Some(group) = record(&mut data) else {
-        return Ok(Handling::Incomplete);
+        return Ok(Some(Handling::Incomplete));
     };
     if group.kind != 0xf000 || group.version != 15 || group.instance != 0 || !data.is_empty() {
-        return Ok(Handling::Incomplete);
+        return Ok(Some(Handling::Incomplete));
     }
     let mut children = group.body;
     while !children.is_empty() {
         sink.check()?;
         let Some(container) = record(&mut children) else {
-            return Ok(Handling::Incomplete);
+            return Ok(Some(Handling::Incomplete));
         };
         if container.kind != 0xf001 {
             continue;
         }
         if container.version != 15 {
-            return Ok(Handling::Incomplete);
+            return Ok(Some(Handling::Incomplete));
         }
         let mut files = container.body;
+        let mut scanned = false;
         while !files.is_empty() {
             sink.check()?;
             let block = files;
             let Some(entry) = record(&mut files) else {
-                return Ok(Handling::Incomplete);
+                return Ok(Some(Handling::Incomplete));
             };
             let image = match entry.kind {
-                0xf007 => inline(entry),
+                0xf007 => match stored_picture(entry, files) {
+                    Some(Picture::Data(image)) => Some(image),
+                    Some(Picture::Skip) => continue,
+                    Some(Picture::End) => {
+                        // A short image header ends this store. A store that
+                        // emitted no image also ends the workbook traversal.
+                        if !scanned {
+                            return Ok(Some(Handling::Complete));
+                        }
+                        break;
+                    }
+                    None => None,
+                },
                 // For a bare BLIP stock bounds its image by the entire remaining store.
                 _ => image(entry, &block[8..]),
             };
             let Some(image) = image else {
-                return Ok(Handling::Incomplete);
+                return Ok(Some(Handling::Incomplete));
             };
             if sink.skip_declared_size(image.len() as u64) {
-                return Ok(Handling::Complete);
+                return Ok(Some(Handling::Complete));
             }
+            scanned = true;
             if sink.child_bytes(image, None)? {
-                return Ok(Handling::Stopped);
+                return Ok(Some(Handling::Stopped));
             }
         }
     }
-    Ok(Handling::Complete)
+    Ok(None)
 }
 
-fn inline(entry: Record<'_>) -> Option<&[u8]> {
+enum Picture<'a> {
+    Data(&'a [u8]),
+    Skip,
+    End,
+}
+
+fn stored_picture<'a>(entry: Record<'a>, following: &'a [u8]) -> Option<Picture<'a>> {
     if entry.version != 2 {
         return None;
     }
@@ -216,6 +282,22 @@ fn inline(entry: Record<'_>) -> Option<&[u8]> {
     let size = u32::from_le_bytes(header[20..24].try_into().ok()?) as usize;
     let name_len = usize::from(header[33]);
     let mut data = entry.body.get(36 + name_len..)?;
+    if data.is_empty() {
+        // Stock reads a candidate header after the FBSE name in the same store.
+        // The declared size bounds this lookahead; foDelay selects no external stream.
+        let visible = &following[..size.min(following.len())];
+        let Some(blip) = record_header(visible) else {
+            return Some(Picture::End);
+        };
+        if blip.kind == 0xf007 && blip.version == 2 {
+            return Some(Picture::Skip);
+        }
+        let prefix = image_prefix(blip.version, blip.instance, blip.kind)?;
+        if visible.len() - 8 < prefix {
+            return Some(Picture::Skip);
+        }
+        return image(blip, &visible[8..]).map(Picture::Data);
+    }
     if data.len() != size {
         return None;
     }
@@ -224,15 +306,15 @@ fn inline(entry: Record<'_>) -> Option<&[u8]> {
         return None;
     }
     let storage = blip.body;
-    image(blip, storage)
+    image(blip, storage).map(Picture::Data)
 }
 
-fn image<'a>(record: Record<'a>, storage: &'a [u8]) -> Option<&'a [u8]> {
-    if record.version != 0 {
+fn image_prefix(version: u16, instance: u16, kind: u16) -> Option<usize> {
+    if version != 0 {
         return None;
     }
     // After the identifiers, stock skips a 34-byte metafile header or one bitmap tag.
-    let (first, header) = match (record.kind, record.instance) {
+    let (first, header) = match (kind, instance) {
         (0xf01a, _) => (0x3d4, 34),                     // EMF
         (0xf01b, _) => (0x216, 34),                     // WMF
         (0xf01c, _) => (0x542, 34),                     // PICT
@@ -243,11 +325,15 @@ fn image<'a>(record: Record<'a>, storage: &'a [u8]) -> Option<&'a [u8]> {
         (0xf029, _) => (0x6e4, 1),                      // TIFF
         _ => return None,
     };
-    let identifiers = match record.instance.checked_sub(first)? {
+    let identifiers = match instance.checked_sub(first)? {
         0 => 16,
         1 => 32,
         _ => return None,
     };
-    let bytes = storage.get(identifiers + header..)?;
-    Some(&bytes[..record.body.len().min(bytes.len())])
+    Some(identifiers + header)
+}
+
+fn image<'a>(record: Record<'a>, storage: &'a [u8]) -> Option<&'a [u8]> {
+    let bytes = storage.get(image_prefix(record.version, record.instance, record.kind)?..)?;
+    Some(&bytes[..record.len.min(bytes.len())])
 }

@@ -523,7 +523,22 @@ Both daemons scan the 4,213-byte report first, then the three stored picture pay
 At 4,212 available scan bytes, the WMF signature wins. The WMF and EMF payloads retain their zlib encoding.
 With OLE scanning disabled, the workbook hash wins. [Authored workbook](../tests/fixtures/xls/README.md)
 
-Delayed picture data, multiple Workbook streams, and mixed Office extraction passes remain unverified. [OfficeArt picture records](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-odraw/c67b883b-8136-4e91-a1a3-2981d16e934f)
+Stock skips external `Data` and `Pictures` delay streams during the Excel drawing pass.
+An inline picture after an unresolved reference can still match. A bare picture immediately after the reference in the same store can match first.
+Stock prefers the root `Workbook` over `Book`. A missed picture in the root can leave a nested `Workbook` eligible.
+An unresolved delayed-only root store can stop that traversal. The scratch filesystem determines the order of competing sibling workbooks.
+Complete unframed picture records after BIFF EOF leave the outer file eligible for matching.
+Zero padding inside the Workbook stream contributes lines to the report. The picture stays eligible when that report misses.
+Mixed Excel drawing and other Office extractor passes still need matching behavior.
+[Picture store entry specification](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-odraw/2f2d7f5e-d5c4-4cb7-b230-59b3fe8f10d6) · [Rust comparisons](../tests/object_ole_xls.rs)
+
+Four clients scanned an 88,064-byte workbook with a delayed PNG and an inline 81,160-byte bitmap.
+Each engine used three fresh containers on one pinned ARM64 CPU with 2 GiB of RAM and caching disabled.
+Barnacle reached 2,898 scans/s at 2.44 ms p95. Stock clamd reached 1,336 scans/s at 7.17 ms p95.
+Median peak cgroup memory was 4.25 MiB for Barnacle and 6.02 MiB for stock, including the driver and charged file-backed pages.
+All 3,078 replies matched the same local MD5 rule, `fbb077e639642f31fb93db9a0241dac7:81160:OfficePass.Bitmap`.
+The Barnacle release binary SHA-256 was `dde4f901a905f6018d1b85f06fad0a0cd784365a3888f696621347222edd7d45`.
+[Raw measurements](benchmarks/object-xls-workbooks.csv)
 
 Both daemons scan top-level PowerPoint `ExOleObjStg` zlib payloads before the root presentation stream and its file hash.
 A root native Package still wins. A presentation inside a storage receives its attachment pass after the root raw-stream pass.
