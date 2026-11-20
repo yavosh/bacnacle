@@ -12,6 +12,7 @@ struct Layout {
     files: HashMap<String, usize>,
     native: HashMap<usize, Vec<usize>>,
     presentations: HashMap<usize, usize>,
+    workbooks: HashMap<usize, usize>,
     folders: HashMap<String, usize>,
 }
 
@@ -19,12 +20,14 @@ impl Layout {
     fn create(
         root: &Path,
         directory: &Inventory,
+        pictures: bool,
         sink: &mut dyn ChildSink,
     ) -> io::Result<Option<Self>> {
         let mut layout = Self {
             files: HashMap::new(),
             native: HashMap::new(),
             presentations: HashMap::new(),
+            workbooks: HashMap::new(),
             folders: HashMap::new(),
         };
         let mut counts = HashMap::new();
@@ -57,6 +60,9 @@ impl Layout {
                     if entry.name.eq_ignore_ascii_case("powerpoint document") {
                         layout.presentations.insert(entry.parent, id);
                     }
+                    if pictures && entry.name.eq_ignore_ascii_case("workbook") {
+                        layout.workbooks.insert(entry.parent, id);
+                    }
                     if native(&entry.name) {
                         layout.native.entry(entry.parent).or_default().push(id);
                     }
@@ -72,31 +78,26 @@ impl Layout {
         doc: &mut Document,
         directory: &Inventory,
         sink: &mut dyn ChildSink,
-    ) -> io::Result<bool> {
+    ) -> io::Result<Option<Handling>> {
         for file in fs::read_dir(path)? {
             sink.check()?;
             let file = file?;
-            let mut stopped = false;
             if file.file_type()?.is_dir() {
-                stopped = self.raw_walk(&file.path(), doc, directory, sink)?;
+                if let Some(result) = self.raw_walk(&file.path(), doc, directory, sink)? {
+                    return Ok(Some(result));
+                }
             } else if let Some((name, &id)) = file
                 .file_name()
                 .to_str()
                 .and_then(|n| self.files.get_key_value(n))
             {
-                stopped = raw(
-                    doc,
-                    directory,
-                    &directory.streams[id],
-                    Some(name.as_bytes()),
-                    sink,
-                )?;
-            }
-            if stopped {
-                return Ok(true);
+                let stream = &directory.streams[id];
+                if let Some(result) = raw(doc, directory, stream, Some(name.as_bytes()), sink)? {
+                    return Ok(Some(result));
+                }
             }
         }
-        Ok(false)
+        Ok(None)
     }
 
     fn visit(
@@ -123,8 +124,13 @@ impl Layout {
         {
             return Ok(Some(result));
         }
-        if self.raw_walk(path, doc, directory, sink)? {
-            return Ok(Some(Handling::Stopped));
+        if let Some(&id) = self.workbooks.get(&folder)
+            && let Some(result) = workbook(doc, directory, id, sink)?
+        {
+            return Ok(Some(result));
+        }
+        if let Some(result) = self.raw_walk(path, doc, directory, sink)? {
+            return Ok(Some(result));
         }
         for entry in fs::read_dir(path)? {
             sink.check()?;
@@ -143,10 +149,11 @@ impl Layout {
 pub(super) fn scan(
     doc: &mut Document,
     directory: &Inventory,
+    pictures: bool,
     sink: &mut dyn ChildSink,
 ) -> io::Result<Handling> {
     let scratch = tempfile::tempdir_in(sink.temporary_directory())?;
-    let Some(layout) = Layout::create(scratch.path(), directory, sink)? else {
+    let Some(layout) = Layout::create(scratch.path(), directory, pictures, sink)? else {
         return Ok(Handling::Incomplete);
     };
     Ok(layout
@@ -170,7 +177,6 @@ impl Layout {
     fn workbook_children(
         &self,
         path: &Path,
-        entries: &HashMap<usize, usize>,
         doc: &mut Document,
         directory: &Inventory,
         sink: &mut dyn ChildSink,
@@ -185,14 +191,12 @@ impl Layout {
             let Some(folder) = name.to_str().and_then(|n| self.folders.get(n)) else {
                 continue;
             };
-            if let Some(&id) = entries.get(folder)
+            if let Some(&id) = self.workbooks.get(folder)
                 && let Some(result) = workbook(doc, directory, id, sink)?
             {
                 return Ok(Some(result));
             }
-            if let Some(result) =
-                self.workbook_children(&file.path(), entries, doc, directory, sink)?
-            {
+            if let Some(result) = self.workbook_children(&file.path(), doc, directory, sink)? {
                 return Ok(Some(result));
             }
         }
@@ -205,9 +209,6 @@ pub(super) fn workbooks(
     directory: &Inventory,
     sink: &mut dyn ChildSink,
 ) -> io::Result<Handling> {
-    if sink.remaining() == 0 {
-        return Ok(Handling::Complete);
-    }
     // Either Book or Workbook can enable the pass. Only streams named Workbook are opened.
     let books = directory
         .streams
@@ -220,20 +221,17 @@ pub(super) fn workbooks(
         return Ok(result);
     }
     let mut nested = books.filter(|(_, entry)| entry.depth > 1);
-    let Some((first, storage)) = nested.next() else {
+    let Some((first, _)) = nested.next() else {
         return Ok(Handling::Complete);
     };
-    let Some((second, other)) = nested.next() else {
+    if nested.next().is_none() {
         return Ok(workbook(doc, directory, first, sink)?.unwrap_or(Handling::Complete));
-    };
-    let mut entries: HashMap<_, _> = nested.map(|(id, entry)| (entry.parent, id)).collect();
-    entries.insert(storage.parent, first);
-    entries.insert(other.parent, second);
+    }
     let scratch = tempfile::tempdir_in(sink.temporary_directory())?;
-    let Some(layout) = Layout::create(scratch.path(), directory, sink)? else {
+    let Some(layout) = Layout::create(scratch.path(), directory, true, sink)? else {
         return Ok(Handling::Incomplete);
     };
     Ok(layout
-        .workbook_children(scratch.path(), &entries, doc, directory, sink)?
+        .workbook_children(scratch.path(), doc, directory, sink)?
         .unwrap_or(Handling::Complete))
 }

@@ -4,7 +4,7 @@ use cfb::CompoundFile;
 use directory::{Inventory, Stream};
 use input::Input;
 use md5::{Digest, Md5};
-use std::io::{self, BufRead, BufReader, Cursor, Read};
+use std::io::{self, BufRead, BufReader, Cursor, Read, Seek};
 
 mod directory;
 mod drawing;
@@ -64,7 +64,11 @@ fn payload(stream: Input, sink: &mut dyn ChildSink) -> io::Result<bool> {
         }
         n = size(&mut input)?;
     }
-    sink.child(&mut input.take(n.into()), None, None)
+    let bytes = u64::from(n).min(total - input.stream_position()?);
+    if bytes <= 5 || sink.skip_declared_size(bytes) {
+        return Ok(false);
+    }
+    sink.child(&mut input.take(bytes), None, None)
 }
 
 fn raw(
@@ -73,9 +77,18 @@ fn raw(
     entry: &Stream,
     filename: Option<&[u8]>,
     sink: &mut dyn ChildSink,
-) -> io::Result<bool> {
+) -> io::Result<Option<Handling>> {
+    if entry.size <= 5 {
+        return Ok(None);
+    }
+    if sink.skip_declared_size(entry.size) {
+        // A rejected temporary file ends this directory pass. The parent can still match.
+        return Ok(filename.map(|_| Handling::Complete));
+    }
     let mut stream = Input::open(doc, directory, entry)?;
-    sink.child(&mut stream, None, filename)
+    Ok(sink
+        .child(&mut stream, None, filename)?
+        .then_some(Handling::Stopped))
 }
 
 // Stock scans the temporary stream files under their hashed names on the Package path.
@@ -113,6 +126,10 @@ fn native_payload(
 }
 
 fn visit(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handling> {
+    // A container that consumed the last scan byte does not enter the OLE passes.
+    if sink.remaining() == 0 {
+        return Ok(Handling::Complete);
+    }
     let Some(directory) = Inventory::read(bytes, sink)? else {
         return Ok(Handling::Incomplete);
     };
@@ -139,15 +156,31 @@ fn visit(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handling> {
         }
         return hwp::scan(&mut doc, &directory, flags, sink);
     }
-    if !temporary_pass {
-        let mut pictures = false;
-        for entry in &directory.streams {
-            match office::kind(&mut doc, &directory, entry, sink)? {
-                office::Kind::Ordinary => {}
-                office::Kind::Pictures => pictures = true,
-                _ => return Ok(Handling::Incomplete),
+    if temporary_pass {
+        // Root Package attachments precede the Office-specific passes.
+        for entry in directory
+            .streams
+            .iter()
+            .rev()
+            .filter(|e| e.depth == 1 && native(&e.name))
+        {
+            if native_payload(&mut doc, &directory, entry, sink)? {
+                return Ok(Handling::Stopped);
             }
         }
+    }
+    let mut pictures = false;
+    for entry in &directory.streams {
+        if temporary_pass && named(entry, &["_vba_project", "dir"]) {
+            return Ok(Handling::Incomplete);
+        }
+        match office::kind(&mut doc, &directory, entry, sink)? {
+            office::Kind::Ordinary => {}
+            office::Kind::Pictures => pictures = true,
+            office::Kind::Unsupported => return Ok(Handling::Incomplete),
+        }
+    }
+    if !temporary_pass {
         if pictures {
             return temporary::workbooks(&mut doc, &directory, sink);
         }
@@ -156,32 +189,14 @@ fn visit(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handling> {
             if sink.ole_directory_limit(entry.depth, preceding) {
                 break;
             }
-            if raw(&mut doc, &directory, entry, None, sink)? {
-                return Ok(Handling::Stopped);
+            if let Some(result) = raw(&mut doc, &directory, entry, None, sink)? {
+                return Ok(result);
             }
         }
         return Ok(Handling::Complete);
     }
-    // Root Package attachments precede the Office-specific passes.
-    for entry in directory
-        .streams
-        .iter()
-        .rev()
-        .filter(|e| e.depth == 1 && native(&e.name))
-    {
-        if native_payload(&mut doc, &directory, entry, sink)? {
-            return Ok(Handling::Stopped);
-        }
-    }
-    for entry in &directory.streams {
-        if named(entry, &["_vba_project", "dir"])
-            || !matches!(
-                office::kind(&mut doc, &directory, entry, sink)?,
-                office::Kind::Ordinary
-            )
-        {
-            return Ok(Handling::Incomplete);
-        }
+    if pictures {
+        return temporary::scan(&mut doc, &directory, true, sink);
     }
     let mut candidates = directory
         .streams
@@ -192,7 +207,7 @@ fn visit(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handling> {
         return Ok(Handling::Complete);
     };
     if candidates.next().is_some() {
-        return temporary::scan(&mut doc, &directory, sink);
+        return temporary::scan(&mut doc, &directory, false, sink);
     }
     let Some(normalized) = normalized_name(&entry.name) else {
         return Ok(Handling::Incomplete);
@@ -219,8 +234,8 @@ fn visit(bytes: &[u8], sink: &mut dyn ChildSink) -> io::Result<Handling> {
         {
             return Ok(result);
         }
-        if raw(&mut doc, &directory, entry, Some(name.as_bytes()), sink)? {
-            return Ok(Handling::Stopped);
+        if let Some(result) = raw(&mut doc, &directory, entry, Some(name.as_bytes()), sink)? {
+            return Ok(result);
         }
     }
     Ok(Handling::Complete)

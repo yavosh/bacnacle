@@ -769,6 +769,195 @@ fn stock_delayed_and_multiple_workbooks() -> io::Result<()> {
     Ok(())
 }
 
+fn compare_mixed_office_passes(stock: bool) -> io::Result<()> {
+    let workbook = workbook(&[picture(0xf01e, 0x6e0, DOTS, true)], &[], 0x3c);
+    let word = b"Passive Word stream description.\n";
+    let note = b"A note attached to the inventory workbook.\n";
+    let slide = b"Inventory notes from the presentation attachment.\n";
+    let mut zlib = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    zlib.write_all(slide)?;
+    let compressed = [
+        (slide.len() as u32).to_le_bytes().as_slice(),
+        &zlib.finish()?,
+    ]
+    .concat();
+    let presentation = art(0x1011, 0x10, &compressed);
+    let mut native = b"\x02\0note.txt\0note.txt\0\0\0\0\0\0\0\0\0note.txt\0".to_vec();
+    native.extend((note.len() as u32).to_le_bytes());
+    native.extend(note);
+    let package = [(native.len() as u32).to_le_bytes().as_slice(), &native].concat();
+    let root_word = compound(&[("Workbook", &workbook), ("WordDocument", word)])?;
+    let nested_workbook = compound(&[("Sheet/Workbook", &workbook), ("WordDocument", word)])?;
+    let root_package = compound(&[("Workbook", &workbook), ("\x01Ole10Native", &package)])?;
+    let nested_package = compound(&[("Workbook", &workbook), ("Sheet/\x01Ole10Native", &package)])?;
+    let root_slide = compound(&[
+        ("Workbook", &workbook),
+        ("PowerPoint Document", &presentation),
+    ])?;
+    let root_all = compound(&[
+        ("Workbook", &workbook),
+        ("PowerPoint Document", &presentation),
+        ("\x01Ole10Native", &package),
+    ])?;
+    let nested_slide = compound(&[
+        ("Workbook", &workbook),
+        ("Sheet/PowerPoint Document", &presentation),
+    ])?;
+    let nested_all = compound(&[
+        ("Sheet/Workbook", &workbook),
+        ("Sheet/PowerPoint Document", &presentation),
+        ("Sheet/\x01Ole10Native", &package),
+    ])?;
+    let picture_rule = hash("Dots", DOTS)?;
+    let workbook_rule = hash("Workbook", &workbook)?;
+    let report_rule = hash("Report", REPORT)?;
+    let attachment_rule = hash("Attachment", note)?;
+    let slide_rule = hash("Slide", slide)?;
+    let picture_and_raw = picture_rule.clone() + &workbook_rule;
+    let all = picture_and_raw.clone() + &report_rule + &attachment_rule + &slide_rule;
+    let server = Server::start(stock, "", &all, "", "")?;
+    for (label, doc, expected) in [
+        (
+            "root Workbook report before Word raw pass",
+            &root_word,
+            "Report",
+        ),
+        (
+            "raw nested Workbook before its report",
+            &nested_workbook,
+            "Workbook",
+        ),
+        ("root Package before report", &root_package, "Attachment"),
+        ("root Package before PowerPoint", &root_all, "Attachment"),
+        (
+            "root PowerPoint attachment before report",
+            &root_slide,
+            "Slide",
+        ),
+        (
+            "root report before nested Package",
+            &nested_package,
+            "Report",
+        ),
+    ] {
+        server.check(label, doc, Some(expected))?;
+    }
+    let without_report = Server::start(stock, "", &picture_and_raw, "", "")?;
+    without_report.check("root picture before raw Workbook", &root_word, Some("Dots"))?;
+    without_report.check(
+        "root picture before raw Package pass",
+        &root_package,
+        Some("Dots"),
+    )?;
+    let raw = Server::start(stock, "", &workbook_rule, "", "")?;
+    raw.check(
+        "raw Workbook is eligible after the drawing miss",
+        &root_word,
+        Some("Workbook"),
+    )?;
+    let attachment = Server::start(stock, "", &attachment_rule, "", "")?;
+    attachment.check(
+        "nested Package is eligible after root passes",
+        &nested_package,
+        Some("Attachment"),
+    )?;
+    let picture = Server::start(stock, "", &picture_rule, "", "")?;
+    picture.check(
+        "nested picture is eligible after the raw miss",
+        &nested_workbook,
+        Some("Dots"),
+    )?;
+    let children = Server::start(
+        stock,
+        "",
+        &(picture_rule.clone() + &slide_rule + &attachment_rule),
+        "",
+        "",
+    )?;
+    children.check(
+        "root drawing before nested PowerPoint",
+        &nested_slide,
+        Some("Dots"),
+    )?;
+    children.check(
+        "nested Package before its sibling PowerPoint and drawing",
+        &nested_all,
+        Some("Attachment"),
+    )?;
+
+    let count = "MaxFiles 2\nAlertExceedsMax yes";
+    let file_limit = "Heuristics.Limits.Exceeded.MaxFiles";
+    let limited = Server::start(stock, count, &picture_rule, "", "")?;
+    limited.check("root Word keeps the picture slot", &root_word, Some("Dots"))?;
+    limited.check(
+        "root Package consumes the picture slot",
+        &root_package,
+        Some(file_limit),
+    )?;
+    limited.check(
+        "raw nested Workbook consumes the picture slot",
+        &nested_workbook,
+        Some(file_limit),
+    )?;
+    let outer_rule = hash("Outer", &root_package)?;
+    for options in [
+        "ScanOLE2 no",
+        "MaxFiles 1\nAlertExceedsMax yes",
+        "MaxRecursion 1\nAlertExceedsMax yes",
+    ] {
+        Server::start(stock, options, &(all.clone() + &outer_rule), "", "")?.check(
+            "outer file remains eligible when children are excluded",
+            &root_package,
+            Some("Outer"),
+        )?;
+    }
+    let exact = format!(
+        "MaxScanSize {}\nMaxRecursion 1\nAlertExceedsMax yes",
+        root_slide.len()
+    );
+    Server::start(stock, &exact, &all, "", "")?.check(
+        "zero remaining bytes skip the Office passes",
+        &root_slide,
+        None,
+    )?;
+    let exact = format!(
+        "MaxScanSize {}\nAlertExceedsMax yes",
+        nested_all.len() + note.len()
+    );
+    Server::start(stock, &exact, &(all + &hash("Outer", &nested_all)?), "", "")?.check(
+        "oversized raw stream stops the nested attachment pass",
+        &nested_all,
+        Some("Outer"),
+    )?;
+    for (room, limit) in [
+        (note.len() - 1, "MaxScanSize"),
+        (note.len(), "MaxRecursion"),
+    ] {
+        let config = format!(
+            "MaxScanSize {}\nMaxRecursion 1\nAlertExceedsMax yes",
+            root_package.len() + room
+        );
+        let expected = format!("Heuristics.Limits.Exceeded.{limit}");
+        Server::start(stock, &config, &attachment_rule, "", "")?.check(
+            "recovered Package size precedes the recursion limit",
+            &root_package,
+            Some(&expected),
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn barnacle_mixed_office_passes() -> io::Result<()> {
+    compare_mixed_office_passes(false)
+}
+
+#[test]
+#[ignore = "requires pinned Debian clamd"]
+fn stock_mixed_office_passes() -> io::Result<()> {
+    compare_mixed_office_passes(true)
+}
+
 #[test]
 fn unsupported_report_layout_is_incomplete() -> io::Result<()> {
     let tmp = tempfile::tempdir()?;

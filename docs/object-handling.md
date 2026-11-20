@@ -529,8 +529,14 @@ Stock prefers the root `Workbook` over `Book`. A missed picture in the root can 
 An unresolved delayed-only root store can stop that traversal. The scratch filesystem determines the order of competing sibling workbooks.
 Complete unframed picture records after BIFF EOF leave the outer file eligible for matching.
 Zero padding inside the Workbook stream contributes lines to the report. The picture stays eligible when that report misses.
-Mixed Excel drawing and other Office extractor passes still need matching behavior.
 [Picture store entry specification](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-odraw/2f2d7f5e-d5c4-4cb7-b230-59b3fe8f10d6) · [Rust comparisons](../tests/object_ole_xls.rs)
+
+Mixed Office storages scan native attachments, PowerPoint attachments, the Excel report, and pictures in that order.
+Each storage scans its raw streams and descendants before visiting the child storages' extraction passes.
+An oversized raw stream stops that walk. A matching outer file can still win.
+The OLE passes are skipped when the outer file consumes the last scan byte.
+Native attachment admission uses the recovered length before checking file count and recursion.
+[PowerPoint compressed storage record](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-ppt/305e541f-2c91-49c5-a742-4955330fd2b9) · [Mixed Office comparisons](../tests/object_ole_xls.rs)
 
 Four clients scanned an 88,064-byte workbook with a delayed PNG and an inline 81,160-byte bitmap.
 Each engine used three fresh containers on one pinned ARM64 CPU with 2 GiB of RAM and caching disabled.
@@ -539,6 +545,13 @@ Median peak cgroup memory was 4.25 MiB for Barnacle and 6.02 MiB for stock, incl
 All 3,078 replies matched the same local MD5 rule, `fbb077e639642f31fb93db9a0241dac7:81160:OfficePass.Bitmap`.
 The Barnacle release binary SHA-256 was `dde4f901a905f6018d1b85f06fad0a0cd784365a3888f696621347222edd7d45`.
 [Raw measurements](benchmarks/object-xls-workbooks.csv)
+
+Adding passive Word, PowerPoint, and native Package streams produced an 89,600-byte mixed workbook.
+The mixed workload used the same bitmap rule and container settings. All 3,078 replies matched.
+Barnacle reached 2,891 scans/s at 2.50 ms p95. Stock reached 1,436 scans/s at 6.14 ms p95.
+Median peak cgroup memory was 3.80 MiB for Barnacle and 6.27 MiB for stock.
+The Barnacle binary SHA-256 was `328869affa9255da5955bb18813871dd25af229684fb125819c9b60c92c8adaf`.
+[Raw mixed Office measurements](benchmarks/object-mixed-office.csv)
 
 Both daemons scan top-level PowerPoint `ExOleObjStg` zlib payloads before the root presentation stream and its file hash.
 A root native Package still wins. A presentation inside a storage receives its attachment pass after the root raw-stream pass.
